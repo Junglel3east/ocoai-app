@@ -1,0 +1,9 @@
+# Never commit secrets — set GROK_API_KEY in Railway Variables
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/

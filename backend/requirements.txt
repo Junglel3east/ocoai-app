@@ -1,0 +1,22 @@
+# On-Chain Oracle AI — FastAPI backend (Railway / production)
+# Install: pip install -r requirements.txt
+# App entrypoint: api:app (see Procfile / railway.json)
+
+fastapi==0.136.3
+uvicorn[standard]==0.48.0
+requests==2.34.2
+python-dotenv==1.2.2
+pydantic==2.13.4
+
+# Transitive (pinned for reproducible deploys)
+starlette==1.1.0
+anyio==4.13.0
+certifi==2026.4.22
+charset-normalizer==3.4.7
+click==8.4.1
+h11==0.16.0
+idna==3.15
+urllib3==2.7.0
+annotated-types==0.7.0
+pydantic_core==2.46.4
+typing_extensions==4.15.0

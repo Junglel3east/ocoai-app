@@ -1,0 +1,2 @@
+# Python version for Railway Nixpacks (3.12 LTS)
+python-3.12.8

@@ -5,8 +5,14 @@ Fully self-contained. Does NOT import from Telegram bot (main.py / bot.py).
 
 Run locally:
   cd backend
-  pip install fastapi uvicorn requests python-dotenv pydantic
+  pip install -r requirements.txt
+  cp .env.example .env   # set GROK_API_KEY
   python api.py
+
+Deploy (Railway):
+  Service root directory: backend
+  Variables: GROK_API_KEY (required)
+  Start: uvicorn api:app --host 0.0.0.0 --port $PORT  (see railway.json / Procfile)
 
 Endpoints (lib/main.dart):
   GET  /health
@@ -41,22 +47,30 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
-# Environment — load backend/.env then project-root .env
+# Environment — Railway Variables + optional local .env (never commit .env)
 # ---------------------------------------------------------------------------
 
 _BACKEND_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _BACKEND_DIR.parent
-load_dotenv(_BACKEND_DIR / ".env")
-load_dotenv(_PROJECT_ROOT / ".env")
 
-GROK_API_KEY = os.getenv("GROK_API_KEY", "")
+# Local dev: load .env if present. Railway injects vars directly (no .env file).
+_env_file = _BACKEND_DIR / ".env"
+_root_env = _PROJECT_ROOT / ".env"
+if _env_file.is_file():
+    load_dotenv(_env_file)
+if _root_env.is_file():
+    load_dotenv(_root_env)
+
+# Required on Railway: Variables → GROK_API_KEY
+GROK_API_KEY = (os.getenv("GROK_API_KEY") or "").strip()
 GROK_MODEL = os.getenv("GROK_MODEL", "grok-4")
 GROK_API_URL = os.getenv("GROK_API_URL", "https://api.x.ai/v1/chat/completions")
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 GROK_TIMEOUT = int(os.getenv("GROK_TIMEOUT", "90"))
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
-API_PORT = int(os.getenv("API_PORT", "8000"))
+# Railway sets PORT; fall back to API_PORT then 8000 for local `python api.py`
+API_PORT = int(os.getenv("PORT", os.getenv("API_PORT", "8000")))
 
 MIN_RR_TP1 = 2.1
 TARGET_RR_TP1 = 2.3
@@ -1243,9 +1257,12 @@ async def lifespan(app: FastAPI):
     logger.info("startup | refreshing CoinGecko symbol index")
     refresh_coingecko_symbol_index(force=True)
     if not GROK_API_KEY:
-        logger.warning("startup | GROK_API_KEY not set — AI endpoints will fail")
+        logger.warning(
+            "startup | GROK_API_KEY not set — set Railway Variable GROK_API_KEY "
+            "or backend/.env locally; /analyze and /chat will return 500"
+        )
     else:
-        logger.info("startup | grok_model=%s ready", GROK_MODEL)
+        logger.info("startup | grok_model=%s configured (key present)", GROK_MODEL)
     yield
     logger.info("shutdown")
 
