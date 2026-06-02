@@ -2583,6 +2583,72 @@ class _MainScreenState extends State<MainScreen> {
 }
 
 // ==================== HOME SCREEN ====================
+//
+// Full-page vertical scroll: SingleChildScrollView → Column (no horizontal scroll).
+// Each section shows exactly 4 fixed-height rows in the viewport, then more rows below
+// on the same page scroll (items 5+ appear when the user scrolls down).
+
+/// Section block inside Home's main Column (watchlist / analyses / news).
+class _HomeVerticalSection extends StatelessWidget {
+  final Widget header;
+  final List<Widget> itemTiles;
+  final double listRowExtent;
+  final bool showScrollHint;
+
+  const _HomeVerticalSection({
+    required this.header,
+    required this.itemTiles,
+    required this.listRowExtent,
+    this.showScrollHint = true,
+  });
+
+  /// Exactly four rows visible per section before the user scrolls the page.
+  static const int defaultVisibleItemCount = 4;
+
+  List<Widget> _fixedHeightTiles(List<Widget> tiles) {
+    return tiles
+        .map(
+          (tile) => SizedBox(
+            height: listRowExtent,
+            child: tile,
+          ),
+        )
+        .toList();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final total = itemTiles.length;
+    final firstBlock = itemTiles.take(defaultVisibleItemCount).toList();
+    final overflowBlock = total > defaultVisibleItemCount
+        ? itemTiles.skip(defaultVisibleItemCount).toList()
+        : const <Widget>[];
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        header,
+        if (showScrollHint && total > defaultVisibleItemCount)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              'Showing $defaultVisibleItemCount of $total — scroll down for more',
+              style: TextStyle(fontSize: 12, color: Colors.grey[600], height: 1.3),
+            ),
+          ),
+        const SizedBox(height: 10),
+        // Default viewport: first 4 items (fixed row height for consistent layout).
+        ..._fixedHeightTiles(firstBlock),
+        if (overflowBlock.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          ..._fixedHeightTiles(overflowBlock),
+        ],
+        const SizedBox(height: _AppSpacing.section),
+      ],
+    );
+  }
+}
+
 class HomeScreen extends StatefulWidget {
   final Function(String) onCoinTap;
   final List<String> watchlist;
@@ -2610,9 +2676,6 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  /// ~4 list rows visible per section on a typical phone; page scroll reveals more.
-  static const int _homeSectionPreviewCount = 4;
-
   bool _chatFabHidden = false;
 
   @override
@@ -2673,16 +2736,166 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  /// Subtle hint when a section has more than ~4 rows (user scrolls the Home page).
-  Widget _homeScrollHint(int itemCount) {
-    if (itemCount <= _homeSectionPreviewCount) return const SizedBox.shrink();
-    return Padding(
-      padding: const EdgeInsets.only(top: 4),
-      child: Text(
-        'Scroll for more',
-        style: TextStyle(fontSize: 12, color: Colors.grey[600], height: 1.3),
+  Widget _winRateBanner(BuildContext context) {
+    return _FadeIn(
+      child: _ScaleTap(
+        onTap: () => Navigator.push(
+          context,
+          _premiumPageRoute(
+            (_) => TradePerformanceScreen(
+              trades: List<Map<String, dynamic>>.from(widget.trades),
+              history: widget.history,
+              onViewReport: widget.onViewReport,
+            ),
+          ),
+        ),
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              colors: [
+                const Color(0xFF00BFFF).withValues(alpha: 0.14),
+                const Color(0xFF1A1A1A),
+              ],
+            ),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.22)),
+          ),
+          child: Row(
+            children: [
+              Icon(Icons.emoji_events_outlined, color: const Color(0xFF00BFFF).withValues(alpha: 0.9), size: 22),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  widget.winRateText,
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                    color: Color(0xFF00BFFF),
+                    letterSpacing: -0.1,
+                  ),
+                ),
+              ),
+              Icon(Icons.chevron_right, color: Colors.grey[600], size: 22),
+            ],
+          ),
+        ),
       ),
     );
+  }
+
+  List<Widget> _watchlistTiles() {
+    return List.generate(widget.watchlist.length, (index) {
+      final symbol = widget.watchlist[index];
+      return TweenAnimationBuilder<double>(
+        key: ValueKey(symbol),
+        tween: Tween(begin: 0, end: 1),
+        duration: Duration(milliseconds: 280 + (index * 35).clamp(0, 180)),
+        curve: Curves.easeOutCubic,
+        builder: (context, value, child) => Opacity(
+          opacity: value,
+          child: Transform.translate(offset: Offset(0, (1 - value) * 10), child: child),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.only(bottom: 10),
+          child: _ScaleTap(
+            onTap: () => widget.onCoinTap(symbol),
+            child: Card(
+              child: ListTile(
+                contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                leading: CircleAvatar(
+                  backgroundColor: const Color(0xFF00BFFF).withValues(alpha: 0.15),
+                  child: Text(
+                    symbol.substring(0, 1),
+                    style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF00BFFF)),
+                  ),
+                ),
+                title: Text(symbol, style: const TextStyle(fontWeight: FontWeight.w600)),
+                trailing: Icon(Icons.chevron_right, color: Colors.grey[600]),
+              ),
+            ),
+          ),
+        ),
+      );
+    });
+  }
+
+  List<Widget> _recentAnalysisTiles(BuildContext context) {
+    if (widget.history.isEmpty) {
+      return [
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          child: _AppEmptyState(
+            icon: Icons.insights_outlined,
+            title: 'No analyses yet',
+            subtitle: 'Tap the analytics button to run your first market analysis.',
+          ),
+        ),
+      ];
+    }
+    return List.generate(widget.history.length, (index) {
+      final item = widget.history[index];
+      final isTradeSetup = item["source"] == "trade_setup";
+      return TweenAnimationBuilder<double>(
+        key: ValueKey(item['id']),
+        tween: Tween(begin: 0, end: 1),
+        duration: Duration(milliseconds: 260 + (index * 40).clamp(0, 200)),
+        curve: Curves.easeOutCubic,
+        builder: (context, value, child) => Opacity(
+          opacity: value,
+          child: Transform.translate(offset: Offset(0, (1 - value) * 10), child: child),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.only(bottom: 10),
+          child: Card(
+            child: ListTile(
+              contentPadding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+              title: Text(
+                isTradeSetup ? "${item['coin']} Trade Setup" : "${item['coin']} Analysis",
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+              subtitle: Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                  isTradeSetup
+                      ? "${item['time']} • ${item['tradeStatus'] ?? "Open"}"
+                      : item['time'],
+                  style: TextStyle(fontSize: 13, color: Colors.grey[500]),
+                ),
+              ),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _HistoryChipButton(
+                    label: 'Review',
+                    backgroundColor: const Color(0xFF455A64),
+                    foregroundColor: Colors.white,
+                    onPressed: () => Navigator.push(
+                      context,
+                      _premiumPageRoute(
+                        (_) => ReviewReportScreen(historyItem: item),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  _HistoryChipButton(
+                    label: 'Open',
+                    backgroundColor: Colors.amber,
+                    foregroundColor: Colors.black87,
+                    onPressed: () => widget.onViewReport(item),
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.delete_outline, color: Colors.red[400]),
+                    onPressed: () => widget.onDelete(item['id']),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    });
   }
 
   @override
@@ -2741,197 +2954,52 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: const Icon(kOracleAiChatIcon),
               ),
             ),
-      // Single scroll surface: ~4 rows per section visible, smooth scroll for more.
+      // Full-page vertical scroll; each section shows 4 fixed-height rows, then more below.
       body: SingleChildScrollView(
-        physics: const BouncingScrollPhysics(),
+        physics: const AlwaysScrollableScrollPhysics(
+          parent: BouncingScrollPhysics(),
+        ),
+        clipBehavior: Clip.none,
         padding: EdgeInsets.fromLTRB(
           _AppSpacing.screen,
           12,
           _AppSpacing.screen,
-          24 + MediaQuery.paddingOf(context).bottom,
+          88 + MediaQuery.paddingOf(context).bottom,
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _FadeIn(
-              child: _ScaleTap(
-                onTap: () => Navigator.push(
-                  context,
-                  _premiumPageRoute(
-                    (_) => TradePerformanceScreen(
-                      trades: List<Map<String, dynamic>>.from(widget.trades),
-                      history: widget.history,
-                      onViewReport: widget.onViewReport,
-                    ),
-                  ),
-                ),
-                child: Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      colors: [
-                        const Color(0xFF00BFFF).withValues(alpha: 0.14),
-                        const Color(0xFF1A1A1A),
-                      ],
-                    ),
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.22)),
-                  ),
-                  child: Row(
-                    children: [
-                      Icon(Icons.emoji_events_outlined, color: const Color(0xFF00BFFF).withValues(alpha: 0.9), size: 22),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Text(
-                          widget.winRateText,
-                          style: const TextStyle(
-                            fontSize: 15,
-                            fontWeight: FontWeight.w600,
-                            color: Color(0xFF00BFFF),
-                            letterSpacing: -0.1,
-                          ),
-                        ),
-                      ),
-                      Icon(Icons.chevron_right, color: Colors.grey[600], size: 22),
-                    ],
-                  ),
-                ),
-              ),
-            ),
+            _winRateBanner(context),
             const SizedBox(height: 20),
-            _FadeIn(
-              delay: const Duration(milliseconds: 60),
-              child: _SectionHeader(
-                title: "Watchlist",
-                trailing: _ScaleTap(
-                  onTap: () => _openWatchlistCoinSearch(context),
-                  child: Material(
-                    color: const Color(0xFF00BFFF).withValues(alpha: 0.15),
-                    borderRadius: BorderRadius.circular(20),
-                    child: const Padding(
-                      padding: EdgeInsets.all(8),
-                      child: Icon(Icons.add, color: Color(0xFF00BFFF), size: 22),
+            _HomeVerticalSection(
+              header: _FadeIn(
+                delay: const Duration(milliseconds: 60),
+                child: _SectionHeader(
+                  title: "Watchlist",
+                  trailing: _ScaleTap(
+                    onTap: () => _openWatchlistCoinSearch(context),
+                    child: Material(
+                      color: const Color(0xFF00BFFF).withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(20),
+                      child: const Padding(
+                        padding: EdgeInsets.all(8),
+                        child: Icon(Icons.add, color: Color(0xFF00BFFF), size: 22),
+                      ),
                     ),
                   ),
                 ),
               ),
+              listRowExtent: 72,
+              itemTiles: _watchlistTiles(),
             ),
-            if (widget.watchlist.length > _homeSectionPreviewCount) _homeScrollHint(widget.watchlist.length),
-            const SizedBox(height: 10),
-            ...List.generate(widget.watchlist.length, (index) {
-              final symbol = widget.watchlist[index];
-              return TweenAnimationBuilder<double>(
-                key: ValueKey(symbol),
-                tween: Tween(begin: 0, end: 1),
-                duration: Duration(milliseconds: 280 + (index * 35).clamp(0, 180)),
-                curve: Curves.easeOutCubic,
-                builder: (context, value, child) => Opacity(
-                  opacity: value,
-                  child: Transform.translate(offset: Offset(0, (1 - value) * 10), child: child),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.only(bottom: 10),
-                  child: _ScaleTap(
-                    onTap: () => widget.onCoinTap(symbol),
-                    child: Card(
-                      child: ListTile(
-                        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                        leading: CircleAvatar(
-                          backgroundColor: const Color(0xFF00BFFF).withValues(alpha: 0.15),
-                          child: Text(
-                            symbol.substring(0, 1),
-                            style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF00BFFF)),
-                          ),
-                        ),
-                        title: Text(symbol, style: const TextStyle(fontWeight: FontWeight.w600)),
-                        trailing: Icon(Icons.chevron_right, color: Colors.grey[600]),
-                      ),
-                    ),
-                  ),
-                ),
-              );
-            }),
-            const SizedBox(height: 24),
-            _FadeIn(
-              delay: const Duration(milliseconds: 100),
-              child: const _SectionHeader(title: "Recent Analyses"),
+            _HomeVerticalSection(
+              header: _FadeIn(
+                delay: const Duration(milliseconds: 100),
+                child: const _SectionHeader(title: "Recent Analyses"),
+              ),
+              listRowExtent: 96,
+              itemTiles: _recentAnalysisTiles(context),
             ),
-            if (widget.history.length > _homeSectionPreviewCount) _homeScrollHint(widget.history.length),
-            const SizedBox(height: 10),
-            if (widget.history.isEmpty)
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                child: _AppEmptyState(
-                  icon: Icons.insights_outlined,
-                  title: 'No analyses yet',
-                  subtitle: 'Tap the analytics button to run your first market analysis.',
-                ),
-              )
-            else
-              ...List.generate(widget.history.length, (index) {
-                final item = widget.history[index];
-                final isTradeSetup = item["source"] == "trade_setup";
-                return TweenAnimationBuilder<double>(
-                  key: ValueKey(item['id']),
-                  tween: Tween(begin: 0, end: 1),
-                  duration: Duration(milliseconds: 260 + (index * 40).clamp(0, 200)),
-                  curve: Curves.easeOutCubic,
-                  builder: (context, value, child) => Opacity(
-                    opacity: value,
-                    child: Transform.translate(offset: Offset(0, (1 - value) * 10), child: child),
-                  ),
-                  child: Padding(
-                    padding: const EdgeInsets.only(bottom: 10),
-                    child: Card(
-                      child: ListTile(
-                        contentPadding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
-                        title: Text(
-                          isTradeSetup ? "${item['coin']} Trade Setup" : "${item['coin']} Analysis",
-                          style: const TextStyle(fontWeight: FontWeight.w600),
-                        ),
-                        subtitle: Padding(
-                          padding: const EdgeInsets.only(top: 4),
-                          child: Text(
-                            isTradeSetup
-                                ? "${item['time']} • ${item['tradeStatus'] ?? "Open"}"
-                                : item['time'],
-                            style: TextStyle(fontSize: 13, color: Colors.grey[500]),
-                          ),
-                        ),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            _HistoryChipButton(
-                              label: 'Review',
-                              backgroundColor: const Color(0xFF455A64),
-                              foregroundColor: Colors.white,
-                              onPressed: () => Navigator.push(
-                                context,
-                                _premiumPageRoute(
-                                  (_) => ReviewReportScreen(historyItem: item),
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            _HistoryChipButton(
-                              label: 'Open',
-                              backgroundColor: Colors.amber,
-                              foregroundColor: Colors.black87,
-                              onPressed: () => widget.onViewReport(item),
-                            ),
-                            IconButton(
-                              icon: Icon(Icons.delete_outline, color: Colors.red[400]),
-                              onPressed: () => widget.onDelete(item['id']),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                );
-              }),
-            const SizedBox(height: 24),
             _FadeIn(
               delay: const Duration(milliseconds: 140),
               child: Row(
@@ -2957,15 +3025,13 @@ class _HomeScreenState extends State<HomeScreen> {
                 ],
               ),
             ),
-            Padding(
-              padding: const EdgeInsets.only(top: 4),
-              child: Text(
-                'Scroll for more headlines',
-                style: TextStyle(fontSize: 12, color: Colors.grey[600], height: 1.3),
-              ),
-            ),
             const SizedBox(height: 10),
-            const _MarketNewsFeed(nestedInParentScroll: true),
+            const _MarketNewsFeed(
+              nestedInParentScroll: true,
+              maxVisibleInViewport: _HomeVerticalSection.defaultVisibleItemCount,
+              listRowExtent: 108,
+            ),
+            const SizedBox(height: _AppSpacing.section),
           ],
         ),
       ),
@@ -3017,10 +3083,16 @@ class _HistoryChipButton extends StatelessWidget {
 }
 
 class _MarketNewsFeed extends StatefulWidget {
-  /// When true, list is embedded in Home's SingleChildScrollView (no nested scroll).
+  /// When true, cards stack in Home's SingleChildScrollView (no nested vertical scroll).
   final bool nestedInParentScroll;
+  final int maxVisibleInViewport;
+  final double listRowExtent;
 
-  const _MarketNewsFeed({this.nestedInParentScroll = false});
+  const _MarketNewsFeed({
+    this.nestedInParentScroll = false,
+    this.maxVisibleInViewport = 4,
+    this.listRowExtent = 108,
+  });
 
   @override
   State<_MarketNewsFeed> createState() => _MarketNewsFeedState();
@@ -3139,35 +3211,69 @@ class _MarketNewsFeedState extends State<_MarketNewsFeed> {
       );
     }
 
+    if (widget.nestedInParentScroll) {
+      final total = _articles.length;
+      final visibleCount = widget.maxVisibleInViewport;
+      final firstCount = total < visibleCount ? total : visibleCount;
+      final overflowCount = total > visibleCount ? total - visibleCount : 0;
+
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (total > visibleCount)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Text(
+                'Showing $visibleCount of $total — scroll down for more',
+                style: TextStyle(fontSize: 12, color: Colors.grey[600], height: 1.3),
+              ),
+            ),
+          for (int i = 0; i < firstCount; i++)
+            SizedBox(
+              height: widget.listRowExtent,
+              child: _newsItemBuilder(context, i),
+            ),
+          if (overflowCount > 0) const SizedBox(height: 6),
+          for (int i = visibleCount; i < total; i++)
+            SizedBox(
+              height: widget.listRowExtent,
+              child: _newsItemBuilder(context, i),
+            ),
+        ],
+      );
+    }
+
     return ListView.builder(
       shrinkWrap: shrinkWrap,
       physics: listPhysics,
       itemCount: _articles.length,
-      itemBuilder: (context, index) {
-        final article = _articles[index];
-        final title = (article['title'] ?? '').toString();
-        final source = (article['source'] as Map<String, dynamic>?)?['name']?.toString() ?? 'Unknown';
-        final url = (article['url'] ?? '').toString();
-        final imageUrl = (article['urlToImage'] ?? '').toString();
-        final publishedAt = DateTime.tryParse((article['publishedAt'] ?? '').toString());
+      itemBuilder: _newsItemBuilder,
+    );
+  }
 
-        return TweenAnimationBuilder<double>(
-          tween: Tween(begin: 0, end: 1),
-          duration: Duration(milliseconds: 300 + (index * 50).clamp(0, 250)),
-          curve: Curves.easeOutCubic,
-          builder: (context, value, child) => Opacity(
-            opacity: value,
-            child: Transform.translate(offset: Offset(0, (1 - value) * 8), child: child),
-          ),
-          child: _LiveNewsCard(
-            title: title,
-            source: source,
-            timeAgo: _formatTimeAgo(publishedAt),
-            imageUrl: imageUrl.isNotEmpty ? imageUrl : null,
-            onTap: url.isNotEmpty ? () => _openArticle(url) : null,
-          ),
-        );
-      },
+  Widget _newsItemBuilder(BuildContext context, int index) {
+    final article = _articles[index];
+    final title = (article['title'] ?? '').toString();
+    final source = (article['source'] as Map<String, dynamic>?)?['name']?.toString() ?? 'Unknown';
+    final url = (article['url'] ?? '').toString();
+    final imageUrl = (article['urlToImage'] ?? '').toString();
+    final publishedAt = DateTime.tryParse((article['publishedAt'] ?? '').toString());
+
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: Duration(milliseconds: 300 + (index * 50).clamp(0, 250)),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, child) => Opacity(
+        opacity: value,
+        child: Transform.translate(offset: Offset(0, (1 - value) * 8), child: child),
+      ),
+      child: _LiveNewsCard(
+        title: title,
+        source: source,
+        timeAgo: _formatTimeAgo(publishedAt),
+        imageUrl: imageUrl.isNotEmpty ? imageUrl : null,
+        onTap: url.isNotEmpty ? () => _openArticle(url) : null,
+      ),
     );
   }
 

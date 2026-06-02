@@ -311,26 +311,37 @@ def fetch_binance_futures(symbol: str) -> Optional[dict[str, Any]]:
         return None
 
 
-def fetch_coingecko_market(symbol: str, *, no_cache: bool = False) -> Optional[dict[str, Any]]:
+def fetch_coingecko_market(
+    symbol: str,
+    *,
+    no_cache: bool = False,
+    cache_bust_ms: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
     coin_id = resolve_coingecko_id(symbol)
     if not coin_id:
         return None
 
     try:
-        # no_cache=True: fresh request right before AI generation (Railway/mobile)
-        headers = (
-            {"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"}
-            if no_cache
-            else {}
-        )
+        # Aggressive cache-bust: headers + unique query param per request (proxies/CDNs)
+        headers: dict[str, str] = {}
+        if no_cache:
+            headers = {
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            }
+        params: dict[str, str] = {
+            "ids": coin_id,
+            "vs_currencies": "usd",
+            "include_24hr_change": "true",
+            "include_24hr_vol": "true",
+        }
+        if no_cache:
+            params["_"] = str(cache_bust_ms or int(time.time() * 1000))
+
         response = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
-            params={
-                "ids": coin_id,
-                "vs_currencies": "usd",
-                "include_24hr_change": "true",
-                "include_24hr_vol": "true",
-            },
+            params=params,
             headers=headers,
             timeout=REQUEST_TIMEOUT,
         )
@@ -354,23 +365,40 @@ def fetch_coingecko_market(symbol: str, *, no_cache: bool = False) -> Optional[d
         return None
 
 
+def fetch_coingecko_market_aggressive(symbol: str) -> Optional[dict[str, Any]]:
+    """
+    Two back-to-back cache-busted CoinGecko pulls; returns the latest successful tick.
+    Called immediately before Grok (analysis + trade setup) — not cached from earlier requests.
+    """
+    upper = symbol.upper()
+    last: Optional[dict[str, Any]] = None
+    base_ms = int(time.time() * 1000)
+    for attempt in range(2):
+        snap = fetch_coingecko_market(upper, no_cache=True, cache_bust_ms=base_ms + attempt)
+        if snap:
+            last = snap
+    return last
+
+
 def fetch_live_price_for_analysis(coin: str) -> dict[str, Any]:
     """
-    Always pull the latest CoinGecko price immediately before /analyze or trade setup.
-    Keeps entry / TP / SL levels aligned with the live market (not a cached Binance tick).
-    Falls back to Binance only if CoinGecko is unavailable.
+    Extremely fresh price for AI levels: CoinGecko (aggressive, cache-busted) right before Grok.
+    Falls back to Binance only if CoinGecko is unavailable. Does not change prompts or report format.
     """
     upper = coin.upper()
-    refresh_coingecko_symbol_index()
+    refresh_coingecko_symbol_index(force=True)
 
-    snapshot = fetch_coingecko_market(upper, no_cache=True)
+    fetched_at = time.time()
+    snapshot = fetch_coingecko_market_aggressive(upper)
     if snapshot:
+        age_ms = (time.time() - fetched_at) * 1000
         logger.info(
-            "live_price_for_ai coin=%s source=coingecko price=%.6f",
+            "live_price_for_ai coin=%s source=coingecko price=%.6f age_ms=%.0f",
             upper,
             snapshot["price"],
+            age_ms,
         )
-        return {"coin": upper, "fetched_at": time.time(), **snapshot}
+        return {"coin": upper, "fetched_at": fetched_at, **snapshot}
 
     logger.warning("live_price_for_ai coin=%s coingecko_miss — falling back to binance", upper)
     symbol = binance_usdt_symbol(coin)
@@ -1242,7 +1270,11 @@ If edge is weak → "NO SCALP — STAY FLAT" and omit TRADE LEVELS.
         ts = datetime.fromtimestamp(float(fetched_at), tz=timezone.utc).strftime(
             "%Y-%m-%d %H:%M:%S UTC"
         )
-        freshness_line = f"PRICE FETCHED AT: {ts} (live CoinGecko pull seconds before this report)\n"
+        age_sec = max(0.0, time.time() - float(fetched_at))
+        freshness_line = (
+            f"PRICE FETCHED AT: {ts} ({age_sec:.2f}s ago — aggressive CoinGecko, cache-busted)\n"
+            f"USE THIS PRICE ONLY: all Entry/TP/SL must anchor to {price_str} as of this timestamp.\n"
+        )
 
     return f"""Generate an elite veteran-grade, high-conviction report for On-Chain Oracle AI.
 {scalp_banner}
