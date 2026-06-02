@@ -44,14 +44,30 @@ const String kNewsApiKey = String.fromEnvironment(
   defaultValue: '0164e1b479294ae581c5097fdcf0d69a',
 );
 
-/// Android emulator → host machine backend (use localhost:8000 on iOS simulator / desktop).
-const String kBackendBaseUrl = 'http://10.0.2.2:8000';
+/// Production FastAPI backend (Railway live). Override: --dart-define=BACKEND_BASE_URL=...
+const String kBackendBaseUrl = String.fromEnvironment(
+  'BACKEND_BASE_URL',
+  defaultValue: 'https://ocoai-app-production.up.railway.app',
+);
 
-/// Oracle Citadel trading command center (secure FastAPI backend).
+/// Oracle Citadel — same production Railway API host.
 const String kCitadelBaseUrl = String.fromEnvironment(
   'CITADEL_BASE_URL',
-  defaultValue: 'http://10.0.2.2:8000',
+  defaultValue: 'https://ocoai-app-production.up.railway.app',
 );
+
+/// GET /health on startup (logs only; does not block UI or change AI behavior).
+Future<void> pingBackendHealth() async {
+  final uri = Uri.parse('$kBackendBaseUrl/health');
+  try {
+    final response = await http
+        .get(uri)
+        .timeout(const Duration(seconds: 10));
+    debugPrint('[Backend] health ${response.statusCode}: ${response.body}');
+  } catch (e) {
+    debugPrint('[Backend] health check failed: $e');
+  }
+}
 
 /// Placeholder YouTube channel — replace with your channel URL when ready.
 const String kYouTubeChannelUrl = 'https://www.youtube.com/@OnChainOracleAI';
@@ -2257,6 +2273,7 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await NotificationService.instance.initialize();
+  pingBackendHealth();
   runApp(const OnChainOracleAI());
 }
 
@@ -2593,6 +2610,9 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
+  /// ~4 list rows visible per section on a typical phone; page scroll reveals more.
+  static const int _homeSectionPreviewCount = 4;
+
   bool _chatFabHidden = false;
 
   @override
@@ -2653,6 +2673,18 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  /// Subtle hint when a section has more than ~4 rows (user scrolls the Home page).
+  Widget _homeScrollHint(int itemCount) {
+    if (itemCount <= _homeSectionPreviewCount) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Text(
+        'Scroll for more',
+        style: TextStyle(fontSize: 12, color: Colors.grey[600], height: 1.3),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -2709,8 +2741,15 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: const Icon(kOracleAiChatIcon),
               ),
             ),
-      body: Padding(
-        padding: const EdgeInsets.fromLTRB(_AppSpacing.screen, 12, _AppSpacing.screen, 8),
+      // Single scroll surface: ~4 rows per section visible, smooth scroll for more.
+      body: SingleChildScrollView(
+        physics: const BouncingScrollPhysics(),
+        padding: EdgeInsets.fromLTRB(
+          _AppSpacing.screen,
+          12,
+          _AppSpacing.screen,
+          24 + MediaQuery.paddingOf(context).bottom,
+        ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -2760,7 +2799,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
             ),
-            const SizedBox(height: _AppSpacing.section),
+            const SizedBox(height: 20),
             _FadeIn(
               delay: const Duration(milliseconds: 60),
               child: _SectionHeader(
@@ -2778,128 +2817,121 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
             ),
-            Expanded(
-              flex: 2,
-              child: ListView.builder(
-                physics: const BouncingScrollPhysics(),
-                itemCount: widget.watchlist.length,
-                itemBuilder: (context, index) {
-                  final symbol = widget.watchlist[index];
-                  return TweenAnimationBuilder<double>(
-                    key: ValueKey(symbol),
-                    tween: Tween(begin: 0, end: 1),
-                    duration: Duration(milliseconds: 280 + (index * 35).clamp(0, 180)),
-                    curve: Curves.easeOutCubic,
-                    builder: (context, value, child) => Opacity(
-                      opacity: value,
-                      child: Transform.translate(offset: Offset(0, (1 - value) * 10), child: child),
-                    ),
-                    child: Padding(
-                      padding: const EdgeInsets.only(bottom: 10),
-                      child: _ScaleTap(
-                        onTap: () => widget.onCoinTap(symbol),
-                        child: Card(
-                          child: ListTile(
-                            contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                            leading: CircleAvatar(
-                              backgroundColor: const Color(0xFF00BFFF).withValues(alpha: 0.15),
-                              child: Text(
-                                symbol.substring(0, 1),
-                                style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF00BFFF)),
-                              ),
-                            ),
-                            title: Text(symbol, style: const TextStyle(fontWeight: FontWeight.w600)),
-                            trailing: Icon(Icons.chevron_right, color: Colors.grey[600]),
+            if (widget.watchlist.length > _homeSectionPreviewCount) _homeScrollHint(widget.watchlist.length),
+            const SizedBox(height: 10),
+            ...List.generate(widget.watchlist.length, (index) {
+              final symbol = widget.watchlist[index];
+              return TweenAnimationBuilder<double>(
+                key: ValueKey(symbol),
+                tween: Tween(begin: 0, end: 1),
+                duration: Duration(milliseconds: 280 + (index * 35).clamp(0, 180)),
+                curve: Curves.easeOutCubic,
+                builder: (context, value, child) => Opacity(
+                  opacity: value,
+                  child: Transform.translate(offset: Offset(0, (1 - value) * 10), child: child),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: _ScaleTap(
+                    onTap: () => widget.onCoinTap(symbol),
+                    child: Card(
+                      child: ListTile(
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                        leading: CircleAvatar(
+                          backgroundColor: const Color(0xFF00BFFF).withValues(alpha: 0.15),
+                          child: Text(
+                            symbol.substring(0, 1),
+                            style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF00BFFF)),
                           ),
                         ),
+                        title: Text(symbol, style: const TextStyle(fontWeight: FontWeight.w600)),
+                        trailing: Icon(Icons.chevron_right, color: Colors.grey[600]),
                       ),
                     ),
-                  );
-                },
-              ),
-            ),
-            const SizedBox(height: _AppSpacing.section),
+                  ),
+                ),
+              );
+            }),
+            const SizedBox(height: 24),
             _FadeIn(
               delay: const Duration(milliseconds: 100),
               child: const _SectionHeader(title: "Recent Analyses"),
             ),
-            Expanded(
-              flex: 3,
-              child: widget.history.isEmpty
-                  ? _AppEmptyState(
-                      fitHeight: true,
-                      icon: Icons.insights_outlined,
-                      title: 'No analyses yet',
-                      subtitle: 'Tap the analytics button to run your first market analysis.',
-                    )
-                  : ListView.builder(
-                      physics: const BouncingScrollPhysics(),
-                      itemCount: widget.history.length,
-                      itemBuilder: (context, index) {
-                        final item = widget.history[index];
-                        final isTradeSetup = item["source"] == "trade_setup";
-                        return TweenAnimationBuilder<double>(
-                          key: ValueKey(item['id']),
-                          tween: Tween(begin: 0, end: 1),
-                          duration: Duration(milliseconds: 260 + (index * 40).clamp(0, 200)),
-                          curve: Curves.easeOutCubic,
-                          builder: (context, value, child) => Opacity(
-                            opacity: value,
-                            child: Transform.translate(offset: Offset(0, (1 - value) * 10), child: child),
+            if (widget.history.length > _homeSectionPreviewCount) _homeScrollHint(widget.history.length),
+            const SizedBox(height: 10),
+            if (widget.history.isEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: _AppEmptyState(
+                  icon: Icons.insights_outlined,
+                  title: 'No analyses yet',
+                  subtitle: 'Tap the analytics button to run your first market analysis.',
+                ),
+              )
+            else
+              ...List.generate(widget.history.length, (index) {
+                final item = widget.history[index];
+                final isTradeSetup = item["source"] == "trade_setup";
+                return TweenAnimationBuilder<double>(
+                  key: ValueKey(item['id']),
+                  tween: Tween(begin: 0, end: 1),
+                  duration: Duration(milliseconds: 260 + (index * 40).clamp(0, 200)),
+                  curve: Curves.easeOutCubic,
+                  builder: (context, value, child) => Opacity(
+                    opacity: value,
+                    child: Transform.translate(offset: Offset(0, (1 - value) * 10), child: child),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.only(bottom: 10),
+                    child: Card(
+                      child: ListTile(
+                        contentPadding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+                        title: Text(
+                          isTradeSetup ? "${item['coin']} Trade Setup" : "${item['coin']} Analysis",
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                        subtitle: Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Text(
+                            isTradeSetup
+                                ? "${item['time']} • ${item['tradeStatus'] ?? "Open"}"
+                                : item['time'],
+                            style: TextStyle(fontSize: 13, color: Colors.grey[500]),
                           ),
-                          child: Padding(
-                            padding: const EdgeInsets.only(bottom: 10),
-                            child: Card(
-                              child: ListTile(
-                                contentPadding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
-                                title: Text(
-                                  isTradeSetup ? "${item['coin']} Trade Setup" : "${item['coin']} Analysis",
-                                  style: const TextStyle(fontWeight: FontWeight.w600),
-                                ),
-                                subtitle: Padding(
-                                  padding: const EdgeInsets.only(top: 4),
-                                  child: Text(
-                                    isTradeSetup
-                                        ? "${item['time']} • ${item['tradeStatus'] ?? "Open"}"
-                                        : item['time'],
-                                    style: TextStyle(fontSize: 13, color: Colors.grey[500]),
-                                  ),
-                                ),
-                                trailing: Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    _HistoryChipButton(
-                                      label: 'Review',
-                                      backgroundColor: const Color(0xFF455A64),
-                                      foregroundColor: Colors.white,
-                                      onPressed: () => Navigator.push(
-                                        context,
-                                        _premiumPageRoute(
-                                          (_) => ReviewReportScreen(historyItem: item),
-                                        ),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    _HistoryChipButton(
-                                      label: 'Open',
-                                      backgroundColor: Colors.amber,
-                                      foregroundColor: Colors.black87,
-                                      onPressed: () => widget.onViewReport(item),
-                                    ),
-                                    IconButton(
-                                      icon: Icon(Icons.delete_outline, color: Colors.red[400]),
-                                      onPressed: () => widget.onDelete(item['id']),
-                                    ),
-                                  ],
+                        ),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            _HistoryChipButton(
+                              label: 'Review',
+                              backgroundColor: const Color(0xFF455A64),
+                              foregroundColor: Colors.white,
+                              onPressed: () => Navigator.push(
+                                context,
+                                _premiumPageRoute(
+                                  (_) => ReviewReportScreen(historyItem: item),
                                 ),
                               ),
                             ),
-                          ),
-                        );
-                      },
+                            const SizedBox(width: 8),
+                            _HistoryChipButton(
+                              label: 'Open',
+                              backgroundColor: Colors.amber,
+                              foregroundColor: Colors.black87,
+                              onPressed: () => widget.onViewReport(item),
+                            ),
+                            IconButton(
+                              icon: Icon(Icons.delete_outline, color: Colors.red[400]),
+                              onPressed: () => widget.onDelete(item['id']),
+                            ),
+                          ],
+                        ),
+                      ),
                     ),
-            ),
-            const SizedBox(height: _AppSpacing.section),
+                  ),
+                );
+              }),
+            const SizedBox(height: 24),
             _FadeIn(
               delay: const Duration(milliseconds: 140),
               child: Row(
@@ -2925,11 +2957,15 @@ class _HomeScreenState extends State<HomeScreen> {
                 ],
               ),
             ),
-            const SizedBox(height: _AppSpacing.item),
-            const Expanded(
-              flex: 2,
-              child: _MarketNewsFeed(),
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                'Scroll for more headlines',
+                style: TextStyle(fontSize: 12, color: Colors.grey[600], height: 1.3),
+              ),
             ),
+            const SizedBox(height: 10),
+            const _MarketNewsFeed(nestedInParentScroll: true),
           ],
         ),
       ),
@@ -2981,7 +3017,10 @@ class _HistoryChipButton extends StatelessWidget {
 }
 
 class _MarketNewsFeed extends StatefulWidget {
-  const _MarketNewsFeed();
+  /// When true, list is embedded in Home's SingleChildScrollView (no nested scroll).
+  final bool nestedInParentScroll;
+
+  const _MarketNewsFeed({this.nestedInParentScroll = false});
 
   @override
   State<_MarketNewsFeed> createState() => _MarketNewsFeedState();
@@ -3073,8 +3112,16 @@ class _MarketNewsFeedState extends State<_MarketNewsFeed> {
 
   @override
   Widget build(BuildContext context) {
+    final listPhysics = widget.nestedInParentScroll
+        ? const NeverScrollableScrollPhysics()
+        : const BouncingScrollPhysics();
+    final shrinkWrap = widget.nestedInParentScroll;
+
     if (_loading) {
-      return const Center(child: CircularProgressIndicator(color: Color(0xFF00BFFF)));
+      return SizedBox(
+        height: widget.nestedInParentScroll ? 120 : null,
+        child: const Center(child: CircularProgressIndicator(color: Color(0xFF00BFFF))),
+      );
     }
 
     if (_error != null) {
@@ -3093,7 +3140,8 @@ class _MarketNewsFeedState extends State<_MarketNewsFeed> {
     }
 
     return ListView.builder(
-      physics: const BouncingScrollPhysics(),
+      shrinkWrap: shrinkWrap,
+      physics: listPhysics,
       itemCount: _articles.length,
       itemBuilder: (context, index) {
         final article = _articles[index];

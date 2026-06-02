@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 import re
 import time
 import uuid
@@ -310,12 +311,18 @@ def fetch_binance_futures(symbol: str) -> Optional[dict[str, Any]]:
         return None
 
 
-def fetch_coingecko_market(symbol: str) -> Optional[dict[str, Any]]:
+def fetch_coingecko_market(symbol: str, *, no_cache: bool = False) -> Optional[dict[str, Any]]:
     coin_id = resolve_coingecko_id(symbol)
     if not coin_id:
         return None
 
     try:
+        # no_cache=True: fresh request right before AI generation (Railway/mobile)
+        headers = (
+            {"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"}
+            if no_cache
+            else {}
+        )
         response = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
             params={
@@ -324,6 +331,7 @@ def fetch_coingecko_market(symbol: str) -> Optional[dict[str, Any]]:
                 "include_24hr_change": "true",
                 "include_24hr_vol": "true",
             },
+            headers=headers,
             timeout=REQUEST_TIMEOUT,
         )
         if response.status_code != 200:
@@ -346,7 +354,45 @@ def fetch_coingecko_market(symbol: str) -> Optional[dict[str, Any]]:
         return None
 
 
+def fetch_live_price_for_analysis(coin: str) -> dict[str, Any]:
+    """
+    Always pull the latest CoinGecko price immediately before /analyze or trade setup.
+    Keeps entry / TP / SL levels aligned with the live market (not a cached Binance tick).
+    Falls back to Binance only if CoinGecko is unavailable.
+    """
+    upper = coin.upper()
+    refresh_coingecko_symbol_index()
+
+    snapshot = fetch_coingecko_market(upper, no_cache=True)
+    if snapshot:
+        logger.info(
+            "live_price_for_ai coin=%s source=coingecko price=%.6f",
+            upper,
+            snapshot["price"],
+        )
+        return {"coin": upper, "fetched_at": time.time(), **snapshot}
+
+    logger.warning("live_price_for_ai coin=%s coingecko_miss — falling back to binance", upper)
+    symbol = binance_usdt_symbol(coin)
+    for fetcher in (fetch_binance_spot, fetch_binance_futures):
+        snap = fetcher(symbol)
+        if snap:
+            logger.info(
+                "live_price_for_ai coin=%s source=%s price=%.6f",
+                upper,
+                snap["source"],
+                snap["price"],
+            )
+            return {"coin": upper, "fetched_at": time.time(), **snap}
+
+    raise HTTPException(
+        status_code=502,
+        detail=f"Unable to fetch a live price for {upper}. Try a major USDT-listed symbol.",
+    )
+
+
 def fetch_market_snapshot(coin: str) -> dict[str, Any]:
+    """General price lookup (review, etc.). Analysis/trade setup uses fetch_live_price_for_analysis."""
     symbol = binance_usdt_symbol(coin)
     upper = coin.upper()
 
@@ -1190,6 +1236,14 @@ If edge is weak → "NO SCALP — STAY FLAT" and omit TRADE LEVELS.
     price_raw = f"{price:.8f}".rstrip("0").rstrip(".")
     max_entry_drift = "0.8%" if scalp_mode else "3%"
 
+    fetched_at = market.get("fetched_at")
+    freshness_line = ""
+    if fetched_at:
+        ts = datetime.fromtimestamp(float(fetched_at), tz=timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+        freshness_line = f"PRICE FETCHED AT: {ts} (live CoinGecko pull seconds before this report)\n"
+
     return f"""Generate an elite veteran-grade, high-conviction report for On-Chain Oracle AI.
 {scalp_banner}
 ═══════════════════════════════════════════════════════════
@@ -1198,8 +1252,7 @@ AUTHORITATIVE LIVE PRICE — RULE 0 (ZERO TOLERANCE FOR ERROR)
 CURRENT LIVE PRICE: {price_str} (raw: {price_raw} USD)
 24h CHANGE: {change_pct:+.2f}%
 SOURCE: {market.get('source', 'unknown')}
-
-MANDATORY:
+{freshness_line}MANDATORY:
 • **Asset** line MUST show EXACTLY: {coin.upper()} | {price_str} | {change_pct:+.2f}%
 • ALL Entry/TP/SL levels positioned vs {price_str} RIGHT NOW — not historical, not estimated.
 • Entry should be within ~{max_entry_drift} of live for {'scalp' if scalp_mode else 'active'} setups unless limit at named structure.
@@ -1385,7 +1438,8 @@ async def _handle_analyze(
         )
 
     direction = normalize_direction(request.direction)
-    market = fetch_market_snapshot(coin)
+    # Fresh CoinGecko price injected into prompt — same AI style/format as before
+    market = fetch_live_price_for_analysis(coin)
 
     scalp_mode = is_scalp_context(
         timeframe=request.timeframe,
