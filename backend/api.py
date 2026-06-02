@@ -15,9 +15,10 @@ Deploy (Railway):
   Start: uvicorn api:app --host 0.0.0.0 --port $PORT  (see railway.json / Procfile)
 
 Endpoints (lib/main.dart):
-  GET  /health
+  GET  /health, GET /
   GET  /coins
   POST /analyze   — analysis + trade setup (mode: analysis | tradesetup)
+  POST /trade-setup, /trade_setup, /tradesetup — aliases → same handler (mode=tradesetup)
   POST /review    — report performance review
   POST /chat      — Expert Oracle Trader AI chat
 
@@ -163,6 +164,19 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] = Field(default_factory=list)
     system_prompt: Optional[str] = None
     request_ts: Optional[int] = None
+
+
+def normalize_analyze_mode(raw: Optional[str], *, default: str = "analysis") -> str:
+    """
+    Flutter sends mode=tradesetup on POST /analyze.
+    Aliases (trade-setup, trade_setup) map to the same internal mode.
+    """
+    token = (raw or default).strip().lower().replace("-", "").replace("_", "")
+    if token in {"analysis", "analyze"}:
+        return "analysis"
+    if token in {"tradesetup", "setup", "trade"}:
+        return "tradesetup"
+    return token
 
 
 # ---------------------------------------------------------------------------
@@ -1267,18 +1281,23 @@ async def lifespan(app: FastAPI):
     logger.info("shutdown")
 
 
+# redirect_slashes=False — avoids POST /analyze → 307 → /analyze/ (body lost → 404 on clients)
 app = FastAPI(
     title="On-Chain Oracle AI API",
     version="2.3.0",
     description="Production backend for the Flutter mobile app",
     lifespan=lifespan,
+    redirect_slashes=False,
 )
 
+# CORS — Flutter mobile/web; preflight OPTIONS handled by middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
 )
 
 
@@ -1303,13 +1322,37 @@ async def request_logging_middleware(request: Request, call_next):
     return response
 
 
+@app.get("/")
+async def root() -> dict[str, Any]:
+    """Railway/public root — confirms service is this API (not a static 404 page)."""
+    return {
+        "service": "On-Chain Oracle AI API",
+        "status": "ok",
+        "health": "/health",
+        "analyze": "POST /analyze (mode=analysis|tradesetup)",
+        "trade_setup": "POST /trade-setup (alias)",
+    }
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    """Flutter startup ping — includes Grok configuration status."""
     return {
         "status": "ok",
         "version": "2.3.0",
         "grok_configured": bool(GROK_API_KEY),
-        "model": GROK_MODEL,
+        "grok_model": GROK_MODEL,
+        "routes": {
+            "analyze": ["POST /analyze", "POST /analyze/"],
+            "trade_setup": [
+                "POST /trade-setup",
+                "POST /trade_setup",
+                "POST /tradesetup",
+                "POST /analyze (mode=tradesetup)",
+            ],
+            "review": ["POST /review"],
+            "chat": ["POST /chat"],
+        },
     }
 
 
@@ -1320,15 +1363,26 @@ async def list_coins(limit: int = 150) -> dict[str, Any]:
     return {"success": True, "coins": symbols, "count": len(symbols)}
 
 
-@app.post("/analyze")
-async def analyze(request: AnalyzeRequest, http_request: Request):
+async def _handle_analyze(
+    request: AnalyzeRequest,
+    http_request: Request,
+    *,
+    mode_override: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Shared handler for POST /analyze and trade-setup aliases.
+    AI prompts, Grok calls, and response JSON shape are unchanged.
+    """
     coin = request.coin.strip().upper()
     if not coin:
         raise HTTPException(status_code=400, detail="coin is required.")
 
-    mode = (request.mode or "analysis").strip().lower()
+    mode = normalize_analyze_mode(mode_override or request.mode)
     if mode not in {"analysis", "tradesetup"}:
-        raise HTTPException(status_code=400, detail="mode must be 'analysis' or 'tradesetup'.")
+        raise HTTPException(
+            status_code=400,
+            detail="mode must be 'analysis' or 'tradesetup' (aliases: trade-setup, trade_setup).",
+        )
 
     direction = normalize_direction(request.direction)
     market = fetch_market_snapshot(coin)
@@ -1336,7 +1390,7 @@ async def analyze(request: AnalyzeRequest, http_request: Request):
     scalp_mode = is_scalp_context(
         timeframe=request.timeframe,
         direction=request.direction,
-        mode=request.mode,
+        mode=mode,
         system_prompt=request.system_prompt or "",
     )
 
@@ -1385,7 +1439,45 @@ async def analyze(request: AnalyzeRequest, http_request: Request):
     }
 
 
+@app.post("/analyze")
+@app.post("/analyze/")
+async def analyze(request: AnalyzeRequest, http_request: Request):
+    """Primary Flutter endpoint (Quick Analyze + Trade Setup via mode field)."""
+    return await _handle_analyze(request, http_request)
+
+
+@app.post("/trade-setup")
+@app.post("/trade_setup")
+@app.post("/tradesetup")
+async def trade_setup(request: AnalyzeRequest, http_request: Request):
+    """
+    Explicit trade-setup routes (fixes 404 if client calls /trade-setup instead of /analyze).
+    Same AI logic as POST /analyze with mode=tradesetup.
+    """
+    return await _handle_analyze(request, http_request, mode_override="tradesetup")
+
+
+# Optional /api/* aliases (some Railway/proxy configs expose APIs under /api)
+@app.post("/api/analyze")
+@app.post("/api/analyze/")
+async def analyze_api_prefix(request: AnalyzeRequest, http_request: Request):
+    return await _handle_analyze(request, http_request)
+
+
+@app.post("/api/trade-setup")
+@app.post("/api/trade_setup")
+@app.post("/api/tradesetup")
+async def trade_setup_api_prefix(request: AnalyzeRequest, http_request: Request):
+    return await _handle_analyze(request, http_request, mode_override="tradesetup")
+
+
+@app.get("/api/health")
+async def health_api_prefix() -> dict[str, Any]:
+    return await health()
+
+
 @app.post("/review")
+@app.post("/review/")
 async def review(request: ReviewRequest, http_request: Request):
     coin = request.coin.strip().upper()
     if not coin:
@@ -1416,6 +1508,7 @@ async def review(request: ReviewRequest, http_request: Request):
 
 
 @app.post("/chat")
+@app.post("/chat/")
 async def chat(request: ChatRequest, http_request: Request):
     message = request.message.strip()
     if not message:
