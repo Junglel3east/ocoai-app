@@ -2584,66 +2584,56 @@ class _MainScreenState extends State<MainScreen> {
 
 // ==================== HOME SCREEN ====================
 //
-// Full-page vertical scroll: SingleChildScrollView → Column (no horizontal scroll).
-// Each section shows exactly 4 fixed-height rows in the viewport, then more rows below
-// on the same page scroll (items 5+ appear when the user scrolls down).
+// Reference layout: Win Rate → Watchlist → Recent Analyses → Latest Market News
+// Scroll: SingleChildScrollView + Column (entire page, vertical only).
+// Each section shows 4 items in the first viewport block; more items sit below on
+// the same page scroll (no nested ListViews, no horizontal scroll).
 
-/// Section block inside Home's main Column (watchlist / analyses / news).
+/// How many cards are visible per section before the user scrolls down.
+const int _kHomeDefaultVisibleCount = 4;
+
+/// One Home section: title row, optional hint, first 4 cards, then any extra cards.
 class _HomeVerticalSection extends StatelessWidget {
   final Widget header;
-  final List<Widget> itemTiles;
-  final double listRowExtent;
-  final bool showScrollHint;
+  final int totalItemCount;
+  final List<Widget> itemCards;
 
   const _HomeVerticalSection({
     required this.header,
-    required this.itemTiles,
-    required this.listRowExtent,
-    this.showScrollHint = true,
+    required this.totalItemCount,
+    required this.itemCards,
   });
 
-  /// Exactly four rows visible per section before the user scrolls the page.
-  static const int defaultVisibleItemCount = 4;
-
-  List<Widget> _fixedHeightTiles(List<Widget> tiles) {
-    return tiles
-        .map(
-          (tile) => SizedBox(
-            height: listRowExtent,
-            child: tile,
-          ),
-        )
-        .toList();
+  static Widget? scrollHint(int total) {
+    if (total <= _kHomeDefaultVisibleCount) return null;
+    return Padding(
+      padding: const EdgeInsets.only(top: 2, bottom: 2),
+      child: Text(
+        'Showing $_kHomeDefaultVisibleCount of $total — scroll down for more',
+        style: TextStyle(fontSize: 12, color: Colors.grey[600], height: 1.3),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    final total = itemTiles.length;
-    final firstBlock = itemTiles.take(defaultVisibleItemCount).toList();
-    final overflowBlock = total > defaultVisibleItemCount
-        ? itemTiles.skip(defaultVisibleItemCount).toList()
+    final previewCards = itemCards.take(_kHomeDefaultVisibleCount).toList();
+    final moreCards = itemCards.length > _kHomeDefaultVisibleCount
+        ? itemCards.skip(_kHomeDefaultVisibleCount).toList()
         : const <Widget>[];
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         header,
-        if (showScrollHint && total > defaultVisibleItemCount)
-          Padding(
-            padding: const EdgeInsets.only(top: 4),
-            child: Text(
-              'Showing $defaultVisibleItemCount of $total — scroll down for more',
-              style: TextStyle(fontSize: 12, color: Colors.grey[600], height: 1.3),
-            ),
-          ),
-        const SizedBox(height: 10),
-        // Default viewport: first 4 items (fixed row height for consistent layout).
-        ..._fixedHeightTiles(firstBlock),
-        if (overflowBlock.isNotEmpty) ...[
-          const SizedBox(height: 6),
-          ..._fixedHeightTiles(overflowBlock),
+        if (scrollHint(totalItemCount) != null) scrollHint(totalItemCount)!,
+        const SizedBox(height: 8),
+        ...previewCards,
+        if (moreCards.isNotEmpty) ...[
+          const SizedBox(height: 4),
+          ...moreCards,
         ],
-        const SizedBox(height: _AppSpacing.section),
+        const SizedBox(height: 20),
       ],
     );
   }
@@ -2864,32 +2854,37 @@ class _HomeScreenState extends State<HomeScreen> {
                   style: TextStyle(fontSize: 13, color: Colors.grey[500]),
                 ),
               ),
-              trailing: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  _HistoryChipButton(
-                    label: 'Review',
-                    backgroundColor: const Color(0xFF455A64),
-                    foregroundColor: Colors.white,
-                    onPressed: () => Navigator.push(
-                      context,
-                      _premiumPageRoute(
-                        (_) => ReviewReportScreen(historyItem: item),
+              trailing: SizedBox(
+                width: 132,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    _HistoryChipButton(
+                      label: 'Review',
+                      backgroundColor: const Color(0xFF455A64),
+                      foregroundColor: Colors.white,
+                      onPressed: () => Navigator.push(
+                        context,
+                        _premiumPageRoute(
+                          (_) => ReviewReportScreen(historyItem: item),
+                        ),
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  _HistoryChipButton(
-                    label: 'Open',
-                    backgroundColor: Colors.amber,
-                    foregroundColor: Colors.black87,
-                    onPressed: () => widget.onViewReport(item),
-                  ),
-                  IconButton(
-                    icon: Icon(Icons.delete_outline, color: Colors.red[400]),
-                    onPressed: () => widget.onDelete(item['id']),
-                  ),
-                ],
+                    const SizedBox(width: 6),
+                    _HistoryChipButton(
+                      label: 'Open',
+                      backgroundColor: Colors.amber,
+                      foregroundColor: Colors.black87,
+                      onPressed: () => widget.onViewReport(item),
+                    ),
+                    IconButton(
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                      icon: Icon(Icons.delete_outline, color: Colors.red[400], size: 22),
+                      onPressed: () => widget.onDelete(item['id']),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -2901,7 +2896,9 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: const Color(0xFF0F0F0F),
       appBar: AppBar(
+        backgroundColor: const Color(0xFF0F0F0F),
         title: const AppLogo(height: 38),
         titleSpacing: 12,
         actions: [
@@ -2954,28 +2951,26 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: const Icon(kOracleAiChatIcon),
               ),
             ),
-      // Full-page vertical scroll; each section shows 4 fixed-height rows, then more below.
+      // Full-page vertical scroll (screenshot layout: Win Rate → 3 sections).
       body: SingleChildScrollView(
-        physics: const AlwaysScrollableScrollPhysics(
-          parent: BouncingScrollPhysics(),
-        ),
-        clipBehavior: Clip.none,
+        physics: const AlwaysScrollableScrollPhysics(parent: BouncingScrollPhysics()),
         padding: EdgeInsets.fromLTRB(
           _AppSpacing.screen,
-          12,
+          8,
           _AppSpacing.screen,
-          88 + MediaQuery.paddingOf(context).bottom,
+          96 + MediaQuery.paddingOf(context).bottom,
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             _winRateBanner(context),
-            const SizedBox(height: 20),
+            const SizedBox(height: 16),
+            // Section 1 — Watchlist (4 coins visible, scroll for more)
             _HomeVerticalSection(
               header: _FadeIn(
                 delay: const Duration(milliseconds: 60),
                 child: _SectionHeader(
-                  title: "Watchlist",
+                  title: 'Watchlist',
                   trailing: _ScaleTap(
                     onTap: () => _openWatchlistCoinSearch(context),
                     child: Material(
@@ -2989,49 +2984,64 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
               ),
-              listRowExtent: 72,
-              itemTiles: _watchlistTiles(),
+              totalItemCount: widget.watchlist.length,
+              itemCards: _watchlistTiles(),
             ),
+            // Section 2 — Recent Analyses (4 cards visible, scroll for more)
             _HomeVerticalSection(
               header: _FadeIn(
                 delay: const Duration(milliseconds: 100),
-                child: const _SectionHeader(title: "Recent Analyses"),
+                child: const _SectionHeader(title: 'Recent Analyses'),
               ),
-              listRowExtent: 96,
-              itemTiles: _recentAnalysisTiles(context),
+              totalItemCount: widget.history.length,
+              itemCards: _recentAnalysisTiles(context),
             ),
+            // Section 3 — Latest Market News (4 headlines by default, scroll for more)
             _FadeIn(
               delay: const Duration(milliseconds: 140),
-              child: Row(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text("Latest Market News", style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
-                  const SizedBox(width: 10),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                    decoration: BoxDecoration(
-                      color: Colors.greenAccent.withValues(alpha: 0.12),
-                      borderRadius: BorderRadius.circular(20),
-                      border: Border.all(color: Colors.greenAccent.withValues(alpha: 0.35)),
-                    ),
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: _AppSpacing.item),
                     child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: const [
-                        Icon(Icons.circle, size: 7, color: Colors.greenAccent),
-                        SizedBox(width: 5),
-                        Text("Live", style: TextStyle(fontSize: 11, color: Colors.greenAccent, fontWeight: FontWeight.w600)),
+                      children: [
+                        const Text(
+                          'Latest Market News',
+                          style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700, letterSpacing: -0.2),
+                        ),
+                        const SizedBox(width: 10),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: Colors.greenAccent.withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(20),
+                            border: Border.all(color: Colors.greenAccent.withValues(alpha: 0.35)),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: const [
+                              Icon(Icons.circle, size: 7, color: Colors.greenAccent),
+                              SizedBox(width: 5),
+                              Text(
+                                'Live',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: Colors.greenAccent,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
                       ],
                     ),
                   ),
+                  const _MarketNewsFeed(nestedInParentScroll: true),
+                  const SizedBox(height: 8),
                 ],
               ),
             ),
-            const SizedBox(height: 10),
-            const _MarketNewsFeed(
-              nestedInParentScroll: true,
-              maxVisibleInViewport: _HomeVerticalSection.defaultVisibleItemCount,
-              listRowExtent: 108,
-            ),
-            const SizedBox(height: _AppSpacing.section),
           ],
         ),
       ),
@@ -3083,16 +3093,10 @@ class _HistoryChipButton extends StatelessWidget {
 }
 
 class _MarketNewsFeed extends StatefulWidget {
-  /// When true, cards stack in Home's SingleChildScrollView (no nested vertical scroll).
+  /// When true, headline cards are plain Column children (Home page scroll only).
   final bool nestedInParentScroll;
-  final int maxVisibleInViewport;
-  final double listRowExtent;
 
-  const _MarketNewsFeed({
-    this.nestedInParentScroll = false,
-    this.maxVisibleInViewport = 4,
-    this.listRowExtent = 108,
-  });
+  const _MarketNewsFeed({this.nestedInParentScroll = false});
 
   @override
   State<_MarketNewsFeed> createState() => _MarketNewsFeedState();
@@ -3213,32 +3217,16 @@ class _MarketNewsFeedState extends State<_MarketNewsFeed> {
 
     if (widget.nestedInParentScroll) {
       final total = _articles.length;
-      final visibleCount = widget.maxVisibleInViewport;
-      final firstCount = total < visibleCount ? total : visibleCount;
-      final overflowCount = total > visibleCount ? total - visibleCount : 0;
-
+      final hint = _HomeVerticalSection.scrollHint(total);
+      final previewEnd = total < _kHomeDefaultVisibleCount ? total : _kHomeDefaultVisibleCount;
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          if (total > visibleCount)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 6),
-              child: Text(
-                'Showing $visibleCount of $total — scroll down for more',
-                style: TextStyle(fontSize: 12, color: Colors.grey[600], height: 1.3),
-              ),
-            ),
-          for (int i = 0; i < firstCount; i++)
-            SizedBox(
-              height: widget.listRowExtent,
-              child: _newsItemBuilder(context, i),
-            ),
-          if (overflowCount > 0) const SizedBox(height: 6),
-          for (int i = visibleCount; i < total; i++)
-            SizedBox(
-              height: widget.listRowExtent,
-              child: _newsItemBuilder(context, i),
-            ),
+          if (hint != null) hint,
+          if (hint != null) const SizedBox(height: 8),
+          for (int i = 0; i < previewEnd; i++) _newsItemBuilder(context, i),
+          if (total > _kHomeDefaultVisibleCount) const SizedBox(height: 4),
+          for (int i = _kHomeDefaultVisibleCount; i < total; i++) _newsItemBuilder(context, i),
         ],
       );
     }
