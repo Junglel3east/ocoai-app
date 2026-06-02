@@ -30,6 +30,7 @@ Trade levels format (Oracle Citadel / Flutter parsing):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timezone
@@ -46,6 +47,7 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -68,8 +70,14 @@ GROK_API_KEY = (os.getenv("GROK_API_KEY") or "").strip()
 GROK_MODEL = os.getenv("GROK_MODEL", "grok-4")
 GROK_API_URL = os.getenv("GROK_API_URL", "https://api.x.ai/v1/chat/completions")
 
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
-GROK_TIMEOUT = int(os.getenv("GROK_TIMEOUT", "90"))
+# Outbound HTTP for prices / CoinGecko (keep relatively short).
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
+# Grok read timeout — Railway + Flutter should allow 90–120s for /analyze.
+GROK_TIMEOUT = int(os.getenv("GROK_TIMEOUT", "120"))
+GROK_CONNECT_TIMEOUT = int(os.getenv("GROK_CONNECT_TIMEOUT", "15"))
+# Hard cap for entire Grok call inside async handler (thread pool + wait_for).
+ANALYZE_ROUTE_TIMEOUT = int(os.getenv("ANALYZE_ROUTE_TIMEOUT", str(GROK_TIMEOUT + 15)))
+GROK_WORKERS = int(os.getenv("GROK_WORKERS", "4"))
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 # Railway sets PORT; fall back to API_PORT then 8000 for local `python api.py`
 API_PORT = int(os.getenv("PORT", os.getenv("API_PORT", "8000")))
@@ -89,6 +97,28 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("oracle.backend")
+
+# Blocking Grok/price work off the event loop — prevents Railway proxy stalls.
+_GROK_EXECUTOR = ThreadPoolExecutor(max_workers=GROK_WORKERS, thread_name_prefix="oracle-grok")
+
+
+class GrokError(Exception):
+    """Raised when xAI/Grok cannot return a usable completion (caller may use fallback text)."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+        response_body: str = "",
+        cause: Optional[BaseException] = None,
+    ) -> None:
+        super().__init__(message)
+        self.user_message = message
+        self.status_code = status_code
+        self.response_body = response_body
+        self.cause = cause
+
 
 # Symbol (uppercase) → CoinGecko coin id (seed + dynamic refresh)
 _SYMBOL_TO_COINGECKO_ID: dict[str, str] = {
@@ -804,10 +834,16 @@ def call_grok(
     temperature: float = 0.4,
     max_tokens: int = 1600,
 ) -> str:
+    """
+    Synchronous Grok call — run via [run_grok_in_executor] from async routes.
+    Raises [GrokError] (not HTTPException) so /analyze can return a fallback report.
+    """
     if not GROK_API_KEY:
-        raise HTTPException(status_code=500, detail="GROK_API_KEY is not configured.")
+        raise GrokError("GROK_API_KEY is not configured on the server.")
 
     started = time.perf_counter()
+    timeout_tuple = (GROK_CONNECT_TIMEOUT, GROK_TIMEOUT)
+
     try:
         response = requests.post(
             GROK_API_URL,
@@ -824,25 +860,132 @@ def call_grok(
                 "temperature": temperature,
                 "max_tokens": max_tokens,
             },
-            timeout=GROK_TIMEOUT,
+            timeout=timeout_tuple,
         )
+    except requests.Timeout as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.error(
+            "grok_timeout elapsed_ms=%.0f connect_s=%s read_s=%s err=%s",
+            elapsed_ms,
+            GROK_CONNECT_TIMEOUT,
+            GROK_TIMEOUT,
+            exc,
+        )
+        raise GrokError(
+            f"Grok timed out after {GROK_TIMEOUT}s (connect {GROK_CONNECT_TIMEOUT}s).",
+            cause=exc,
+        ) from exc
     except requests.RequestException as exc:
-        logger.error("grok_request_failed err=%s", exc)
-        raise HTTPException(status_code=502, detail="AI service unreachable.") from exc
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.error(
+            "grok_request_failed elapsed_ms=%.0f type=%s err=%s",
+            elapsed_ms,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise GrokError("Grok network error — AI service unreachable.", cause=exc) from exc
 
     elapsed_ms = (time.perf_counter() - started) * 1000
 
     if response.status_code != 200:
-        logger.error("grok_http_error status=%s body=%s", response.status_code, response.text[:400])
-        raise HTTPException(status_code=502, detail="AI service returned an error.")
+        body_preview = (response.text or "")[:800]
+        logger.error(
+            "grok_http_error status=%s elapsed_ms=%.0f body=%s",
+            response.status_code,
+            elapsed_ms,
+            body_preview,
+        )
+        raise GrokError(
+            f"Grok HTTP {response.status_code}.",
+            status_code=response.status_code,
+            response_body=body_preview,
+        )
 
     try:
-        content = response.json()["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail="Malformed AI response.") from exc
+        payload = response.json()
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        logger.error(
+            "grok_malformed_json elapsed_ms=%.0f body=%s",
+            elapsed_ms,
+            (response.text or "")[:400],
+            exc_info=True,
+        )
+        raise GrokError("Malformed Grok response payload.", cause=exc) from exc
+
+    if not isinstance(content, str) or not content.strip():
+        raise GrokError("Grok returned empty content.")
 
     logger.info("grok_ok model=%s elapsed_ms=%.0f chars=%d", GROK_MODEL, elapsed_ms, len(content))
     return content.strip()
+
+
+async def run_grok_in_executor(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float,
+    max_tokens: int,
+) -> str:
+    """Run [call_grok] in a worker thread with an asyncio deadline (Railway-safe)."""
+    loop = asyncio.get_running_loop()
+    return await asyncio.wait_for(
+        loop.run_in_executor(
+            _GROK_EXECUTOR,
+            lambda: call_grok(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ),
+        ),
+        timeout=ANALYZE_ROUTE_TIMEOUT,
+    )
+
+
+def build_analyze_fallback_report(
+    *,
+    coin: str,
+    mode: str,
+    market: dict[str, Any],
+    reason: str,
+) -> str:
+    """
+    User-visible report when Grok fails — keeps Flutter flow alive (success=true + report).
+    Same section headers the app already parses/displays.
+    """
+    price = float(market.get("price") or 0)
+    source = market.get("source") or "unknown"
+    mode_label = "Trade Setup" if mode == "tradesetup" else "Analysis"
+
+    trade_levels_note = ""
+    if mode == "tradesetup":
+        trade_levels_note = (
+            "\n**TRADE LEVELS**: Omitted — regenerate when Oracle AI is available.\n"
+        )
+
+    body = f"""**Asset**: {coin} | ${price:,.4f} | —
+
+**Overall Bias**: Neutral (Confidence: 0%)
+
+**Oracle Status**: {mode_label} could not be generated right now.
+
+**Key Drivers**:
+• Live price (${price:,.4f}) from {source} was captured successfully
+• AI engine error: {reason}
+• Tap Quick Analyze or Trade Setup again in 1–2 minutes
+
+**Confluence Summary**: No AI edge this request — infrastructure timeout or upstream outage.
+
+**If I Were to Trade Today...**: Stand flat until Oracle AI completes a full read. Forced entries without the model are negative EV.
+
+**Risks & Watchlist**:
+• Grok/xAI latency or rate limits on Railway
+• Verify `GROK_API_KEY` in Railway Variables if this repeats
+{trade_levels_note}
+"""
+    return ensure_disclaimer(body.strip())
 
 
 def call_grok_chat(
@@ -878,21 +1021,38 @@ def call_grok_chat(
                 "temperature": temperature,
                 "max_tokens": max_tokens,
             },
-            timeout=GROK_TIMEOUT,
+            timeout=(GROK_CONNECT_TIMEOUT, GROK_TIMEOUT),
         )
+    except requests.Timeout as exc:
+        logger.error(
+            "grok_chat_timeout connect_s=%s read_s=%s err=%s",
+            GROK_CONNECT_TIMEOUT,
+            GROK_TIMEOUT,
+            exc,
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=f"AI chat timed out after {GROK_TIMEOUT}s.",
+        ) from exc
     except requests.RequestException as exc:
-        logger.error("grok_chat_failed err=%s", exc)
+        logger.error("grok_chat_failed err=%s", exc, exc_info=True)
         raise HTTPException(status_code=502, detail="AI service unreachable.") from exc
 
     elapsed_ms = (time.perf_counter() - started) * 1000
 
     if response.status_code != 200:
-        logger.error("grok_chat_http_error status=%s", response.status_code)
+        logger.error(
+            "grok_chat_http_error status=%s elapsed_ms=%.0f body=%s",
+            response.status_code,
+            elapsed_ms,
+            (response.text or "")[:400],
+        )
         raise HTTPException(status_code=502, detail="AI service returned an error.")
 
     try:
         content = response.json()["choices"][0]["message"]["content"]
     except (KeyError, IndexError, ValueError) as exc:
+        logger.error("grok_chat_malformed elapsed_ms=%.0f", elapsed_ms, exc_info=True)
         raise HTTPException(status_code=502, detail="Malformed AI response.") from exc
 
     logger.info("grok_chat_ok elapsed_ms=%.0f chars=%d", elapsed_ms, len(content))
@@ -1353,8 +1513,20 @@ Then disclaimer."""
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("startup | refreshing CoinGecko symbol index")
-    refresh_coingecko_symbol_index(force=True)
+    # Never block app boot if CoinGecko is slow — /health must come up for Railway.
+    try:
+        logger.info("startup | refreshing CoinGecko symbol index")
+        refresh_coingecko_symbol_index(force=True)
+    except Exception as exc:
+        logger.warning("startup | CoinGecko index refresh failed (non-fatal): %s", exc, exc_info=True)
+
+    logger.info(
+        "startup | timeouts request=%ss grok_connect=%ss grok_read=%ss analyze_route=%ss",
+        REQUEST_TIMEOUT,
+        GROK_CONNECT_TIMEOUT,
+        GROK_TIMEOUT,
+        ANALYZE_ROUTE_TIMEOUT,
+    )
     if not GROK_API_KEY:
         logger.warning(
             "startup | GROK_API_KEY not set — set Railway Variable GROK_API_KEY "
@@ -1363,13 +1535,14 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("startup | grok_model=%s configured (key present)", GROK_MODEL)
     yield
-    logger.info("shutdown")
+    logger.info("shutdown | shutting down Grok executor")
+    _GROK_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
 
 # redirect_slashes=False — avoids POST /analyze → 307 → /analyze/ (body lost → 404 on clients)
 app = FastAPI(
     title="On-Chain Oracle AI API",
-    version="2.3.0",
+    version="2.4.0",
     description="Production backend for the Flutter mobile app",
     lifespan=lifespan,
     redirect_slashes=False,
@@ -1392,7 +1565,31 @@ async def request_logging_middleware(request: Request, call_next):
     request.state.request_id = request_id
     started = time.perf_counter()
 
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except HTTPException as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.warning(
+            "http_http_exception request_id=%s %s %s status=%s detail=%s elapsed_ms=%.1f",
+            request_id,
+            request.method,
+            request.url.path,
+            exc.status_code,
+            exc.detail,
+            elapsed_ms,
+        )
+        raise
+    except Exception as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.exception(
+            "http_unhandled request_id=%s %s %s elapsed_ms=%.1f err=%s",
+            request_id,
+            request.method,
+            request.url.path,
+            elapsed_ms,
+            exc,
+        )
+        raise
 
     elapsed_ms = (time.perf_counter() - started) * 1000
     logger.info(
@@ -1405,6 +1602,22 @@ async def request_logging_middleware(request: Request, call_next):
     )
     response.headers["X-Request-ID"] = request_id
     return response
+
+
+@app.exception_handler(GrokError)
+async def grok_error_handler(request: Request, exc: GrokError) -> JSONResponse:
+    """Non-analyze routes still surface Grok failures as JSON errors."""
+    logger.error(
+        "grok_error_handler request_id=%s path=%s msg=%s status=%s",
+        getattr(request.state, "request_id", "?"),
+        request.url.path,
+        exc.user_message,
+        exc.status_code,
+    )
+    return JSONResponse(
+        status_code=502,
+        content={"success": False, "detail": exc.user_message},
+    )
 
 
 @app.get("/")
@@ -1421,24 +1634,38 @@ async def root() -> dict[str, Any]:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    """Flutter startup ping — includes Grok configuration status."""
-    return {
-        "status": "ok",
-        "version": "2.3.0",
-        "grok_configured": bool(GROK_API_KEY),
-        "grok_model": GROK_MODEL,
-        "routes": {
-            "analyze": ["POST /analyze", "POST /analyze/"],
-            "trade_setup": [
-                "POST /trade-setup",
-                "POST /trade_setup",
-                "POST /tradesetup",
-                "POST /analyze (mode=tradesetup)",
-            ],
-            "review": ["POST /review"],
-            "chat": ["POST /chat"],
-        },
-    }
+    """
+    Railway healthcheck + Flutter ping — must stay fast and never call Grok/CoinGecko.
+    """
+    try:
+        return {
+            "status": "ok",
+            "version": "2.4.0",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "grok_configured": bool(GROK_API_KEY),
+            "grok_model": GROK_MODEL,
+            "timeouts": {
+                "grok_connect_seconds": GROK_CONNECT_TIMEOUT,
+                "grok_read_seconds": GROK_TIMEOUT,
+                "analyze_route_seconds": ANALYZE_ROUTE_TIMEOUT,
+                "price_request_seconds": REQUEST_TIMEOUT,
+            },
+            "routes": {
+                "analyze": ["POST /analyze", "POST /analyze/"],
+                "trade_setup": [
+                    "POST /trade-setup",
+                    "POST /trade_setup",
+                    "POST /tradesetup",
+                    "POST /analyze (mode=tradesetup)",
+                ],
+                "review": ["POST /review"],
+                "chat": ["POST /chat"],
+            },
+        }
+    except Exception as exc:
+        # Last resort — still return 200 so Railway does not mark the service dead.
+        logger.exception("health_endpoint_error: %s", exc)
+        return {"status": "ok", "version": "2.4.0", "degraded": True}
 
 
 @app.get("/coins")
@@ -1456,8 +1683,9 @@ async def _handle_analyze(
 ) -> dict[str, Any]:
     """
     Shared handler for POST /analyze and trade-setup aliases.
-    AI prompts, Grok calls, and response JSON shape are unchanged.
+    Grok runs in a thread pool with 120s-class timeouts; failures return a fallback report (not 502).
     """
+    req_id = getattr(http_request.state, "request_id", "?")
     coin = request.coin.strip().upper()
     if not coin:
         raise HTTPException(status_code=400, detail="coin is required.")
@@ -1470,59 +1698,119 @@ async def _handle_analyze(
         )
 
     direction = normalize_direction(request.direction)
-    # Fresh CoinGecko price injected into prompt — same AI style/format as before
-    market = fetch_live_price_for_analysis(coin)
+    grok_fallback = False
 
-    scalp_mode = is_scalp_context(
-        timeframe=request.timeframe,
-        direction=request.direction,
-        mode=mode,
-        system_prompt=request.system_prompt or "",
-    )
+    try:
+        # Fresh CoinGecko price injected into prompt — same AI style/format as before
+        market = fetch_live_price_for_analysis(coin)
 
-    derivatives = fetch_derivatives_snapshot(coin, spot_price=float(market["price"]))
+        scalp_mode = is_scalp_context(
+            timeframe=request.timeframe,
+            direction=request.direction,
+            mode=mode,
+            system_prompt=request.system_prompt or "",
+        )
 
-    # Veteran backend prompt is authoritative (Flutter-compatible structure preserved)
-    system_prompt = default_system_prompt(mode, scalp_mode=scalp_mode)
-    user_prompt = build_analyze_user_prompt(
-        coin=coin,
-        timeframe=request.timeframe,
-        mode=mode,
-        direction=direction,
-        market=market,
-        scalp_mode=scalp_mode,
-        derivatives=derivatives,
-    )
+        derivatives = fetch_derivatives_snapshot(coin, spot_price=float(market["price"]))
 
-    req_id = getattr(http_request.state, "request_id", "?")
-    logger.info(
-        "analyze request_id=%s coin=%s mode=%s tf=%s dir=%s scalp=%s price=%.6f src=%s deriv=%s",
-        req_id,
-        coin,
-        mode,
-        request.timeframe,
-        direction,
-        scalp_mode,
-        market["price"],
-        market.get("source"),
-        derivatives["has_futures_data"],
-    )
+        system_prompt = default_system_prompt(mode, scalp_mode=scalp_mode)
+        user_prompt = build_analyze_user_prompt(
+            coin=coin,
+            timeframe=request.timeframe,
+            mode=mode,
+            direction=direction,
+            market=market,
+            scalp_mode=scalp_mode,
+            derivatives=derivatives,
+        )
 
-    report = call_grok(
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        temperature=0.36 if scalp_mode else (0.39 if mode == "analysis" else 0.35),
-        max_tokens=1800 if mode == "tradesetup" or scalp_mode else 1580,
-    )
-    report = ensure_disclaimer(report)
-    audit_trade_levels(report, float(market["price"]), scalp_mode=scalp_mode)
+        logger.info(
+            "analyze request_id=%s coin=%s mode=%s tf=%s dir=%s scalp=%s price=%.6f src=%s deriv=%s",
+            req_id,
+            coin,
+            mode,
+            request.timeframe,
+            direction,
+            scalp_mode,
+            market["price"],
+            market.get("source"),
+            derivatives["has_futures_data"],
+        )
 
-    return {
-        "success": True,
-        "coin": coin,
-        "current_price": market["price"],
-        "report": report,
-    }
+        temperature = 0.36 if scalp_mode else (0.39 if mode == "analysis" else 0.35)
+        max_tokens = 1800 if mode == "tradesetup" or scalp_mode else 1580
+
+        try:
+            report = await run_grok_in_executor(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except asyncio.TimeoutError as exc:
+            grok_fallback = True
+            reason = f"analyze route exceeded {ANALYZE_ROUTE_TIMEOUT}s"
+            logger.error(
+                "analyze_grok_timeout request_id=%s coin=%s mode=%s %s",
+                req_id,
+                coin,
+                mode,
+                reason,
+                exc_info=True,
+            )
+            report = build_analyze_fallback_report(
+                coin=coin, mode=mode, market=market, reason=reason
+            )
+        except GrokError as exc:
+            grok_fallback = True
+            logger.error(
+                "analyze_grok_failed request_id=%s coin=%s mode=%s msg=%s http=%s body=%s",
+                req_id,
+                coin,
+                mode,
+                exc.user_message,
+                exc.status_code,
+                (exc.response_body or "")[:200],
+                exc_info=exc.cause is not None,
+            )
+            report = build_analyze_fallback_report(
+                coin=coin, mode=mode, market=market, reason=exc.user_message
+            )
+
+        report = ensure_disclaimer(report)
+        if not grok_fallback:
+            try:
+                audit_trade_levels(report, float(market["price"]), scalp_mode=scalp_mode)
+            except HTTPException as audit_exc:
+                logger.warning(
+                    "analyze_trade_audit_failed request_id=%s coin=%s detail=%s",
+                    req_id,
+                    coin,
+                    audit_exc.detail,
+                )
+
+        return {
+            "success": True,
+            "coin": coin,
+            "current_price": market["price"],
+            "report": report,
+            "grok_fallback": grok_fallback,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "analyze_unhandled request_id=%s coin=%s mode=%s err=%s",
+            req_id,
+            coin,
+            mode,
+            exc,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Analyze request failed unexpectedly. Check server logs.",
+        ) from exc
 
 
 @app.post("/analyze")
@@ -1577,12 +1865,16 @@ async def review(request: ReviewRequest, http_request: Request):
     req_id = getattr(http_request.state, "request_id", "?")
     logger.info("review request_id=%s coin=%s price=%.6f", req_id, coin, market["price"])
 
-    review_text = call_grok(
-        system_prompt=build_review_system_prompt(),
-        user_prompt=build_review_user_prompt(coin, previous_report, market),
-        temperature=0.50,
-        max_tokens=1150,
-    )
+    try:
+        review_text = call_grok(
+            system_prompt=build_review_system_prompt(),
+            user_prompt=build_review_user_prompt(coin, previous_report, market),
+            temperature=0.50,
+            max_tokens=1150,
+        )
+    except GrokError as exc:
+        logger.error("review_grok_failed request_id=%s coin=%s msg=%s", req_id, coin, exc.user_message)
+        raise HTTPException(status_code=502, detail=exc.user_message) from exc
     review_text = ensure_disclaimer(review_text)
 
     return {
@@ -1618,4 +1910,11 @@ async def chat(request: ChatRequest, http_request: Request):
 
 
 if __name__ == "__main__":
-    uvicorn.run("api:app", host=API_HOST, port=API_PORT, reload=False)
+    # --timeout-keep-alive helps long /analyze responses behind Railway proxy.
+    uvicorn.run(
+        "api:app",
+        host=API_HOST,
+        port=API_PORT,
+        reload=False,
+        timeout_keep_alive=120,
+    )
