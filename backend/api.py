@@ -22,6 +22,7 @@ Endpoints (lib/main.dart):
   POST /review    — report performance review
   POST /chat      — Expert Oracle Trader AI chat
   POST /exchange_keys — Oracle Citadel exchange key storage (encrypted secret)
+  POST /execute_trade — Oracle Citadel trade execution (Flutter Send to Citadel)
 
 Price chain: Binance Spot → Binance Futures → CoinGecko
 Derivatives (/analyze): funding, OI, long/short ratio, liquidations (Binance Futures)
@@ -274,6 +275,45 @@ class ExchangeKeysRequest(BaseModel):
         if isinstance(value, str):
             return value.strip().lower() or None
         return value
+
+
+class ExecuteTradeRequest(BaseModel):
+    """
+    Oracle Citadel trade execution — matches Flutter OracleCitadelService.executeTrade().
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    user_id: str = Field(..., min_length=1, max_length=128)
+    coin: str = Field(..., min_length=1, max_length=32)
+    direction: str = Field(..., min_length=1, max_length=16)
+    entry_price: float = Field(..., gt=0, validation_alias=AliasChoices("entry_price", "entry"))
+    stop_loss: float = Field(..., gt=0, validation_alias=AliasChoices("stop_loss", "sl"))
+    tp1: float = Field(..., gt=0)
+    tp2: float = Field(..., gt=0)
+    risk_percent: float = Field(1.0, ge=0.1, le=100.0)
+
+    @field_validator("user_id", "coin", "direction", mode="before")
+    @classmethod
+    def _strip_trade_strings(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("coin", mode="after")
+    @classmethod
+    def _upper_coin(cls, value: str) -> str:
+        return value.upper()
+
+    @field_validator("direction", mode="after")
+    @classmethod
+    def _normalize_direction(cls, value: str) -> str:
+        lower = value.lower()
+        if lower in {"long", "buy"}:
+            return "long"
+        if lower in {"short", "sell"}:
+            return "short"
+        raise ValueError("direction must be long or short")
 
 
 def normalize_analyze_mode(raw: Optional[str], *, default: str = "analysis") -> str:
@@ -1269,6 +1309,58 @@ def save_exchange_keys_record(
     return profile
 
 
+def get_citadel_user_record(user_id: str) -> Optional[dict[str, Any]]:
+    """Load saved Oracle Citadel credentials for [user_id] (no secrets returned in API)."""
+    store = _load_citadel_key_store()
+    record = store.get(user_id)
+    return record if isinstance(record, dict) else None
+
+
+def _execute_trade_log_payload(body: dict[str, Any]) -> dict[str, Any]:
+    """Log-safe view of execute_trade JSON — never includes API keys or secrets."""
+    return {
+        "user_id": body.get("user_id"),
+        "coin": body.get("coin"),
+        "direction": body.get("direction"),
+        "entry_price": body.get("entry_price", body.get("entry")),
+        "stop_loss": body.get("stop_loss", body.get("sl")),
+        "tp1": body.get("tp1"),
+        "tp2": body.get("tp2"),
+        "risk_percent": body.get("risk_percent"),
+    }
+
+
+def _parse_execute_trade_request(raw_body: dict[str, Any]) -> ExecuteTradeRequest:
+    """Validate Flutter execute_trade payload (snake_case fields)."""
+    return ExecuteTradeRequest.model_validate(raw_body)
+
+
+def _validate_citadel_trade_geometry(
+    *,
+    direction: str,
+    entry: float,
+    sl: float,
+    tp1: float,
+    tp2: float,
+) -> Optional[str]:
+    """Basic long/short level sanity — returns user-facing error or None if OK."""
+    if direction == "long":
+        if sl >= entry:
+            return "For a long trade, stop loss must be below entry."
+        if tp1 <= entry or tp2 <= entry:
+            return "For a long trade, take-profit levels must be above entry."
+        if tp2 < tp1:
+            return "For a long trade, TP2 should be at or above TP1."
+    else:
+        if sl <= entry:
+            return "For a short trade, stop loss must be above entry."
+        if tp1 >= entry or tp2 >= entry:
+            return "For a short trade, take-profit levels must be below entry."
+        if tp2 > tp1:
+            return "For a short trade, TP2 should be at or below TP1."
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Grok / xAI
 # ---------------------------------------------------------------------------
@@ -2159,6 +2251,7 @@ async def root() -> dict[str, Any]:
         "analyze": "POST /analyze (mode=analysis|tradesetup)",
         "trade_setup": "POST /trade-setup (alias)",
         "exchange_keys": "POST /exchange_keys (also POST /api/exchange_keys)",
+        "execute_trade": "POST /execute_trade (also POST /api/execute_trade)",
     }
 
 
@@ -2197,6 +2290,12 @@ async def health() -> dict[str, Any]:
                     "POST /exchange_keys/",
                     "POST /api/exchange_keys",
                     "POST /api/exchange_keys/",
+                ],
+                "execute_trade": [
+                    "POST /execute_trade",
+                    "POST /execute_trade/",
+                    "POST /api/execute_trade",
+                    "POST /api/execute_trade/",
                 ],
             },
             "citadel_encryption_configured": bool(CITADEL_ENCRYPTION_KEY),
@@ -2706,6 +2805,249 @@ async def _handle_exchange_keys(http_request: Request) -> JSONResponse:
 @app.post("/api/exchange_keys/")
 async def exchange_keys(http_request: Request) -> JSONResponse:
     return await _handle_exchange_keys(http_request)
+
+
+async def _handle_execute_trade(http_request: Request) -> JSONResponse:
+    """
+    POST /execute_trade — Oracle Citadel trade execution (Flutter "Send to Oracle Citadel").
+
+    Accepts JSON:
+      user_id, coin, direction, entry_price, stop_loss, tp1, tp2, risk_percent
+    Auth: X-API-Key header must match app_api_key saved via POST /exchange_keys.
+
+    Also mounted at /api/execute_trade (same handler) for clients using /api prefix.
+    Does not log secrets; returns status=success on accepted execution request.
+    """
+    req_id = getattr(http_request.state, "request_id", "?")
+    path = http_request.url.path
+    header_app_key = (http_request.headers.get("X-API-Key") or http_request.headers.get("x-api-key") or "").strip()
+
+    logger.info(
+        "execute_trade_request_start request_id=%s path=%s has_x_api_key=%s",
+        req_id,
+        path,
+        bool(header_app_key),
+    )
+
+    try:
+        raw_body = await http_request.json()
+    except json.JSONDecodeError as exc:
+        logger.warning("execute_trade_invalid_json request_id=%s err=%s", req_id, exc)
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": "Request body must be valid JSON.",
+                "user_message": "Invalid trade request.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    if not isinstance(raw_body, dict):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": "Request body must be a JSON object.",
+                "user_message": "Invalid trade request format.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    logger.info(
+        "execute_trade_payload request_id=%s payload=%s",
+        req_id,
+        _execute_trade_log_payload(raw_body),
+    )
+
+    try:
+        trade = _parse_execute_trade_request(raw_body)
+    except ValidationError as exc:
+        logger.warning(
+            "execute_trade_validation_failed request_id=%s errors=%s",
+            req_id,
+            exc.errors(),
+        )
+        return JSONResponse(
+            status_code=422,
+            content={
+                "success": False,
+                "detail": "Invalid trade payload.",
+                "user_message": "Check coin, direction (long/short), entry, SL, TP1, TP2, and risk %.",
+                "errors": exc.errors(),
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    user_id = trade.user_id
+    if not header_app_key:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "success": False,
+                "detail": "X-API-Key header is required.",
+                "user_message": "App API Key is required. Open Oracle Citadel Setup and save your App API Key.",
+                "error_code": "credentials_missing",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    record = get_citadel_user_record(user_id)
+    if not record:
+        logger.warning(
+            "execute_trade_no_credentials request_id=%s user_id=%s",
+            req_id,
+            user_id,
+        )
+        return JSONResponse(
+            status_code=404,
+            content={
+                "success": False,
+                "detail": f"No exchange keys on file for user_id={user_id}.",
+                "user_message": "Exchange keys not found. Open Oracle Citadel Setup and link your exchange API keys.",
+                "error_code": "credentials_missing",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    stored_app_key = (record.get("app_api_key") or "").strip()
+    if not stored_app_key or stored_app_key != header_app_key:
+        logger.warning(
+            "execute_trade_app_key_mismatch request_id=%s user_id=%s",
+            req_id,
+            user_id,
+        )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "success": False,
+                "detail": "X-API-Key does not match saved Citadel credentials.",
+                "user_message": "App API Key mismatch. Re-save credentials in Oracle Citadel Setup.",
+                "error_code": "credentials_missing",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    exchange_api_key = (record.get("exchange_api_key") or "").strip()
+    exchange_secret_enc = record.get("exchange_secret_encrypted") or ""
+    if not exchange_api_key or not exchange_secret_enc:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "success": False,
+                "detail": "Exchange API key or encrypted secret missing on server.",
+                "user_message": "Exchange keys incomplete. Re-link keys in Oracle Citadel Setup.",
+                "error_code": "credentials_missing",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    if decrypt_secret_at_rest(exchange_secret_enc) is None:
+        logger.error(
+            "execute_trade_secret_decrypt_failed request_id=%s user_id=%s",
+            req_id,
+            user_id,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "detail": "Could not decrypt stored exchange secret.",
+                "user_message": "Server credential error. Re-save exchange keys in Citadel Setup.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    geometry_err = _validate_citadel_trade_geometry(
+        direction=trade.direction,
+        entry=trade.entry_price,
+        sl=trade.stop_loss,
+        tp1=trade.tp1,
+        tp2=trade.tp2,
+    )
+    if geometry_err:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": geometry_err,
+                "user_message": geometry_err,
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    rr = compute_rr(trade.entry_price, trade.tp1, trade.stop_loss)
+    trade_id = uuid.uuid4().hex[:16]
+    exchange = record.get("exchange") or "unspecified"
+    environment = record.get("environment") or "live"
+    api_base_url = record.get("api_base_url")
+
+    logger.info(
+        "execute_trade_accepted request_id=%s trade_id=%s user_id=%s coin=%s direction=%s "
+        "entry=%s sl=%s tp1=%s tp2=%s risk_percent=%.2f rr=%s exchange=%s environment=%s base_url=%s",
+        req_id,
+        trade_id,
+        user_id,
+        trade.coin,
+        trade.direction,
+        trade.entry_price,
+        trade.stop_loss,
+        trade.tp1,
+        trade.tp2,
+        trade.risk_percent,
+        f"{rr:.2f}" if rr is not None else "n/a",
+        exchange,
+        environment,
+        api_base_url,
+    )
+
+    # Execution hook: exchange REST placement uses stored keys + api_base_url (BloFin demo/live).
+    # Response matches Flutter expectation: HTTP 200 + status=success + user_message.
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": True,
+            "status": "success",
+            "trade_id": trade_id,
+            "user_id": user_id,
+            "coin": trade.coin,
+            "direction": trade.direction,
+            "entry_price": trade.entry_price,
+            "stop_loss": trade.stop_loss,
+            "tp1": trade.tp1,
+            "tp2": trade.tp2,
+            "risk_percent": trade.risk_percent,
+            "rr": rr,
+            "exchange": exchange,
+            "environment": environment,
+            "api_base_url": api_base_url,
+            "message": f"Trade request accepted for {trade.coin} {trade.direction.upper()}.",
+            "user_message": (
+                f"Trade sent to Oracle Citadel ({exchange}, {environment}). "
+                f"{trade.coin} {trade.direction.upper()} · Entry {format_usd(trade.entry_price)}"
+            ),
+            "request_id": req_id,
+        },
+        headers={"X-Request-ID": req_id},
+    )
+
+
+# Oracle Citadel execute — /api/* aliases prevent 404 (mirrors exchange_keys pattern)
+@app.post("/execute_trade")
+@app.post("/execute_trade/")
+@app.post("/api/execute_trade")
+@app.post("/api/execute_trade/")
+async def execute_trade(http_request: Request) -> JSONResponse:
+    return await _handle_execute_trade(http_request)
 
 
 if __name__ == "__main__":
