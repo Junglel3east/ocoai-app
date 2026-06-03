@@ -94,6 +94,13 @@ CITADEL_ENCRYPTION_KEY = (os.getenv("CITADEL_ENCRYPTION_KEY") or "").strip()
 _CITADEL_DATA_DIR = _BACKEND_DIR / "data"
 _CITADEL_KEYS_FILE = _CITADEL_DATA_DIR / "exchange_keys.json"
 
+# BloFin Open API — demo/testnet uses a separate host from live production.
+BLOFIN_DEMO_API_BASE_URL = "https://demo-trading-openapi.blofin.com"
+BLOFIN_LIVE_API_BASE_URL = os.getenv(
+    "BLOFIN_LIVE_API_BASE_URL",
+    "https://openapi.blofin.com",
+)
+
 MIN_RR_TP1 = 2.1
 TARGET_RR_TP1 = 2.3
 
@@ -230,6 +237,12 @@ class ExchangeKeysRequest(BaseModel):
         validation_alias=AliasChoices("exchange_secret", "api_secret"),
     )
     risk_percent: float = Field(1.0, ge=0.1, le=100.0)
+    # Optional exchange id (e.g. "blofin", "coinbase"). Demo URL only for BloFin + use_demo_mode.
+    exchange: Optional[str] = Field(None, max_length=64)
+    use_demo_mode: bool = Field(
+        False,
+        validation_alias=AliasChoices("use_demo_mode", "demo_mode"),
+    )
 
     @field_validator("user_id", "exchange_api_key", "exchange_secret", mode="before")
     @classmethod
@@ -245,6 +258,15 @@ class ExchangeKeysRequest(BaseModel):
             return None
         if isinstance(value, str):
             return value.strip() or None
+        return value
+
+    @field_validator("exchange", mode="before")
+    @classmethod
+    def _strip_optional_exchange(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value.strip().lower() or None
         return value
 
 
@@ -811,24 +833,188 @@ def format_usd(price: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Trade level validation (Oracle Citadel / Flutter extractTradeLevel)
+# Trade level parsing (Oracle Citadel / Flutter) — extraction only, not AI prompts
 # ---------------------------------------------------------------------------
 
-_TRADE_LEVEL_PATTERNS = {
-    "entry": re.compile(r"entry\s*(?:at|:)?\s*\$?\s*([0-9]+(?:[.,][0-9]+)?)", re.I),
-    "tp1": re.compile(r"tp1\s*(?:at|:)?\s*\$?\s*([0-9]+(?:[.,][0-9]+)?)", re.I),
-    "tp2": re.compile(r"tp2\s*(?:at|:)?\s*\$?\s*([0-9]+(?:[.,][0-9]+)?)", re.I),
-    "sl": re.compile(r"sl\s*(?:at|:)?\s*\$?\s*([0-9]+(?:[.,][0-9]+)?)", re.I),
+_LEVEL_LABELS = {
+    "entry": "Entry",
+    "tp1": "TP1",
+    "tp2": "TP2",
+    "sl": "Stop Loss",
 }
+
+# Canonical one-liner from trade-setup prompts (order may vary slightly in text).
+_CANONICAL_TRADE_LEVELS_RE = re.compile(
+    r"entry\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
+    r".{0,120}?tp\s*[-_]?\s*1\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
+    r".{0,120}?tp\s*[-_]?\s*2\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
+    r".{0,120}?s(?:top\s*[-_]?\s*loss|l)\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Alternate ordering: SL before Entry, etc.
+_CANONICAL_TRADE_LEVELS_ALT_RE = re.compile(
+    r"tp\s*[-_]?\s*1\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
+    r".{0,120}?tp\s*[-_]?\s*2\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
+    r".{0,120}?s(?:top\s*[-_]?\s*loss|l)\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
+    r".{0,120}?entry\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Per-field fallback patterns — tried in order until a price is found.
+_LEVEL_FIELD_PATTERNS: dict[str, list[re.Pattern[str]]] = {
+    "entry": [
+        re.compile(
+            r"(?:^|[\n\r\*\-])\s*entry(?:\s+price|\s+zone|\s+level)?\s*(?:at|@|:|is|=|-)?\s*\$?\s*"
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+        re.compile(r"entry\s*[=:]\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", re.IGNORECASE),
+        re.compile(r"buy\s+(?:at|@|:)\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", re.IGNORECASE),
+    ],
+    "tp1": [
+        re.compile(
+            r"tp\s*[-_]?\s*1\s*(?:at|@|:|is|=|-)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"take\s*[-_]?\s*profit\s*[-_]?\s*1\s*(?:at|@|:|is|=|-)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"target\s*[-_]?\s*1\s*(?:at|@|:|is|=|-)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+            re.IGNORECASE,
+        ),
+        re.compile(r"t\.?p\.?\s*1\s*[=:]\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", re.IGNORECASE),
+    ],
+    "tp2": [
+        re.compile(
+            r"tp\s*[-_]?\s*2\s*(?:at|@|:|is|=|-)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"take\s*[-_]?\s*profit\s*[-_]?\s*2\s*(?:at|@|:|is|=|-)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"target\s*[-_]?\s*2\s*(?:at|@|:|is|=|-)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+            re.IGNORECASE,
+        ),
+        re.compile(r"t\.?p\.?\s*2\s*[=:]\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", re.IGNORECASE),
+    ],
+    "sl": [
+        re.compile(
+            r"s(?:top\s*[-_]?\s*loss|l)\s*(?:at|@|:|is|=|-)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"stop\s*[-_]?\s*loss\s*(?:at|@|:|is|=|-)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+            re.IGNORECASE,
+        ),
+        re.compile(r"invalidation\s*(?:at|@|:|is|=|-)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", re.IGNORECASE),
+    ],
+}
+
+_RR_TEXT_PATTERNS = [
+    re.compile(
+        r"(?:r\s*:?\s*r|risk\s*[-:]?\s*reward)\s*(?:ratio)?\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*:?\s*1",
+        re.IGNORECASE,
+    ),
+    re.compile(r"reward\s*[-:]\s*risk\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE),
+]
+
+
+def _normalize_report_for_parsing(report: str) -> str:
+    """Strip markdown emphasis so **Entry** and Entry parse the same."""
+    text = report or ""
+    text = re.sub(r"\*+", "", text)
+    text = text.replace("—", "-").replace("–", "-")
+    return text
+
+
+def _parse_price_token(raw: str) -> Optional[float]:
+    if not raw:
+        return None
+    cleaned = raw.strip().replace(",", "").replace(" ", "")
+    cleaned = re.sub(r"[^\d.]+$", "", cleaned)
+    try:
+        value = float(cleaned)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _first_match_price(patterns: list[re.Pattern[str]], text: str) -> Optional[float]:
+    for pattern in patterns:
+        match = pattern.search(text)
+        if match:
+            price = _parse_price_token(match.group(1))
+            if price is not None:
+                return price
+    return None
 
 
 def parse_trade_levels(report: str) -> dict[str, Optional[float]]:
-    levels: dict[str, Optional[float]] = {k: None for k in _TRADE_LEVEL_PATTERNS}
-    for key, pattern in _TRADE_LEVEL_PATTERNS.items():
-        match = pattern.search(report)
+    """
+    Extract Entry, TP1, TP2, SL, and R:R from AI report text.
+    Does not change prompts — only tolerates wording/format variation.
+    """
+    text = _normalize_report_for_parsing(report)
+    levels: dict[str, Optional[float]] = {
+        "entry": None,
+        "tp1": None,
+        "tp2": None,
+        "sl": None,
+        "rr": None,
+    }
+
+    canonical = _CANONICAL_TRADE_LEVELS_RE.search(text)
+    if canonical:
+        levels["entry"] = _parse_price_token(canonical.group(1))
+        levels["tp1"] = _parse_price_token(canonical.group(2))
+        levels["tp2"] = _parse_price_token(canonical.group(3))
+        levels["sl"] = _parse_price_token(canonical.group(4))
+    else:
+        alt = _CANONICAL_TRADE_LEVELS_ALT_RE.search(text)
+        if alt:
+            levels["tp1"] = _parse_price_token(alt.group(1))
+            levels["tp2"] = _parse_price_token(alt.group(2))
+            levels["sl"] = _parse_price_token(alt.group(3))
+            levels["entry"] = _parse_price_token(alt.group(4))
+
+    for field, patterns in _LEVEL_FIELD_PATTERNS.items():
+        if levels[field] is not None:
+            continue
+        levels[field] = _first_match_price(patterns, text)
+
+    for pattern in _RR_TEXT_PATTERNS:
+        match = pattern.search(text)
         if match:
-            levels[key] = float(match.group(1).replace(",", ""))
+            levels["rr"] = _parse_price_token(match.group(1))
+            break
+
+    entry, tp1, sl = levels["entry"], levels["tp1"], levels["sl"]
+    if levels["rr"] is None and entry is not None and tp1 is not None and sl is not None:
+        levels["rr"] = compute_rr(entry, tp1, sl)
+
     return levels
+
+
+def missing_trade_level_labels(levels: dict[str, Optional[float]]) -> list[str]:
+    """Human-readable list of levels still missing after parsing."""
+    required = ("entry", "tp1", "tp2", "sl")
+    return [_LEVEL_LABELS[key] for key in required if levels.get(key) is None]
+
+
+def trade_levels_error_message(levels: dict[str, Optional[float]]) -> Optional[str]:
+    """Clear Citadel-facing error when parsing failed."""
+    missing = missing_trade_level_labels(levels)
+    if not missing:
+        return None
+    return (
+        f"Could not parse {', '.join(missing)} from this report. "
+        "Include a TRADE LEVELS line: Entry at $X, TP1 at $X, TP2 at $X, SL at $X (R:R X.X:1)."
+    )
 
 
 def compute_rr(entry: float, tp1: float, sl: float) -> Optional[float]:
@@ -841,25 +1027,39 @@ def compute_rr(entry: float, tp1: float, sl: float) -> Optional[float]:
 
 def audit_trade_levels(report: str, live_price: float, *, scalp_mode: bool = False) -> None:
     levels = parse_trade_levels(report)
-    entry, tp1, sl = levels["entry"], levels["tp1"], levels["sl"]
-    if entry is None or tp1 is None or sl is None:
+    missing = missing_trade_level_labels(levels)
+    if missing:
+        logger.warning(
+            "trade_levels_incomplete missing=%s parsed=%s",
+            ",".join(missing),
+            {k: levels.get(k) for k in ("entry", "tp1", "tp2", "sl", "rr")},
+        )
         return
 
-    rr = compute_rr(entry, tp1, sl)
+    entry, tp1, tp2, sl = levels["entry"], levels["tp1"], levels["tp2"], levels["sl"]
+    rr = levels.get("rr") or compute_rr(entry, tp1, sl)
     if rr is not None:
         if rr < MIN_RR_TP1:
             logger.warning(
-                "rr_below_floor rr=%.2f floor=%.1f entry=%s tp1=%s sl=%s",
+                "rr_below_floor rr=%.2f floor=%.1f entry=%s tp1=%s tp2=%s sl=%s",
                 rr,
                 MIN_RR_TP1,
                 entry,
                 tp1,
+                tp2,
                 sl,
             )
         else:
-            logger.info("rr_ok rr=%.2f entry=%s tp1=%s sl=%s", rr, entry, tp1, sl)
+            logger.info(
+                "rr_ok rr=%.2f entry=%s tp1=%s tp2=%s sl=%s",
+                rr,
+                entry,
+                tp1,
+                tp2,
+                sl,
+            )
 
-    if live_price > 0:
+    if live_price > 0 and entry is not None:
         drift_pct = abs(entry - live_price) / live_price * 100
         max_drift = 2.5 if scalp_mode else 8.0
         if drift_pct > max_drift:
@@ -910,6 +1110,53 @@ def _save_citadel_key_store(store: dict[str, Any]) -> None:
     tmp.replace(_CITADEL_KEYS_FILE)
 
 
+def resolve_citadel_exchange_profile(
+    exchange: Optional[str],
+    use_demo_mode: bool,
+) -> dict[str, Any]:
+    """
+    BloFin Demo: only when exchange name contains 'blofin' AND use_demo_mode is True.
+    Coinbase, Kraken, Binance, etc. are unchanged (no demo base URL forced).
+    """
+    raw = (exchange or "").strip().lower()
+    is_blofin = "blofin" in raw
+
+    if use_demo_mode and not is_blofin:
+        return {
+            "exchange": raw or "unspecified",
+            "environment": "live",
+            "api_base_url": None,
+            "blofin_demo": False,
+            "demo_rejected": True,
+        }
+
+    if is_blofin and use_demo_mode:
+        return {
+            "exchange": "blofin",
+            "environment": "demo",
+            "api_base_url": BLOFIN_DEMO_API_BASE_URL,
+            "blofin_demo": True,
+            "demo_rejected": False,
+        }
+
+    if is_blofin:
+        return {
+            "exchange": "blofin",
+            "environment": "live",
+            "api_base_url": BLOFIN_LIVE_API_BASE_URL,
+            "blofin_demo": False,
+            "demo_rejected": False,
+        }
+
+    return {
+        "exchange": raw or "unspecified",
+        "environment": "live",
+        "api_base_url": None,
+        "blofin_demo": False,
+        "demo_rejected": False,
+    }
+
+
 def save_exchange_keys_record(
     *,
     user_id: str,
@@ -917,7 +1164,10 @@ def save_exchange_keys_record(
     exchange_api_key: str,
     exchange_secret: str,
     risk_percent: float,
-) -> None:
+    exchange: Optional[str] = None,
+    use_demo_mode: bool = False,
+) -> dict[str, Any]:
+    profile = resolve_citadel_exchange_profile(exchange, use_demo_mode)
     store = _load_citadel_key_store()
     store[user_id] = {
         "user_id": user_id,
@@ -925,9 +1175,14 @@ def save_exchange_keys_record(
         "exchange_api_key": exchange_api_key,
         "exchange_secret_encrypted": encrypt_secret_at_rest(exchange_secret),
         "risk_percent": risk_percent,
+        "exchange": profile["exchange"],
+        "use_demo_mode": use_demo_mode,
+        "environment": profile["environment"],
+        "api_base_url": profile["api_base_url"],
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     _save_citadel_key_store(store)
+    return profile
 
 
 # ---------------------------------------------------------------------------
@@ -2167,24 +2422,57 @@ async def exchange_keys(
             headers={"X-Request-ID": req_id},
         )
 
+    profile = resolve_citadel_exchange_profile(request.exchange, request.use_demo_mode)
+    if profile.get("demo_rejected"):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": "Demo/Testnet mode is only supported for BloFin (exchange must contain 'blofin').",
+                "user_message": "Demo mode is for BloFin only. Turn off Demo or set exchange to blofin.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
     try:
-        save_exchange_keys_record(
+        saved_profile = save_exchange_keys_record(
             user_id=user_id,
             app_api_key=app_api_key,
             exchange_api_key=exchange_api_key,
             exchange_secret=exchange_secret,
             risk_percent=float(request.risk_percent),
+            exchange=request.exchange,
+            use_demo_mode=request.use_demo_mode,
         )
-        logger.info(
-            "exchange_keys_saved request_id=%s user_id=%s risk_percent=%.2f",
-            req_id,
-            user_id,
-            request.risk_percent,
-        )
+        if saved_profile.get("blofin_demo"):
+            logger.info(
+                "exchange_keys_saved request_id=%s user_id=%s exchange=blofin environment=demo "
+                "base_url=%s risk_percent=%.2f",
+                req_id,
+                user_id,
+                saved_profile.get("api_base_url"),
+                request.risk_percent,
+            )
+        else:
+            logger.info(
+                "exchange_keys_saved request_id=%s user_id=%s exchange=%s environment=%s "
+                "demo_mode=%s risk_percent=%.2f",
+                req_id,
+                user_id,
+                saved_profile.get("exchange"),
+                saved_profile.get("environment"),
+                request.use_demo_mode,
+                request.risk_percent,
+            )
         return {
             "success": True,
             "user_id": user_id,
             "message": "Exchange keys saved securely.",
+            "exchange": saved_profile.get("exchange"),
+            "environment": saved_profile.get("environment"),
+            "api_base_url": saved_profile.get("api_base_url"),
+            "use_demo_mode": request.use_demo_mode,
         }
     except OSError as exc:
         logger.exception(
