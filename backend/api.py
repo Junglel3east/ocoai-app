@@ -12,7 +12,7 @@ Run locally:
 Deploy (Railway):
   Service root directory: backend
   Variables: GROK_API_KEY (required)
-  Start: uvicorn api:app --host 0.0.0.0 --port $PORT  (see railway.json / Procfile)
+  Start: uvicorn api:app --host 0.0.0.0 --port $PORT --timeout-keep-alive 120 --timeout-graceful-shutdown 180
 
 Endpoints (lib/main.dart):
   GET  /health, GET /
@@ -72,12 +72,15 @@ GROK_API_URL = os.getenv("GROK_API_URL", "https://api.x.ai/v1/chat/completions")
 
 # Outbound HTTP for prices / CoinGecko (keep relatively short).
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
-# Grok read timeout — Railway + Flutter should allow 90–120s for /analyze.
+# Grok HTTP client timeouts (requests tuple: connect, read).
+GROK_CONNECT_TIMEOUT = int(os.getenv("GROK_CONNECT_TIMEOUT", "20"))
 GROK_TIMEOUT = int(os.getenv("GROK_TIMEOUT", "120"))
-GROK_CONNECT_TIMEOUT = int(os.getenv("GROK_CONNECT_TIMEOUT", "15"))
 # Hard cap for entire Grok call inside async handler (thread pool + wait_for).
-ANALYZE_ROUTE_TIMEOUT = int(os.getenv("ANALYZE_ROUTE_TIMEOUT", str(GROK_TIMEOUT + 15)))
+ANALYZE_ROUTE_TIMEOUT = int(os.getenv("ANALYZE_ROUTE_TIMEOUT", "180"))
 GROK_WORKERS = int(os.getenv("GROK_WORKERS", "4"))
+# Uvicorn — long /analyze responses behind Railway proxy (see railway.json startCommand).
+UVICORN_TIMEOUT_KEEP_ALIVE = int(os.getenv("UVICORN_TIMEOUT_KEEP_ALIVE", "120"))
+UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN = int(os.getenv("UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN", "180"))
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 # Railway sets PORT; fall back to API_PORT then 8000 for local `python api.py`
 API_PORT = int(os.getenv("PORT", os.getenv("API_PORT", "8000")))
@@ -843,6 +846,19 @@ def call_grok(
 
     started = time.perf_counter()
     timeout_tuple = (GROK_CONNECT_TIMEOUT, GROK_TIMEOUT)
+    system_len = len(system_prompt)
+    user_len = len(user_prompt)
+    logger.info(
+        "grok_request_start model=%s connect_s=%s read_s=%s system_chars=%d user_chars=%d "
+        "temperature=%.2f max_tokens=%d",
+        GROK_MODEL,
+        GROK_CONNECT_TIMEOUT,
+        GROK_TIMEOUT,
+        system_len,
+        user_len,
+        temperature,
+        max_tokens,
+    )
 
     try:
         response = requests.post(
@@ -917,7 +933,12 @@ def call_grok(
     if not isinstance(content, str) or not content.strip():
         raise GrokError("Grok returned empty content.")
 
-    logger.info("grok_ok model=%s elapsed_ms=%.0f chars=%d", GROK_MODEL, elapsed_ms, len(content))
+    logger.info(
+        "grok_request_complete model=%s elapsed_ms=%.0f response_chars=%d",
+        GROK_MODEL,
+        elapsed_ms,
+        len(content),
+    )
     return content.strip()
 
 
@@ -929,19 +950,47 @@ async def run_grok_in_executor(
     max_tokens: int,
 ) -> str:
     """Run [call_grok] in a worker thread with an asyncio deadline (Railway-safe)."""
-    loop = asyncio.get_running_loop()
-    return await asyncio.wait_for(
-        loop.run_in_executor(
-            _GROK_EXECUTOR,
-            lambda: call_grok(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            ),
-        ),
-        timeout=ANALYZE_ROUTE_TIMEOUT,
+    logger.info(
+        "grok_executor_start route_timeout_s=%s user_chars=%d max_tokens=%d",
+        ANALYZE_ROUTE_TIMEOUT,
+        len(user_prompt),
+        max_tokens,
     )
+    loop = asyncio.get_running_loop()
+    started = time.perf_counter()
+    try:
+        result = await asyncio.wait_for(
+            loop.run_in_executor(
+                _GROK_EXECUTOR,
+                lambda: call_grok(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ),
+            ),
+            timeout=ANALYZE_ROUTE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.error(
+            "grok_executor_timeout elapsed_ms=%.0f route_timeout_s=%s",
+            elapsed_ms,
+            ANALYZE_ROUTE_TIMEOUT,
+        )
+        raise
+    except GrokError:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.error("grok_executor_failed elapsed_ms=%.0f", elapsed_ms)
+        raise
+    else:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.info(
+            "grok_executor_complete elapsed_ms=%.0f response_chars=%d",
+            elapsed_ms,
+            len(result),
+        )
+        return result
 
 
 def build_analyze_fallback_report(
@@ -1008,6 +1057,15 @@ def call_grok_chat(
     messages.append({"role": "user", "content": message.strip()})
 
     started = time.perf_counter()
+    logger.info(
+        "grok_chat_request_start model=%s connect_s=%s read_s=%s history_msgs=%d user_chars=%d max_tokens=%d",
+        GROK_MODEL,
+        GROK_CONNECT_TIMEOUT,
+        GROK_TIMEOUT,
+        len(messages) - 1,
+        len(message),
+        max_tokens,
+    )
     try:
         response = requests.post(
             GROK_API_URL,
@@ -1055,7 +1113,11 @@ def call_grok_chat(
         logger.error("grok_chat_malformed elapsed_ms=%.0f", elapsed_ms, exc_info=True)
         raise HTTPException(status_code=502, detail="Malformed AI response.") from exc
 
-    logger.info("grok_chat_ok elapsed_ms=%.0f chars=%d", elapsed_ms, len(content))
+    logger.info(
+        "grok_chat_request_complete elapsed_ms=%.0f response_chars=%d",
+        elapsed_ms,
+        len(content),
+    )
     return content.strip()
 
 
@@ -1521,11 +1583,14 @@ async def lifespan(app: FastAPI):
         logger.warning("startup | CoinGecko index refresh failed (non-fatal): %s", exc, exc_info=True)
 
     logger.info(
-        "startup | timeouts request=%ss grok_connect=%ss grok_read=%ss analyze_route=%ss",
+        "startup | timeouts request=%ss grok_connect=%ss grok_read=%ss analyze_route=%ss "
+        "uvicorn_keep_alive=%ss uvicorn_graceful_shutdown=%ss",
         REQUEST_TIMEOUT,
         GROK_CONNECT_TIMEOUT,
         GROK_TIMEOUT,
         ANALYZE_ROUTE_TIMEOUT,
+        UVICORN_TIMEOUT_KEEP_ALIVE,
+        UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN,
     )
     if not GROK_API_KEY:
         logger.warning(
@@ -1542,7 +1607,7 @@ async def lifespan(app: FastAPI):
 # redirect_slashes=False — avoids POST /analyze → 307 → /analyze/ (body lost → 404 on clients)
 app = FastAPI(
     title="On-Chain Oracle AI API",
-    version="2.4.0",
+    version="2.5.0",
     description="Production backend for the Flutter mobile app",
     lifespan=lifespan,
     redirect_slashes=False,
@@ -1569,16 +1634,21 @@ async def request_logging_middleware(request: Request, call_next):
         response = await call_next(request)
     except HTTPException as exc:
         elapsed_ms = (time.perf_counter() - started) * 1000
+        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
         logger.warning(
             "http_http_exception request_id=%s %s %s status=%s detail=%s elapsed_ms=%.1f",
             request_id,
             request.method,
             request.url.path,
             exc.status_code,
-            exc.detail,
+            detail,
             elapsed_ms,
         )
-        raise
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"success": False, "detail": detail, "request_id": request_id},
+            headers={"X-Request-ID": request_id},
+        )
     except Exception as exc:
         elapsed_ms = (time.perf_counter() - started) * 1000
         logger.exception(
@@ -1589,7 +1659,15 @@ async def request_logging_middleware(request: Request, call_next):
             elapsed_ms,
             exc,
         )
-        raise
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "detail": "Internal server error. Check server logs.",
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
 
     elapsed_ms = (time.perf_counter() - started) * 1000
     logger.info(
@@ -1607,16 +1685,23 @@ async def request_logging_middleware(request: Request, call_next):
 @app.exception_handler(GrokError)
 async def grok_error_handler(request: Request, exc: GrokError) -> JSONResponse:
     """Non-analyze routes still surface Grok failures as JSON errors."""
+    req_id = getattr(request.state, "request_id", "?")
     logger.error(
-        "grok_error_handler request_id=%s path=%s msg=%s status=%s",
-        getattr(request.state, "request_id", "?"),
+        "grok_error_handler request_id=%s path=%s msg=%s upstream_status=%s",
+        req_id,
         request.url.path,
         exc.user_message,
         exc.status_code,
     )
     return JSONResponse(
         status_code=502,
-        content={"success": False, "detail": exc.user_message},
+        content={
+            "success": False,
+            "detail": exc.user_message,
+            "request_id": req_id,
+            "error": "grok_unavailable",
+        },
+        headers={"X-Request-ID": req_id},
     )
 
 
@@ -1640,7 +1725,7 @@ async def health() -> dict[str, Any]:
     try:
         return {
             "status": "ok",
-            "version": "2.4.0",
+            "version": "2.5.0",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "grok_configured": bool(GROK_API_KEY),
             "grok_model": GROK_MODEL,
@@ -1649,6 +1734,8 @@ async def health() -> dict[str, Any]:
                 "grok_read_seconds": GROK_TIMEOUT,
                 "analyze_route_seconds": ANALYZE_ROUTE_TIMEOUT,
                 "price_request_seconds": REQUEST_TIMEOUT,
+                "uvicorn_keep_alive_seconds": UVICORN_TIMEOUT_KEEP_ALIVE,
+                "uvicorn_graceful_shutdown_seconds": UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN,
             },
             "routes": {
                 "analyze": ["POST /analyze", "POST /analyze/"],
@@ -1665,7 +1752,7 @@ async def health() -> dict[str, Any]:
     except Exception as exc:
         # Last resort — still return 200 so Railway does not mark the service dead.
         logger.exception("health_endpoint_error: %s", exc)
-        return {"status": "ok", "version": "2.4.0", "degraded": True}
+        return {"status": "ok", "version": "2.5.0", "degraded": True}
 
 
 @app.get("/coins")
@@ -1874,7 +1961,17 @@ async def review(request: ReviewRequest, http_request: Request):
         )
     except GrokError as exc:
         logger.error("review_grok_failed request_id=%s coin=%s msg=%s", req_id, coin, exc.user_message)
-        raise HTTPException(status_code=502, detail=exc.user_message) from exc
+        return JSONResponse(
+            status_code=502,
+            content={
+                "success": False,
+                "detail": exc.user_message,
+                "coin": coin,
+                "request_id": req_id,
+                "error": "grok_unavailable",
+            },
+            headers={"X-Request-ID": req_id},
+        )
     review_text = ensure_disclaimer(review_text)
 
     return {
@@ -1910,11 +2007,12 @@ async def chat(request: ChatRequest, http_request: Request):
 
 
 if __name__ == "__main__":
-    # --timeout-keep-alive helps long /analyze responses behind Railway proxy.
+    # Keep-alive 120s + graceful shutdown 180s — match Railway startCommand (long Grok /analyze).
     uvicorn.run(
         "api:app",
         host=API_HOST,
         port=API_PORT,
         reload=False,
-        timeout_keep_alive=120,
+        timeout_keep_alive=UVICORN_TIMEOUT_KEEP_ALIVE,
+        timeout_graceful_shutdown=UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN,
     )
