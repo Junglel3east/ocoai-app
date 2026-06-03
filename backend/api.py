@@ -1612,6 +1612,55 @@ def _parse_execute_trade_request(raw_body: dict[str, Any]) -> ExecuteTradeReques
 # ---------------------------------------------------------------------------
 
 _INSTRUMENT_SPEC_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+# Cached egress IP for Citadel → BloFin whitelist debugging (refreshed every 5 min).
+_CITADEL_EGRESS_IP_CACHE: tuple[float, str] = (0.0, "")
+
+
+def _log_execute_trade_outbound_ip(request_id: str) -> None:
+    """
+    Debug: log the public IP BloFin will see when Railway calls their API.
+    Use this value in BloFin Demo → API Management → IP whitelist (or Railway static egress).
+    """
+    global _CITADEL_EGRESS_IP_CACHE
+    now = time.time()
+    if _CITADEL_EGRESS_IP_CACHE[1] and (now - _CITADEL_EGRESS_IP_CACHE[0]) < 300:
+        logger.info(
+            "execute_trade_outbound_ip request_id=%s ip=%s source=cache age_sec=%.0f",
+            request_id,
+            _CITADEL_EGRESS_IP_CACHE[1],
+            now - _CITADEL_EGRESS_IP_CACHE[0],
+        )
+        return
+    try:
+        response = requests.get(
+            "https://api.ipify.org?format=json",
+            timeout=5,
+        )
+        if response.status_code == 200:
+            payload = response.json()
+            ip = (payload.get("ip") if isinstance(payload, dict) else "") or ""
+            ip = str(ip).strip()
+            if ip:
+                _CITADEL_EGRESS_IP_CACHE = (now, ip)
+                logger.info(
+                    "execute_trade_outbound_ip request_id=%s ip=%s source=ipify "
+                    "(whitelist this IP in BloFin Demo API settings)",
+                    request_id,
+                    ip,
+                )
+                return
+        logger.warning(
+            "execute_trade_outbound_ip_unexpected request_id=%s status=%s body=%s",
+            request_id,
+            response.status_code,
+            (response.text or "")[:200],
+        )
+    except Exception as exc:
+        logger.warning(
+            "execute_trade_outbound_ip_failed request_id=%s err=%s",
+            request_id,
+            exc,
+        )
 
 
 def _resolve_effective_risk_percent(risk_percent: Optional[float]) -> tuple[float, float]:
@@ -1634,12 +1683,24 @@ def _blofin_inst_id(coin: str) -> str:
     return symbol if "-" in symbol else f"{symbol}-USDT"
 
 
-def _blofin_canonical_json(body: dict[str, Any]) -> str:
+def _blofin_canonical_json(body: dict[str, Any], *, request_id: str = "?") -> str:
     """
-    BloFin signature must match the exact POST bytes (no spaces).
+    BloFin signature must match the exact POST bytes (no spaces, stable key order).
     See https://docs.blofin.com — \"JSON string should not contain any extra spaces\".
     """
-    return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+    canonical = json.dumps(
+        body,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    # Signature debug: exact bytes signed and sent on POST (never log secrets).
+    logger.info(
+        "blofin_signature_canonical_json request_id=%s json=%s",
+        request_id,
+        canonical,
+    )
+    return canonical
 
 
 def _blofin_sign_headers(
@@ -1650,16 +1711,35 @@ def _blofin_sign_headers(
     method: str,
     path: str,
     body_str: str = "",
+    request_id: str = "?",
 ) -> dict[str, str]:
     """
-    BloFin REST signature headers (secrets never logged).
+    BloFin REST signature headers (API secret and passphrase never logged).
     Prehash: path + METHOD + timestamp + nonce + body_str (body_str empty for GET).
     """
     timestamp = str(int(time.time() * 1000))
     nonce = uuid.uuid4().hex
-    msg = f"{path}{method.upper()}{timestamp}{nonce}{body_str}"
-    hex_sig = hmac.new(api_secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+    method_upper = method.upper()
+    # Full prehash per BloFin docs (must match bytes sent on the wire).
+    prehash = f"{path}{method_upper}{timestamp}{nonce}{body_str}"
+    hex_sig = hmac.new(api_secret.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).hexdigest()
     signature = base64.b64encode(hex_sig.encode("utf-8")).decode("ascii")
+
+    # Signature debug: reproducible signing audit trail (no keys/secrets/passphrase).
+    logger.info(
+        "blofin_signature_debug request_id=%s timestamp=%s method=%s path=%s nonce=%s "
+        "body_len=%d canonical_body=%s prehash=%s access_sign=%s",
+        request_id,
+        timestamp,
+        method_upper,
+        path,
+        nonce,
+        len(body_str),
+        body_str if body_str else "(empty)",
+        prehash,
+        signature,
+    )
+
     return {
         "ACCESS-KEY": api_key,
         "ACCESS-SIGN": signature,
@@ -1781,7 +1861,7 @@ def _blofin_private_request(
     url = f"{base_url.rstrip('/')}{path}"
     body_str = ""
     if body is not None and method.upper() in {"POST", "PUT"}:
-        body_str = _blofin_canonical_json(body)
+        body_str = _blofin_canonical_json(body, request_id=request_id)
     headers = _blofin_sign_headers(
         api_key=api_key,
         api_secret=api_secret,
@@ -1789,6 +1869,7 @@ def _blofin_private_request(
         method=method,
         path=path,
         body_str=body_str,
+        request_id=request_id,
     )
     started = time.perf_counter()
     try:
@@ -2123,12 +2204,12 @@ def _blofin_place_order(
         body["slOrderPrice"] = "-1"
         body["slTriggerPriceType"] = "last"
 
-    body_str = _blofin_canonical_json(body)
+    body_str = _blofin_canonical_json(body, request_id=request_id)
     logger.info(
-        "blofin_order_submit request_id=%s order_params=%s canonical_json=%s",
+        "blofin_order_submit request_id=%s order_type=%s order_params=%s",
         request_id,
+        normalized_type,
         body,
-        body_str,
     )
 
     http_status, raw_text, parsed = _blofin_private_request(
@@ -2193,21 +2274,18 @@ def _resolve_blofin_passphrase(record: dict[str, Any]) -> str:
 
 
 def _blofin_user_friendly_error(code: Any, msg: Optional[str]) -> str:
-    """Map BloFin API errors to actionable Citadel messages."""
+    """Map BloFin API errors to short, actionable Citadel snackbar messages."""
     text = (msg or "").strip()
     code_str = str(code or "")
     lower = text.lower()
     if code_str == "152409" or "signature verification failed" in lower:
         return (
-            "BloFin rejected the order: API signature mismatch. "
-            "Re-save your BloFin Demo API Key and Secret in Oracle Citadel Setup, "
-            "confirm BLOFIN_PASSPHRASE on Railway matches the passphrase you set when creating the key, "
-            "then retry MARKET."
+            "Signature verification failed - please double-check API Key, Secret, "
+            "and Passphrase in Citadel Setup."
         )
     if "ip" in lower and "whitelist" in lower:
         return (
-            "BloFin rejected the order: API key IP whitelist does not include the Oracle Citadel server. "
-            "In BloFin Demo → API Management, disable IP restriction for testing or whitelist Railway egress."
+            "IP whitelist error - make sure Railway Static IPs are added in BloFin API settings."
         )
     return text or "BloFin could not place the MARKET order. Try again."
 
@@ -3945,6 +4023,9 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
         path,
         bool(header_app_key),
     )
+
+    # Debug: outbound IP BloFin sees (for API key IP whitelist / Railway static egress).
+    _log_execute_trade_outbound_ip(req_id)
 
     try:
         raw_body = await http_request.json()
