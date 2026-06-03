@@ -110,8 +110,15 @@ BLOFIN_LIVE_API_BASE_URL = os.getenv(
 )
 # BloFin trade placement (Oracle Citadel MARKET orders)
 BLOFIN_TRADE_ORDER_PATH = "/api/v1/trade/order"
+BLOFIN_ORDER_DETAIL_PATH = "/api/v1/trade/order-detail"
+BLOFIN_ACCOUNT_BALANCE_PATH = "/api/v1/account/balance"
+BLOFIN_MARKET_INSTRUMENTS_PATH = "/api/v1/market/instruments"
 BLOFIN_ORDER_SIZE = os.getenv("BLOFIN_ORDER_SIZE", "0.1")
 BLOFIN_MARGIN_MODE = os.getenv("BLOFIN_MARGIN_MODE", "cross")
+# Oracle Citadel execute_trade — demo risk guardrails (Flutter risk_percent capped here)
+EXECUTE_TRADE_MAX_RISK_PERCENT = 2.0
+EXECUTE_TRADE_DEFAULT_RISK_PERCENT = 1.0
+BLOFIN_POST_ORDER_CONFIRM_DELAY_SEC = 1.5
 # Passphrase is required by BloFin REST auth; set on Railway or save per-user later.
 BLOFIN_PASSPHRASE = (os.getenv("BLOFIN_PASSPHRASE") or os.getenv("CITADEL_BLOFIN_PASSPHRASE") or "").strip()
 
@@ -1604,6 +1611,23 @@ def _parse_execute_trade_request(raw_body: dict[str, Any]) -> ExecuteTradeReques
 # BloFin — Oracle Citadel MARKET execution (limit path unchanged below)
 # ---------------------------------------------------------------------------
 
+_INSTRUMENT_SPEC_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _resolve_effective_risk_percent(risk_percent: Optional[float]) -> tuple[float, float]:
+    """
+    Respect Flutter risk_percent; default 1.0%; hard-cap at 2.0% for demo safety.
+    Returns (effective_percent, raw_requested_percent).
+    """
+    try:
+        requested = float(risk_percent) if risk_percent is not None else EXECUTE_TRADE_DEFAULT_RISK_PERCENT
+    except (TypeError, ValueError):
+        requested = EXECUTE_TRADE_DEFAULT_RISK_PERCENT
+    if requested <= 0:
+        requested = EXECUTE_TRADE_DEFAULT_RISK_PERCENT
+    effective = min(requested, EXECUTE_TRADE_MAX_RISK_PERCENT)
+    return effective, requested
+
 
 def _blofin_inst_id(coin: str) -> str:
     symbol = (coin or "").strip().upper()
@@ -1638,7 +1662,7 @@ def _blofin_sign_headers(
 
 
 def _blofin_safe_response_log(data: Any) -> Any:
-    """Log-safe BloFin JSON — codes, messages, order ids only."""
+    """Log-safe BloFin JSON — full outcome fields without secrets."""
     if not isinstance(data, dict):
         return data
     out: dict[str, Any] = {}
@@ -1649,31 +1673,382 @@ def _blofin_safe_response_log(data: Any) -> Any:
     payload = data.get("data")
     if isinstance(payload, list) and payload:
         first = payload[0] if isinstance(payload[0], dict) else {}
-        out["data"] = {
-            "orderId": first.get("orderId"),
-            "clientOrderId": first.get("clientOrderId"),
-            "code": first.get("code"),
-            "msg": first.get("msg"),
-        }
+        out["data"] = _blofin_safe_order_row(first)
     elif isinstance(payload, dict):
-        out["data"] = {
-            "orderId": payload.get("orderId"),
-            "clientOrderId": payload.get("clientOrderId"),
-            "code": payload.get("code"),
-            "msg": payload.get("msg"),
-        }
+        out["data"] = _blofin_safe_order_row(payload)
     return out
 
 
-def _blofin_extract_order_id(response_json: dict[str, Any]) -> Optional[str]:
+def _blofin_safe_order_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Single order row / detail — ids, fill state, errors (no keys)."""
+    return {
+        "orderId": row.get("orderId"),
+        "clientOrderId": row.get("clientOrderId"),
+        "code": row.get("code"),
+        "msg": row.get("msg"),
+        "state": row.get("state"),
+        "orderType": row.get("orderType"),
+        "side": row.get("side"),
+        "instId": row.get("instId"),
+        "size": row.get("size"),
+        "filledSize": row.get("filledSize"),
+        "filled_amount": row.get("filled_amount"),
+        "averagePrice": row.get("averagePrice"),
+        "price": row.get("price"),
+    }
+
+
+def _blofin_first_data_row(response_json: dict[str, Any]) -> dict[str, Any]:
     data = response_json.get("data")
-    if isinstance(data, list) and data:
-        row = data[0]
-        if isinstance(row, dict) and row.get("orderId"):
-            return str(row["orderId"])
-    if isinstance(data, dict) and data.get("orderId"):
-        return str(data["orderId"])
-    return None
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0]
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def _blofin_parse_place_order_response(
+    response_json: dict[str, Any],
+    *,
+    http_status: int,
+) -> dict[str, Any]:
+    """
+    BloFin returns HTTP 200 with top-level code \"0\" even when the order event fails.
+    Success requires top code 0 AND per-order data[].code == \"0\" AND an orderId.
+    """
+    top_code = str(response_json.get("code", ""))
+    top_msg = response_json.get("msg")
+    row = _blofin_first_data_row(response_json)
+    row_code = str(row.get("code", top_code))
+    row_msg = row.get("msg") or top_msg
+    order_id = row.get("orderId")
+    order_id_str = str(order_id) if order_id else None
+    ok = (
+        http_status == 200
+        and top_code == "0"
+        and row_code == "0"
+        and bool(order_id_str)
+    )
+    return {
+        "ok": ok,
+        "http_status": http_status,
+        "code": row_code if row else top_code,
+        "top_code": top_code,
+        "msg": row_msg,
+        "order_id": order_id_str,
+        "filled_size": row.get("filledSize"),
+        "remaining_size": _blofin_remaining_size(row),
+        "state": row.get("state"),
+        "response": response_json,
+    }
+
+
+def _blofin_remaining_size(row: dict[str, Any]) -> Optional[str]:
+    try:
+        total = float(row.get("size") or 0)
+        filled = float(row.get("filledSize") or 0)
+    except (TypeError, ValueError):
+        return None
+    remaining = max(0.0, total - filled)
+    return f"{remaining:.8f}".rstrip("0").rstrip(".")
+
+
+def _blofin_private_request(
+    *,
+    base_url: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    method: str,
+    path: str,
+    body: Optional[dict[str, Any]] = None,
+    request_id: str = "?",
+    log_tag: str = "blofin_request",
+) -> tuple[int, str, Any]:
+    """Signed BloFin REST call — returns (http_status, raw_text, parsed_or_none)."""
+    url = f"{base_url.rstrip('/')}{path}"
+    headers = _blofin_sign_headers(
+        api_key=api_key,
+        api_secret=api_secret,
+        passphrase=passphrase,
+        method=method,
+        path=path,
+        body=body if method.upper() in {"POST", "PUT"} else None,
+    )
+    started = time.perf_counter()
+    try:
+        if method.upper() == "GET":
+            response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        else:
+            response = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.error(
+            "%s_http_error request_id=%s method=%s path=%s elapsed_ms=%.1f err=%s",
+            log_tag,
+            request_id,
+            method,
+            path,
+            elapsed_ms,
+            exc,
+        )
+        raise
+
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    raw_text = response.text or ""
+    logger.info(
+        "%s_http_response request_id=%s method=%s path=%s status=%s elapsed_ms=%.1f raw_body=%s",
+        log_tag,
+        request_id,
+        method,
+        path,
+        response.status_code,
+        elapsed_ms,
+        raw_text[:4000],
+    )
+    try:
+        parsed = response.json()
+    except json.JSONDecodeError:
+        logger.error(
+            "%s_invalid_json request_id=%s status=%s body_preview=%s",
+            log_tag,
+            request_id,
+            response.status_code,
+            raw_text[:2000],
+        )
+        return response.status_code, raw_text, None
+    logger.info(
+        "%s_parsed request_id=%s payload=%s",
+        log_tag,
+        request_id,
+        _blofin_safe_response_log(parsed) if isinstance(parsed, dict) else parsed,
+    )
+    return response.status_code, raw_text, parsed
+
+
+def _blofin_fetch_instrument_spec(
+    *,
+    base_url: str,
+    inst_id: str,
+    request_id: str = "?",
+) -> dict[str, Any]:
+    """Public instruments spec — contractValue, minSize, lotSize (cached 5 min)."""
+    cache_key = f"{base_url}|{inst_id}"
+    cached = _INSTRUMENT_SPEC_CACHE.get(cache_key)
+    if cached and (time.time() - cached[0]) < 300:
+        return cached[1]
+
+    url = f"{base_url.rstrip('/')}{BLOFIN_MARKET_INSTRUMENTS_PATH}"
+    try:
+        response = requests.get(
+            url,
+            params={"instId": inst_id},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if response.status_code != 200:
+            raise ValueError(f"instruments_http_{response.status_code}")
+        payload = response.json()
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("instruments_empty")
+        row = rows[0] if isinstance(rows[0], dict) else {}
+        spec = {
+            "instId": inst_id,
+            "contractValue": float(row.get("contractValue") or 0.001),
+            "minSize": float(row.get("minSize") or 0.1),
+            "lotSize": float(row.get("lotSize") or 0.1),
+            "maxMarketSize": float(row.get("maxMarketSize") or 1_000_000),
+        }
+        _INSTRUMENT_SPEC_CACHE[cache_key] = (time.time(), spec)
+        logger.info(
+            "blofin_instrument_spec request_id=%s inst=%s spec=%s",
+            request_id,
+            inst_id,
+            spec,
+        )
+        return spec
+    except Exception as exc:
+        logger.warning(
+            "blofin_instrument_spec_fallback request_id=%s inst=%s err=%s",
+            request_id,
+            inst_id,
+            exc,
+        )
+        return {
+            "instId": inst_id,
+            "contractValue": 0.001,
+            "minSize": float(BLOFIN_ORDER_SIZE),
+            "lotSize": float(BLOFIN_ORDER_SIZE),
+            "maxMarketSize": 1_000_000.0,
+        }
+
+
+def _blofin_fetch_available_usdt(
+    *,
+    base_url: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    request_id: str = "?",
+) -> Optional[float]:
+    """USDT available balance for risk-based contract sizing."""
+    path = f"{BLOFIN_ACCOUNT_BALANCE_PATH}?productType=USDT-FUTURES"
+    http_status, _raw, parsed = _blofin_private_request(
+        base_url=base_url,
+        api_key=api_key,
+        api_secret=api_secret,
+        passphrase=passphrase,
+        method="GET",
+        path=path,
+        request_id=request_id,
+        log_tag="blofin_balance",
+    )
+    if not isinstance(parsed, dict) or http_status != 200 or str(parsed.get("code")) != "0":
+        return None
+    data = parsed.get("data")
+    if not isinstance(data, dict):
+        return None
+    details = data.get("details")
+    if isinstance(details, list):
+        for item in details:
+            if isinstance(item, dict) and str(item.get("currency", "")).upper() == "USDT":
+                try:
+                    return float(item.get("available") or item.get("availableEquity") or 0)
+                except (TypeError, ValueError):
+                    continue
+    try:
+        return float(data.get("totalEquity") or 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _blofin_format_contract_size(contracts: float, lot_size: float) -> str:
+    """Format size string to BloFin lot increment."""
+    lot = lot_size if lot_size > 0 else 0.1
+    steps = max(1, int(contracts / lot))
+    aligned = steps * lot
+    if lot >= 1:
+        return str(int(aligned)) if aligned == int(aligned) else f"{aligned:.4f}".rstrip("0").rstrip(".")
+    decimals = max(1, len(f"{lot:.10f}".rstrip("0").split(".")[-1]))
+    return f"{aligned:.{decimals}f}".rstrip("0").rstrip(".")
+
+
+def _blofin_calculate_order_size(
+    *,
+    coin: str,
+    entry_price: float,
+    stop_loss: float,
+    risk_percent: float,
+    base_url: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    request_id: str = "?",
+) -> tuple[str, dict[str, Any]]:
+    """
+    Risk-based contract count: risk_usdt = available * risk%; size from SL distance.
+    Falls back to env BLOFIN_ORDER_SIZE if balance unavailable (logged).
+    """
+    inst_id = _blofin_inst_id(coin)
+    spec = _blofin_fetch_instrument_spec(base_url=base_url, inst_id=inst_id, request_id=request_id)
+    contract_value = float(spec["contractValue"])
+    min_size = float(spec["minSize"])
+    lot_size = float(spec["lotSize"])
+    max_market = float(spec["maxMarketSize"])
+
+    sl_distance = abs(float(entry_price) - float(stop_loss))
+    meta: dict[str, Any] = {
+        "inst_id": inst_id,
+        "contract_value": contract_value,
+        "min_size": min_size,
+        "lot_size": lot_size,
+        "sl_distance": sl_distance,
+        "risk_percent": risk_percent,
+    }
+
+    if sl_distance <= 0:
+        size_str = _blofin_format_contract_size(min_size, lot_size)
+        meta["fallback"] = "invalid_sl_distance"
+        return size_str, meta
+
+    available = _blofin_fetch_available_usdt(
+        base_url=base_url,
+        api_key=api_key,
+        api_secret=api_secret,
+        passphrase=passphrase,
+        request_id=request_id,
+    )
+    meta["available_usdt"] = available
+
+    if available is None or available <= 0:
+        fallback = max(min_size, float(BLOFIN_ORDER_SIZE))
+        meta["fallback"] = "balance_unavailable"
+        logger.warning(
+            "blofin_size_fallback_balance request_id=%s inst=%s size=%s",
+            request_id,
+            inst_id,
+            fallback,
+        )
+        return _blofin_format_contract_size(fallback, lot_size), meta
+
+    risk_usdt = available * (risk_percent / 100.0)
+    loss_per_contract = sl_distance * contract_value
+    if loss_per_contract <= 0:
+        contracts = min_size
+    else:
+        contracts = risk_usdt / loss_per_contract
+
+    contracts = max(min_size, min(contracts, max_market))
+    steps = int(contracts / lot_size)
+    if steps < 1:
+        steps = 1
+    contracts = steps * lot_size
+    meta.update(
+        {
+            "risk_usdt": risk_usdt,
+            "loss_per_contract": loss_per_contract,
+            "contracts": contracts,
+        }
+    )
+    return _blofin_format_contract_size(contracts, lot_size), meta
+
+
+def _blofin_fetch_order_detail(
+    *,
+    base_url: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    inst_id: str,
+    order_id: str,
+    request_id: str = "?",
+) -> dict[str, Any]:
+    """Post-placement confirmation — filled qty, state, avg price."""
+    path = f"{BLOFIN_ORDER_DETAIL_PATH}?instId={inst_id}&orderId={order_id}"
+    http_status, _raw, parsed = _blofin_private_request(
+        base_url=base_url,
+        api_key=api_key,
+        api_secret=api_secret,
+        passphrase=passphrase,
+        method="GET",
+        path=path,
+        request_id=request_id,
+        log_tag="blofin_order_detail",
+    )
+    if not isinstance(parsed, dict):
+        return {"ok": False, "http_status": http_status}
+    row = _blofin_first_data_row(parsed)
+    ok = http_status == 200 and str(parsed.get("code")) == "0"
+    return {
+        "ok": ok,
+        "http_status": http_status,
+        "state": row.get("state"),
+        "filled_size": row.get("filledSize"),
+        "size": row.get("size"),
+        "average_price": row.get("averagePrice"),
+        "order_type": row.get("orderType"),
+        "response": _blofin_safe_response_log(parsed),
+    }
 
 
 def _blofin_place_order(
@@ -1693,132 +2068,99 @@ def _blofin_place_order(
     request_id: str = "?",
 ) -> dict[str, Any]:
     """
-    Place order on BloFin. MARKET: orderType=market, no price.
-    LIMIT: orderType=limit + price (not used by current Citadel limit accept path).
+    Place order on BloFin.
+    MARKET: orderType=market — no price field (BloFin rejects price on market orders).
+    LIMIT: orderType=limit + price (Citadel limit accept path does not call this today).
+    TP/SL: trigger prices + -1 market execution + triggerPriceType=last per BloFin docs.
     """
     inst_id = _blofin_inst_id(coin)
     side = "buy" if direction == "long" else "sell"
+    normalized_type = order_type.strip().lower()
+    if normalized_type not in {"market", "limit"}:
+        normalized_type = "limit"
+
     body: dict[str, Any] = {
         "instId": inst_id,
         "marginMode": BLOFIN_MARGIN_MODE,
         "positionSide": "net",
         "side": side,
-        "orderType": order_type,
-        "size": size,
+        "orderType": normalized_type,
+        "size": str(size),
         "reduceOnly": "false",
     }
     if client_order_id:
-        body["clientOrderId"] = client_order_id
-    if order_type == "limit" and price is not None:
-        body["price"] = price
+        body["clientOrderId"] = client_order_id[:32]
+    # MARKET: never send price — immediate execution at best available.
+    if normalized_type == "limit" and price is not None:
+        body["price"] = str(price)
     if tp1 is not None:
         body["tpTriggerPrice"] = str(tp1)
         body["tpOrderPrice"] = "-1"
+        body["tpTriggerPriceType"] = "last"
     if sl is not None:
         body["slTriggerPrice"] = str(sl)
         body["slOrderPrice"] = "-1"
+        body["slTriggerPriceType"] = "last"
 
-    safe_body = dict(body)
-    url = f"{base_url.rstrip('/')}{BLOFIN_TRADE_ORDER_PATH}"
-    headers = _blofin_sign_headers(
+    logger.info(
+        "blofin_order_submit request_id=%s order_params=%s",
+        request_id,
+        body,
+    )
+
+    http_status, raw_text, parsed = _blofin_private_request(
+        base_url=base_url,
         api_key=api_key,
         api_secret=api_secret,
         passphrase=passphrase,
         method="POST",
         path=BLOFIN_TRADE_ORDER_PATH,
         body=body,
+        request_id=request_id,
+        log_tag="blofin_place_order",
     )
 
-    logger.info(
-        "blofin_order_request request_id=%s url=%s order_type=%s inst_id=%s side=%s size=%s "
-        "has_tp=%s has_sl=%s client_order_id=%s body=%s",
-        request_id,
-        url,
-        order_type,
-        inst_id,
-        side,
-        size,
-        tp1 is not None,
-        sl is not None,
-        client_order_id,
-        safe_body,
-    )
-
-    started = time.perf_counter()
-    try:
-        response = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as exc:
-        elapsed_ms = (time.perf_counter() - started) * 1000
-        logger.error(
-            "blofin_order_http_error request_id=%s elapsed_ms=%.1f err=%s",
-            request_id,
-            elapsed_ms,
-            exc,
-        )
-        raise
-
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    text_preview = (response.text or "")[:2000]
-    logger.info(
-        "blofin_order_http_response request_id=%s status=%s elapsed_ms=%.1f body_preview=%s",
-        request_id,
-        response.status_code,
-        elapsed_ms,
-        text_preview,
-    )
-
-    try:
-        parsed = response.json()
-    except json.JSONDecodeError:
-        logger.error(
-            "blofin_order_invalid_json request_id=%s status=%s body_preview=%s",
-            request_id,
-            response.status_code,
-            text_preview,
-        )
+    if not isinstance(parsed, dict):
         return {
             "ok": False,
-            "http_status": response.status_code,
-            "error": "invalid_json",
-            "raw_preview": text_preview,
+            "http_status": http_status,
+            "code": "invalid_json",
+            "msg": "BloFin returned non-JSON",
+            "order_id": None,
+            "raw_preview": (raw_text or "")[:2000],
         }
 
-    logger.info(
-        "blofin_order_parsed_response request_id=%s payload=%s",
-        request_id,
-        _blofin_safe_response_log(parsed),
-    )
+    result = _blofin_parse_place_order_response(parsed, http_status=http_status)
+    result["order_params"] = body
 
-    code = str(parsed.get("code", ""))
-    ok = response.status_code == 200 and code == "0"
-    order_id = _blofin_extract_order_id(parsed) if isinstance(parsed, dict) else None
-
-    if ok:
+    if result.get("ok"):
         logger.info(
-            "blofin_order_success request_id=%s order_id=%s order_type=%s inst_id=%s",
+            "blofin_order_outcome_success request_id=%s order_id=%s order_type=%s inst=%s side=%s "
+            "size=%s filled=%s remaining=%s state=%s",
             request_id,
-            order_id,
-            order_type,
+            result.get("order_id"),
+            normalized_type,
             inst_id,
+            side,
+            size,
+            result.get("filled_size"),
+            result.get("remaining_size"),
+            result.get("state"),
         )
     else:
         logger.warning(
-            "blofin_order_failure request_id=%s http_status=%s code=%s msg=%s order_id=%s",
+            "blofin_order_outcome_failure request_id=%s http=%s top_code=%s code=%s msg=%s "
+            "order_id=%s raw=%s",
             request_id,
-            response.status_code,
-            code,
-            parsed.get("msg"),
-            order_id,
+            http_status,
+            result.get("top_code"),
+            result.get("code"),
+            result.get("msg"),
+            result.get("order_id"),
+            _blofin_safe_response_log(parsed),
         )
 
-    return {
-        "ok": ok,
-        "http_status": response.status_code,
-        "code": code,
-        "msg": parsed.get("msg"),
-        "order_id": order_id,
-        "response": parsed,
-    }
+    return result
 
 
 def _resolve_blofin_passphrase(record: dict[str, Any]) -> str:
@@ -3701,14 +4043,25 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
 
     is_market = _is_market_trade_request(trade, raw_body)
     order_type = "market" if is_market else "limit"
+    effective_risk, requested_risk = _resolve_effective_risk_percent(trade.risk_percent)
     exchange = record.get("exchange") or "unspecified"
     environment = record.get("environment") or "live"
     api_base_url = record.get("api_base_url") or BLOFIN_LIVE_API_BASE_URL
     trade_id = uuid.uuid4().hex[:16]
 
+    if effective_risk < requested_risk:
+        logger.info(
+            "execute_trade_risk_capped request_id=%s requested=%.2f effective=%.2f max=%.2f",
+            req_id,
+            requested_risk,
+            effective_risk,
+            EXECUTE_TRADE_MAX_RISK_PERCENT,
+        )
+
     logger.info(
         "execute_trade_parsed request_id=%s trade_id=%s user_id=%s order_type=%s coin=%s direction=%s "
-        "entry=%s sl=%s tp1=%s tp2=%s risk_percent=%.2f exchange=%s environment=%s base_url=%s",
+        "entry=%s sl=%s tp1=%s tp2=%s risk_requested=%.2f risk_effective=%.2f exchange=%s "
+        "environment=%s base_url=%s",
         req_id,
         trade_id,
         user_id,
@@ -3719,7 +4072,8 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
         trade.stop_loss,
         trade.tp1,
         trade.tp2,
-        trade.risk_percent,
+        requested_risk,
+        effective_risk,
         exchange,
         environment,
         api_base_url,
@@ -3762,12 +4116,44 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
                 headers={"X-Request-ID": req_id},
             )
 
+        inst_id = _blofin_inst_id(trade.coin)
+
+        # Reference price for sizing (live Mobula/CG/Binance — not sent as limit price on market).
+        try:
+            live = fetch_live_price_for_analysis(trade.coin)
+            reference_price = float(live["price"])
+        except Exception as exc:
+            logger.warning(
+                "execute_trade_market_price_fallback request_id=%s coin=%s err=%s using_entry=%s",
+                req_id,
+                trade.coin,
+                exc,
+                trade.entry_price,
+            )
+            reference_price = float(trade.entry_price)
+
+        order_size, size_meta = _blofin_calculate_order_size(
+            coin=trade.coin,
+            entry_price=reference_price,
+            stop_loss=trade.stop_loss,
+            risk_percent=effective_risk,
+            base_url=api_base_url,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            passphrase=passphrase,
+            request_id=req_id,
+        )
+
         logger.info(
-            "execute_trade_market_dispatch request_id=%s trade_id=%s blofin_base=%s inst=%s",
+            "execute_trade_market_dispatch request_id=%s trade_id=%s blofin_base=%s inst=%s "
+            "reference_price=%.6f order_size=%s size_meta=%s",
             req_id,
             trade_id,
             api_base_url,
-            _blofin_inst_id(trade.coin),
+            inst_id,
+            reference_price,
+            order_size,
+            size_meta,
         )
 
         blofin_result = _blofin_place_order(
@@ -3778,7 +4164,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             coin=trade.coin,
             direction=trade.direction,
             order_type="market",
-            size=BLOFIN_ORDER_SIZE,
+            size=order_size,
             tp1=trade.tp1,
             sl=trade.stop_loss,
             client_order_id=trade_id[:32],
@@ -3786,12 +4172,36 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
         )
 
         blofin_order_id = blofin_result.get("order_id")
-        if blofin_result.get("ok"):
+        order_params = blofin_result.get("order_params") or {}
+
+        if blofin_result.get("ok") and blofin_order_id:
+            # Optional post-placement confirmation — verify fill state in BloFin UI/backend.
+            await asyncio.sleep(BLOFIN_POST_ORDER_CONFIRM_DELAY_SEC)
+            confirm = _blofin_fetch_order_detail(
+                base_url=api_base_url,
+                api_key=exchange_api_key,
+                api_secret=exchange_secret,
+                passphrase=passphrase,
+                inst_id=inst_id,
+                order_id=blofin_order_id,
+                request_id=req_id,
+            )
             logger.info(
-                "execute_trade_market_success request_id=%s trade_id=%s blofin_order_id=%s",
+                "execute_trade_post_confirm request_id=%s trade_id=%s order_id=%s confirm=%s",
                 req_id,
                 trade_id,
                 blofin_order_id,
+                confirm,
+            )
+            logger.info(
+                "execute_trade_market_outcome request_id=%s trade_id=%s "
+                "Order placed successfully - Order ID: %s state=%s filled=%s avg=%s",
+                req_id,
+                trade_id,
+                blofin_order_id,
+                confirm.get("state"),
+                confirm.get("filled_size"),
+                confirm.get("average_price"),
             )
             return JSONResponse(
                 status_code=200,
@@ -3807,26 +4217,38 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
                     "stop_loss": trade.stop_loss,
                     "tp1": trade.tp1,
                     "tp2": trade.tp2,
-                    "risk_percent": trade.risk_percent,
+                    "risk_percent": effective_risk,
+                    "risk_percent_requested": requested_risk,
+                    "order_size": order_size,
                     "exchange": exchange,
                     "environment": environment,
                     "message": f"MARKET order placed for {trade.coin} {trade.direction.upper()}.",
                     "user_message": (
                         f"MARKET order executed on BloFin ({environment}). "
-                        f"{trade.coin} {trade.direction.upper()} · Order ID {blofin_order_id or 'pending'}"
+                        f"{trade.coin} {trade.direction.upper()} · Order ID {blofin_order_id}"
                     ),
+                    "blofin_confirm": {
+                        "state": confirm.get("state"),
+                        "filled_size": confirm.get("filled_size"),
+                        "average_price": confirm.get("average_price"),
+                    },
                     "request_id": req_id,
                 },
                 headers={"X-Request-ID": req_id},
             )
 
         logger.warning(
-            "execute_trade_market_failure request_id=%s trade_id=%s http=%s code=%s msg=%s",
+            "execute_trade_market_failure request_id=%s trade_id=%s http=%s code=%s msg=%s "
+            "order_params=%s blofin_response=%s",
             req_id,
             trade_id,
             blofin_result.get("http_status"),
             blofin_result.get("code"),
             blofin_result.get("msg"),
+            order_params,
+            _blofin_safe_response_log(blofin_result.get("response"))
+            if isinstance(blofin_result.get("response"), dict)
+            else blofin_result.get("response"),
         )
         return JSONResponse(
             status_code=502,
@@ -3872,7 +4294,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
 
     logger.info(
         "execute_trade_limit_accepted request_id=%s trade_id=%s user_id=%s coin=%s direction=%s "
-        "entry=%s sl=%s tp1=%s tp2=%s risk_percent=%.2f rr=%s exchange=%s environment=%s",
+        "entry=%s sl=%s tp1=%s tp2=%s risk_requested=%.2f risk_effective=%.2f rr=%s exchange=%s environment=%s",
         req_id,
         trade_id,
         user_id,
@@ -3882,7 +4304,8 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
         trade.stop_loss,
         trade.tp1,
         trade.tp2,
-        trade.risk_percent,
+        requested_risk,
+        effective_risk,
         f"{rr:.2f}" if rr is not None else "n/a",
         exchange,
         environment,
@@ -3902,7 +4325,8 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             "stop_loss": trade.stop_loss,
             "tp1": trade.tp1,
             "tp2": trade.tp2,
-            "risk_percent": trade.risk_percent,
+            "risk_percent": effective_risk,
+            "risk_percent_requested": requested_risk,
             "rr": rr,
             "exchange": exchange,
             "environment": environment,
