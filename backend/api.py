@@ -110,7 +110,6 @@ BLOFIN_LIVE_API_BASE_URL = os.getenv(
 )
 # BloFin trade placement (Oracle Citadel MARKET orders)
 BLOFIN_TRADE_ORDER_PATH = "/api/v1/trade/order"
-BLOFIN_TRADE_ORDER_TPSL_PATH = "/api/v1/trade/order-tpsl"
 BLOFIN_ORDER_DETAIL_PATH = "/api/v1/trade/order-detail"
 BLOFIN_ACCOUNT_BALANCE_PATH = "/api/v1/account/balance"
 BLOFIN_MARKET_INSTRUMENTS_PATH = "/api/v1/market/instruments"
@@ -1613,55 +1612,6 @@ def _parse_execute_trade_request(raw_body: dict[str, Any]) -> ExecuteTradeReques
 # ---------------------------------------------------------------------------
 
 _INSTRUMENT_SPEC_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-# Cached egress IP for Citadel → BloFin whitelist debugging (refreshed every 5 min).
-_CITADEL_EGRESS_IP_CACHE: tuple[float, str] = (0.0, "")
-
-
-def _log_execute_trade_outbound_ip(request_id: str) -> None:
-    """
-    Debug: log the public IP BloFin will see when Railway calls their API.
-    Use this value in BloFin Demo → API Management → IP whitelist (or Railway static egress).
-    """
-    global _CITADEL_EGRESS_IP_CACHE
-    now = time.time()
-    if _CITADEL_EGRESS_IP_CACHE[1] and (now - _CITADEL_EGRESS_IP_CACHE[0]) < 300:
-        logger.info(
-            "execute_trade_outbound_ip request_id=%s ip=%s source=cache age_sec=%.0f",
-            request_id,
-            _CITADEL_EGRESS_IP_CACHE[1],
-            now - _CITADEL_EGRESS_IP_CACHE[0],
-        )
-        return
-    try:
-        response = requests.get(
-            "https://api.ipify.org?format=json",
-            timeout=5,
-        )
-        if response.status_code == 200:
-            payload = response.json()
-            ip = (payload.get("ip") if isinstance(payload, dict) else "") or ""
-            ip = str(ip).strip()
-            if ip:
-                _CITADEL_EGRESS_IP_CACHE = (now, ip)
-                logger.info(
-                    "execute_trade_outbound_ip request_id=%s ip=%s source=ipify "
-                    "(whitelist this IP in BloFin Demo API settings)",
-                    request_id,
-                    ip,
-                )
-                return
-        logger.warning(
-            "execute_trade_outbound_ip_unexpected request_id=%s status=%s body=%s",
-            request_id,
-            response.status_code,
-            (response.text or "")[:200],
-        )
-    except Exception as exc:
-        logger.warning(
-            "execute_trade_outbound_ip_failed request_id=%s err=%s",
-            request_id,
-            exc,
-        )
 
 
 def _resolve_effective_risk_percent(risk_percent: Optional[float]) -> tuple[float, float]:
@@ -1684,24 +1634,9 @@ def _blofin_inst_id(coin: str) -> str:
     return symbol if "-" in symbol else f"{symbol}-USDT"
 
 
-def _blofin_canonical_json(body: dict[str, Any], *, request_id: str = "?") -> str:
-    """
-    BloFin signature must match the exact POST bytes (no spaces, stable key order).
-    See https://docs.blofin.com — \"JSON string should not contain any extra spaces\".
-    """
-    canonical = json.dumps(
-        body,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    # Signature debug: exact bytes signed and sent on POST (never log secrets).
-    logger.info(
-        "blofin_signature_canonical_json request_id=%s json=%s",
-        request_id,
-        canonical,
-    )
-    return canonical
+def _blofin_canonical_json(body: dict[str, Any]) -> str:
+    """Compact JSON — must match exact POST bytes signed (BloFin rejects extra spaces)."""
+    return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
 
 def _blofin_sign_headers(
@@ -1712,35 +1647,13 @@ def _blofin_sign_headers(
     method: str,
     path: str,
     body_str: str = "",
-    request_id: str = "?",
 ) -> dict[str, str]:
-    """
-    BloFin REST signature headers (API secret and passphrase never logged).
-    Prehash: path + METHOD + timestamp + nonce + body_str (body_str empty for GET).
-    """
+    """BloFin REST signature headers (secrets never logged)."""
     timestamp = str(int(time.time() * 1000))
     nonce = uuid.uuid4().hex
-    method_upper = method.upper()
-    # Full prehash per BloFin docs (must match bytes sent on the wire).
-    prehash = f"{path}{method_upper}{timestamp}{nonce}{body_str}"
-    hex_sig = hmac.new(api_secret.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).hexdigest()
+    msg = f"{path}{method.upper()}{timestamp}{nonce}{body_str}"
+    hex_sig = hmac.new(api_secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
     signature = base64.b64encode(hex_sig.encode("utf-8")).decode("ascii")
-
-    # Signature debug: reproducible signing audit trail (no keys/secrets/passphrase).
-    logger.info(
-        "blofin_signature_debug request_id=%s timestamp=%s method=%s path=%s nonce=%s "
-        "body_len=%d canonical_body=%s prehash=%s access_sign=%s",
-        request_id,
-        timestamp,
-        method_upper,
-        path,
-        nonce,
-        len(body_str),
-        body_str if body_str else "(empty)",
-        prehash,
-        signature,
-    )
-
     return {
         "ACCESS-KEY": api_key,
         "ACCESS-SIGN": signature,
@@ -1862,7 +1775,7 @@ def _blofin_private_request(
     url = f"{base_url.rstrip('/')}{path}"
     body_str = ""
     if body is not None and method.upper() in {"POST", "PUT"}:
-        body_str = _blofin_canonical_json(body, request_id=request_id)
+        body_str = _blofin_canonical_json(body)
     headers = _blofin_sign_headers(
         api_key=api_key,
         api_secret=api_secret,
@@ -1870,7 +1783,6 @@ def _blofin_private_request(
         method=method,
         path=path,
         body_str=body_str,
-        request_id=request_id,
     )
     started = time.perf_counter()
     try:
@@ -1900,14 +1812,14 @@ def _blofin_private_request(
     elapsed_ms = (time.perf_counter() - started) * 1000
     raw_text = response.text or ""
     logger.info(
-        "%s_http_response request_id=%s method=%s path=%s status=%s elapsed_ms=%.1f raw_body=%s",
+        "%s_http_response request_id=%s method=%s path=%s status=%s elapsed_ms=%.1f body_preview=%s",
         log_tag,
         request_id,
         method,
         path,
         response.status_code,
         elapsed_ms,
-        raw_text[:4000],
+        raw_text[:2000],
     )
     try:
         parsed = response.json()
@@ -2205,11 +2117,13 @@ def _blofin_place_order(
         body["slOrderPrice"] = "-1"
         body["slTriggerPriceType"] = "last"
 
-    body_str = _blofin_canonical_json(body, request_id=request_id)
     logger.info(
-        "blofin_order_submit request_id=%s order_type=%s order_params=%s",
+        "blofin_order_request request_id=%s order_type=%s inst_id=%s side=%s size=%s body=%s",
         request_id,
         normalized_type,
+        inst_id,
+        side,
+        size,
         body,
     )
 
@@ -2265,141 +2179,6 @@ def _blofin_place_order(
             _blofin_safe_response_log(parsed),
         )
 
-    return result
-
-
-def _blofin_tp_close_side(direction: str) -> str:
-    """Side for reduce-only take-profit orders (closes long/short position)."""
-    return "sell" if direction == "long" else "buy"
-
-
-def _blofin_dual_tp_contract_sizes(
-    total_size: str,
-    *,
-    lot_size: float,
-    min_size: float,
-) -> tuple[str, str]:
-    """
-    Split position into TP1 (40%) and TP2 (60%) contract counts, lot-aligned.
-    Ensures tp1 + tp2 <= total and each leg >= minSize where possible.
-    """
-    try:
-        total = float(total_size)
-    except (TypeError, ValueError):
-        total = float(min_size)
-    lot = lot_size if lot_size > 0 else 0.1
-    min_s = min_size if min_size > 0 else lot
-
-    if total < min_s * 2:
-        half = max(min_s, total / 2.0)
-        tp1 = _blofin_format_contract_size(half, lot)
-        tp2 = _blofin_format_contract_size(max(min_s, total - float(tp1)), lot)
-        return tp1, tp2
-
-    tp1_raw = total * 0.4
-    tp2_raw = total * 0.6
-    tp1_steps = max(1, int(tp1_raw / lot))
-    tp1_val = tp1_steps * lot
-    remaining = max(min_s, total - tp1_val)
-    tp2_steps = max(1, int(remaining / lot))
-    tp2_val = min(remaining, tp2_steps * lot)
-    if tp1_val + tp2_val > total:
-        tp2_val = max(min_s, total - tp1_val)
-    return _blofin_format_contract_size(tp1_val, lot), _blofin_format_contract_size(tp2_val, lot)
-
-
-def _blofin_parse_tpsl_response(
-    response_json: dict[str, Any],
-    *,
-    http_status: int,
-) -> dict[str, Any]:
-    """Parse POST /api/v1/trade/order-tpsl — per-event code in data."""
-    top_code = str(response_json.get("code", ""))
-    top_msg = response_json.get("msg")
-    data = response_json.get("data")
-    row = data if isinstance(data, dict) else {}
-    row_code = str(row.get("code", top_code))
-    row_msg = row.get("msg") or top_msg
-    tpsl_id = row.get("tpslId")
-    tpsl_id_str = str(tpsl_id) if tpsl_id else None
-    ok = http_status == 200 and top_code == "0" and row_code == "0" and bool(tpsl_id_str)
-    return {
-        "ok": ok,
-        "http_status": http_status,
-        "code": row_code,
-        "top_code": top_code,
-        "msg": row_msg,
-        "tpsl_id": tpsl_id_str,
-        "response": response_json,
-    }
-
-
-def _blofin_place_tpsl_take_profit(
-    *,
-    base_url: str,
-    api_key: str,
-    api_secret: str,
-    passphrase: str,
-    coin: str,
-    direction: str,
-    tp_price: float,
-    size: str,
-    client_order_id: Optional[str] = None,
-    request_id: str = "?",
-) -> dict[str, Any]:
-    """
-    Place a reduce-only take-profit via BloFin order-tpsl (40% / 60% legs after entry).
-    Uses tpTriggerPrice, tpOrderPrice=-1, tpTriggerPriceType=last per BloFin docs.
-    """
-    inst_id = _blofin_inst_id(coin)
-    body: dict[str, Any] = {
-        "instId": inst_id,
-        "marginMode": BLOFIN_MARGIN_MODE,
-        "positionSide": "net",
-        "side": _blofin_tp_close_side(direction),
-        "tpTriggerPrice": str(tp_price),
-        "tpOrderPrice": "-1",
-        "tpTriggerPriceType": "last",
-        "size": str(size),
-        "reduceOnly": "true",
-    }
-    if client_order_id:
-        body["clientOrderId"] = client_order_id[:32]
-
-    logger.info(
-        "blofin_tpsl_tp_submit request_id=%s inst=%s size=%s tp_trigger=%s side=%s body=%s",
-        request_id,
-        inst_id,
-        size,
-        tp_price,
-        body["side"],
-        body,
-    )
-
-    http_status, raw_text, parsed = _blofin_private_request(
-        base_url=base_url,
-        api_key=api_key,
-        api_secret=api_secret,
-        passphrase=passphrase,
-        method="POST",
-        path=BLOFIN_TRADE_ORDER_TPSL_PATH,
-        body=body,
-        request_id=request_id,
-        log_tag="blofin_place_tpsl_tp",
-    )
-
-    if not isinstance(parsed, dict):
-        return {
-            "ok": False,
-            "http_status": http_status,
-            "code": "invalid_json",
-            "msg": "BloFin TP/SL returned non-JSON",
-            "tpsl_id": None,
-            "raw_preview": (raw_text or "")[:2000],
-        }
-
-    result = _blofin_parse_tpsl_response(parsed, http_status=http_status)
-    result["order_params"] = body
     return result
 
 
@@ -4160,9 +3939,6 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
         bool(header_app_key),
     )
 
-    # Debug: outbound IP BloFin sees (for API key IP whitelist / Railway static egress).
-    _log_execute_trade_outbound_ip(req_id)
-
     try:
         raw_body = await http_request.json()
     except json.JSONDecodeError as exc:
@@ -4529,7 +4305,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             headers={"X-Request-ID": req_id},
         )
 
-    # ── LIMIT: BloFin limit entry + SL on entry + dual TP (40% / 60%) — market path untouched above ──
+    # ── LIMIT: validate + accept (no BloFin REST — user uses MARKET from execution dialog) ──
     geometry_err = _validate_citadel_trade_geometry(
         direction=trade.direction,
         entry=trade.entry_price,
@@ -4554,203 +4330,26 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             headers={"X-Request-ID": req_id},
         )
 
-    if "blofin" not in str(exchange).lower():
-        return JSONResponse(
-            status_code=400,
-            content={
-                "success": False,
-                "detail": f"LIMIT orders are only supported for BloFin (exchange={exchange}).",
-                "user_message": "Limit execution is available for BloFin only. Link BloFin keys in Citadel Setup.",
-                "request_id": req_id,
-            },
-            headers={"X-Request-ID": req_id},
-        )
-
-    passphrase = _resolve_blofin_passphrase(record)
-    if not passphrase:
-        logger.error(
-            "execute_trade_blofin_passphrase_missing request_id=%s user_id=%s",
-            req_id,
-            user_id,
-        )
-        return JSONResponse(
-            status_code=500,
-            content={
-                "success": False,
-                "detail": "BloFin API passphrase is not configured on the server.",
-                "user_message": "Server BloFin passphrase missing. Set BLOFIN_PASSPHRASE on Railway.",
-                "request_id": req_id,
-            },
-            headers={"X-Request-ID": req_id},
-        )
-
-    inst_id = _blofin_inst_id(trade.coin)
-    spec = _blofin_fetch_instrument_spec(
-        base_url=api_base_url,
-        inst_id=inst_id,
-        request_id=req_id,
-    )
-
-    order_size, size_meta = _blofin_calculate_order_size(
-        coin=trade.coin,
-        entry_price=float(trade.entry_price),
-        stop_loss=trade.stop_loss,
-        risk_percent=effective_risk,
-        base_url=api_base_url,
-        api_key=exchange_api_key,
-        api_secret=exchange_secret,
-        passphrase=passphrase,
-        request_id=req_id,
-    )
-
-    tp1_size, tp2_size = _blofin_dual_tp_contract_sizes(
-        order_size,
-        lot_size=float(spec["lotSize"]),
-        min_size=float(spec["minSize"]),
-    )
+    rr = compute_rr(trade.entry_price, trade.tp1, trade.stop_loss)
 
     logger.info(
-        "execute_trade_limit_dispatch request_id=%s trade_id=%s inst=%s entry=%s size=%s "
-        "tp1_size_40pct=%s tp2_size_60pct=%s size_meta=%s",
+        "execute_trade_limit_accepted request_id=%s trade_id=%s user_id=%s coin=%s direction=%s "
+        "entry=%s sl=%s tp1=%s tp2=%s risk_requested=%.2f risk_effective=%.2f rr=%s exchange=%s environment=%s",
         req_id,
         trade_id,
-        inst_id,
-        trade.entry_price,
-        order_size,
-        tp1_size,
-        tp2_size,
-        size_meta,
-    )
-
-    # Main limit entry — SL on entry order (same as market); TPs placed separately below.
-    entry_result = _blofin_place_order(
-        base_url=api_base_url,
-        api_key=exchange_api_key,
-        api_secret=exchange_secret,
-        passphrase=passphrase,
-        coin=trade.coin,
-        direction=trade.direction,
-        order_type="limit",
-        size=order_size,
-        price=str(trade.entry_price),
-        tp1=None,
-        sl=trade.stop_loss,
-        client_order_id=trade_id[:32],
-        request_id=req_id,
-    )
-
-    entry_order_id = entry_result.get("order_id")
-    if not entry_result.get("ok") or not entry_order_id:
-        friendly = _blofin_user_friendly_error(
-            entry_result.get("code"),
-            entry_result.get("msg"),
-        )
-        logger.warning(
-            "execute_trade_limit_failure request_id=%s trade_id=%s http=%s code=%s msg=%s",
-            req_id,
-            trade_id,
-            entry_result.get("http_status"),
-            entry_result.get("code"),
-            entry_result.get("msg"),
-        )
-        return JSONResponse(
-            status_code=502,
-            content={
-                "success": False,
-                "status": "failed",
-                "order_type": "limit",
-                "trade_id": trade_id,
-                "detail": entry_result.get("msg") or "BloFin LIMIT order rejected.",
-                "user_message": friendly,
-                "blofin_code": entry_result.get("code"),
-                "request_id": req_id,
-            },
-            headers={"X-Request-ID": req_id},
-        )
-
-    logger.info(
-        "limit_order_submitted request_id=%s trade_id=%s order_id=%s inst=%s side=%s "
-        "price=%s size=%s sl=%s",
-        req_id,
-        trade_id,
-        entry_order_id,
-        inst_id,
+        user_id,
+        trade.coin,
         trade.direction,
         trade.entry_price,
-        order_size,
         trade.stop_loss,
+        trade.tp1,
+        trade.tp2,
+        requested_risk,
+        effective_risk,
+        f"{rr:.2f}" if rr is not None else "n/a",
+        exchange,
+        environment,
     )
-
-    tp1_result = _blofin_place_tpsl_take_profit(
-        base_url=api_base_url,
-        api_key=exchange_api_key,
-        api_secret=exchange_secret,
-        passphrase=passphrase,
-        coin=trade.coin,
-        direction=trade.direction,
-        tp_price=trade.tp1,
-        size=tp1_size,
-        client_order_id=f"{trade_id[:28]}tp1",
-        request_id=req_id,
-    )
-    tp1_tpsl_id = tp1_result.get("tpsl_id")
-    if tp1_result.get("ok"):
-        logger.info(
-            "tp1_40pct_placed request_id=%s trade_id=%s tpsl_id=%s size=%s trigger=%s",
-            req_id,
-            trade_id,
-            tp1_tpsl_id,
-            tp1_size,
-            trade.tp1,
-        )
-    else:
-        logger.warning(
-            "tp1_40pct_failed request_id=%s trade_id=%s code=%s msg=%s size=%s",
-            req_id,
-            trade_id,
-            tp1_result.get("code"),
-            tp1_result.get("msg"),
-            tp1_size,
-        )
-
-    tp2_result = _blofin_place_tpsl_take_profit(
-        base_url=api_base_url,
-        api_key=exchange_api_key,
-        api_secret=exchange_secret,
-        passphrase=passphrase,
-        coin=trade.coin,
-        direction=trade.direction,
-        tp_price=trade.tp2,
-        size=tp2_size,
-        client_order_id=f"{trade_id[:28]}tp2",
-        request_id=req_id,
-    )
-    tp2_tpsl_id = tp2_result.get("tpsl_id")
-    if tp2_result.get("ok"):
-        logger.info(
-            "tp2_60pct_placed request_id=%s trade_id=%s tpsl_id=%s size=%s trigger=%s",
-            req_id,
-            trade_id,
-            tp2_tpsl_id,
-            tp2_size,
-            trade.tp2,
-        )
-    else:
-        logger.warning(
-            "tp2_60pct_failed request_id=%s trade_id=%s code=%s msg=%s size=%s",
-            req_id,
-            trade_id,
-            tp2_result.get("code"),
-            tp2_result.get("msg"),
-            tp2_size,
-        )
-
-    rr = compute_rr(trade.entry_price, trade.tp1, trade.stop_loss)
-    tp_warnings: list[str] = []
-    if not tp1_result.get("ok"):
-        tp_warnings.append(f"TP1 (40%) not placed: {tp1_result.get('msg') or 'unknown'}")
-    if not tp2_result.get("ok"):
-        tp_warnings.append(f"TP2 (60%) not placed: {tp2_result.get('msg') or 'unknown'}")
 
     return JSONResponse(
         status_code=200,
@@ -4759,11 +4358,6 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             "status": "success",
             "order_type": "limit",
             "trade_id": trade_id,
-            "order_id": entry_order_id,
-            "tp1_tpsl_id": tp1_tpsl_id,
-            "tp2_tpsl_id": tp2_tpsl_id,
-            "tp1_size": tp1_size,
-            "tp2_size": tp2_size,
             "user_id": user_id,
             "coin": trade.coin,
             "direction": trade.direction,
@@ -4777,12 +4371,10 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             "exchange": exchange,
             "environment": environment,
             "api_base_url": api_base_url,
-            "tp_warnings": tp_warnings,
-            "message": f"LIMIT order placed for {trade.coin} {trade.direction.upper()}.",
+            "message": f"Trade request accepted for {trade.coin} {trade.direction.upper()}.",
             "user_message": (
-                f"Limit order sent to BloFin ({environment}). "
+                f"Trade sent to Oracle Citadel ({exchange}, {environment}). "
                 f"{trade.coin} {trade.direction.upper()} · Entry {format_usd(trade.entry_price)}"
-                + (f" · {tp_warnings[0]}" if len(tp_warnings) == 1 else "")
             ),
             "request_id": req_id,
         },
