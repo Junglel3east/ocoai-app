@@ -24,7 +24,7 @@ Endpoints (lib/main.dart):
   POST /exchange_keys — Oracle Citadel exchange key storage (encrypted secret)
   POST /execute_trade — Oracle Citadel trade execution (Flutter Send to Citadel)
 
-Price chain: Binance Spot → Binance Futures → CoinGecko
+Price chain (analysis): Mobula → CoinGecko (aggressive) → Binance Spot/Futures
 Derivatives (/analyze): funding, OI, long/short ratio, liquidations (Binance Futures)
 Trade levels format (Oracle Citadel / Flutter parsing):
   Entry at $X, TP1 at $X, TP2 at $X, SL at $X (R:R X.X:1)
@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -77,6 +78,12 @@ GROK_API_URL = os.getenv("GROK_API_URL", "https://api.x.ai/v1/chat/completions")
 
 # Outbound HTTP for prices / CoinGecko (keep relatively short).
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
+
+# Mobula — live price + liquidity (free tier: demo API; production: set MOBULA_API_KEY on Railway)
+# Get a key: https://admin.mobula.io — leave empty to use demo-api.mobula.io (rate-limited).
+MOBULA_API_KEY = (os.getenv("MOBULA_API_KEY") or "").strip()
+MOBULA_API_BASE_URL = os.getenv("MOBULA_API_BASE_URL", "https://api.mobula.io/api/1").rstrip("/")
+MOBULA_DEMO_API_BASE_URL = "https://demo-api.mobula.io/api/1"
 # Grok HTTP client timeouts (requests tuple: connect, read).
 GROK_CONNECT_TIMEOUT = int(os.getenv("GROK_CONNECT_TIMEOUT", "20"))
 GROK_TIMEOUT = int(os.getenv("GROK_TIMEOUT", "120"))
@@ -101,6 +108,12 @@ BLOFIN_LIVE_API_BASE_URL = os.getenv(
     "BLOFIN_LIVE_API_BASE_URL",
     "https://openapi.blofin.com",
 )
+# BloFin trade placement (Oracle Citadel MARKET orders)
+BLOFIN_TRADE_ORDER_PATH = "/api/v1/trade/order"
+BLOFIN_ORDER_SIZE = os.getenv("BLOFIN_ORDER_SIZE", "0.1")
+BLOFIN_MARGIN_MODE = os.getenv("BLOFIN_MARGIN_MODE", "cross")
+# Passphrase is required by BloFin REST auth; set on Railway or save per-user later.
+BLOFIN_PASSPHRASE = (os.getenv("BLOFIN_PASSPHRASE") or os.getenv("CITADEL_BLOFIN_PASSPHRASE") or "").strip()
 
 MIN_RR_TP1 = 2.1
 TARGET_RR_TP1 = 2.3
@@ -292,6 +305,7 @@ class ExecuteTradeRequest(BaseModel):
     tp1: float = Field(..., gt=0)
     tp2: float = Field(..., gt=0)
     risk_percent: float = Field(1.0, ge=0.1, le=100.0)
+    order_type: str = Field("limit", max_length=16)
 
     @field_validator("user_id", "coin", "direction", mode="before")
     @classmethod
@@ -314,6 +328,13 @@ class ExecuteTradeRequest(BaseModel):
         if lower in {"short", "sell"}:
             return "short"
         raise ValueError("direction must be long or short")
+
+    @field_validator("order_type", mode="before")
+    @classmethod
+    def _normalize_order_type(cls, value: Any) -> str:
+        if value is None:
+            return "limit"
+        return str(value).strip().lower() or "limit"
 
 
 def normalize_analyze_mode(raw: Optional[str], *, default: str = "analysis") -> str:
@@ -404,7 +425,146 @@ def resolve_coingecko_id(symbol: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Market data — Binance Spot → Futures → CoinGecko
+# Market data — Mobula (primary for /analyze) → CoinGecko → Binance
+# ---------------------------------------------------------------------------
+
+
+def _mobula_request_base() -> str:
+    """Production API when key is set; otherwise Mobula demo (free tier, rate-limited)."""
+    return MOBULA_API_BASE_URL if MOBULA_API_KEY else MOBULA_DEMO_API_BASE_URL
+
+
+def fetch_mobula_price(coin: str) -> Optional[dict[str, Any]]:
+    """
+    Mobula /market/data — depth-weighted price, liquidity, on-chain + off-chain volume.
+    https://api.mobula.io/api/1/market/data?symbol=BTC&shouldFetchPriceChange=24h
+    """
+    upper = (coin or "").strip().upper()
+    if not upper:
+        return None
+
+    base = _mobula_request_base()
+    url = f"{base}/market/data"
+    params = {"symbol": upper, "shouldFetchPriceChange": "24h"}
+    headers: dict[str, str] = {"Accept": "application/json"}
+    if MOBULA_API_KEY:
+        headers["Authorization"] = MOBULA_API_KEY
+
+    try:
+        started = time.perf_counter()
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if response.status_code != 200:
+            logger.warning(
+                "mobula_price_http coin=%s status=%s elapsed_ms=%.0f base=%s",
+                upper,
+                response.status_code,
+                elapsed_ms,
+                base,
+            )
+            return None
+
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            logger.warning("mobula_price_no_data coin=%s elapsed_ms=%.0f", upper, elapsed_ms)
+            return None
+
+        price = float(data.get("price") or 0)
+        if price <= 0:
+            return None
+
+        change_24h = float(data.get("price_change_24h") or 0)
+        on_chain_vol = float(data.get("volume") or 0)
+        off_chain_vol = float(data.get("off_chain_volume") or 0)
+        liquidity = float(data.get("liquidity") or 0)
+        liquidity_max = float(data.get("liquidityMax") or 0)
+        market_cap = float(data.get("market_cap") or 0)
+
+        logger.info(
+            "mobula_price_ok coin=%s price=%.6f change_24h=%.2f liquidity=%.0f "
+            "on_chain_vol=%.0f off_chain_vol=%.0f elapsed_ms=%.0f",
+            upper,
+            price,
+            change_24h,
+            liquidity,
+            on_chain_vol,
+            off_chain_vol,
+            elapsed_ms,
+        )
+
+        return {
+            "price": price,
+            "change_24h_pct": change_24h,
+            "volume_24h_usd": on_chain_vol + off_chain_vol if (on_chain_vol or off_chain_vol) else on_chain_vol,
+            "liquidity_usd": liquidity,
+            "liquidity_max_usd": liquidity_max,
+            "market_cap_usd": market_cap,
+            "on_chain_volume_usd": on_chain_vol,
+            "off_chain_volume_usd": off_chain_vol,
+            "source": "mobula",
+            "mobula_name": data.get("name"),
+            "mobula_rank": data.get("rank"),
+            "price_change_1h": data.get("price_change_1h"),
+            "price_change_7d": data.get("price_change_7d"),
+        }
+    except Exception as exc:
+        logger.warning("mobula_price_error coin=%s err=%s", upper, exc)
+        return None
+
+
+def format_mobula_market_prompt_block(market: dict[str, Any]) -> str:
+    """Rich Mobula context for Grok — liquidity, volume split, market cap (no secrets)."""
+    if market.get("source") != "mobula":
+        return ""
+
+    liq = market.get("liquidity_usd")
+    liq_max = market.get("liquidity_max_usd")
+    mcap = market.get("market_cap_usd")
+    on_vol = market.get("on_chain_volume_usd")
+    off_vol = market.get("off_chain_volume_usd")
+    ch1h = market.get("price_change_1h")
+    ch7d = market.get("price_change_7d")
+    rank = market.get("mobula_rank")
+
+    def _usd(val: Any) -> str:
+        try:
+            v = float(val)
+        except (TypeError, ValueError):
+            return "n/a"
+        if v >= 1e9:
+            return f"${v / 1e9:.2f}B"
+        if v >= 1e6:
+            return f"${v / 1e6:.1f}M"
+        if v >= 1e3:
+            return f"${v / 1e3:.1f}K"
+        return format_usd(v)
+
+    lines = [
+        "═══ MOBULA LIVE MARKET (depth-weighted price, on-chain + CEX context) ═══",
+        f"Liquidity (DEX pools): {_usd(liq)} | Max pool liquidity: {_usd(liq_max)}",
+        f"Market cap: {_usd(mcap)}" + (f" | Rank: #{rank}" if rank else ""),
+        f"24h volume — on-chain: {_usd(on_vol)} | off-chain (CEX): {_usd(off_vol)}",
+    ]
+    if ch1h is not None:
+        try:
+            lines.append(f"Mobula price change: 1h {float(ch1h):+.2f}% | 7d {float(ch7d or 0):+.2f}%")
+        except (TypeError, ValueError):
+            pass
+    lines.append(
+        "Use liquidity + volume mix to judge slippage risk, trap probability, and whether "
+        "moves are spot-led vs perp/CEX-led. Cross-check with derivatives below."
+    )
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Binance Spot / Futures + CoinGecko (fallbacks)
 # ---------------------------------------------------------------------------
 
 
@@ -531,13 +691,27 @@ def fetch_coingecko_market_aggressive(symbol: str) -> Optional[dict[str, Any]]:
 
 def fetch_live_price_for_analysis(coin: str) -> dict[str, Any]:
     """
-    Extremely fresh price for AI levels: CoinGecko (aggressive, cache-busted) right before Grok.
-    Falls back to Binance only if CoinGecko is unavailable. Does not change prompts or report format.
+    Fresh price for AI analysis/trade setup: Mobula first, then CoinGecko (aggressive), then Binance.
+    Does not change prompts or report section format — only enriches market context when Mobula hits.
     """
     upper = coin.upper()
     refresh_coingecko_symbol_index(force=True)
 
     fetched_at = time.time()
+
+    mobula = fetch_mobula_price(upper)
+    if mobula:
+        age_ms = (time.time() - fetched_at) * 1000
+        logger.info(
+            "live_price_for_ai coin=%s source=mobula price=%.6f liquidity=%.0f age_ms=%.0f",
+            upper,
+            mobula["price"],
+            mobula.get("liquidity_usd") or 0,
+            age_ms,
+        )
+        return {"coin": upper, "fetched_at": fetched_at, **mobula}
+
+    logger.warning("live_price_for_ai coin=%s mobula_miss — trying coingecko", upper)
     snapshot = fetch_coingecko_market_aggressive(upper)
     if snapshot:
         age_ms = (time.time() - fetched_at) * 1000
@@ -848,24 +1022,21 @@ def format_derivatives_prompt_block(derivatives: dict[str, Any]) -> str:
     else:
         liq_val = "quiet — no meaningful recent force orders"
 
-    return f"""═══ LIVE DERIVATIVES DATA (Binance Futures — weave into prose, never list mechanically) ═══
+    return f"""═══ LIVE DERIVATIVES — BINANCE FUTURES (hedge-fund positioning read; NEVER list as four sentences) ═══
 Funding: {funding_val} → {derivatives['funding_label']}
 Open Interest: {oi_val} → {derivatives['oi_label']}
-Long/Short (5m): {ls_val} → {derivatives['ls_label']}
-Liquidations (last 20): {liq_val} → {derivatives['liq_label']}
+Long/Short accounts (5m): {ls_val} → {derivatives['ls_label']}
+Recent liquidations: {liq_val} → {derivatives['liq_label']}
 
-HOW TO USE THIS DATA (critical — read before writing):
-• **Liquidity & Sentiment** = ONE flowing paragraph of veteran desk prose. Weave funding, OI, positioning,
-  and liquidation flow into a single positioning verdict — who is trapped, who is crowded, what the
-  squeeze/cascade risk is. NEVER enumerate metrics as "Funding: … OI: … L/S: …" — that reads like a bot.
-  Good: "Longs are stacked — elevated funding, 62% long accounts, and fresh long liquidations suggest
-  trapped exposure above; fade rallies into VWAP unless structure reclaims."
-  Bad: "Funding is neutral. OI is stable. Long/short is balanced. Liquidations are quiet."
-• **Confluence Summary** MUST reflect derivatives when they confirm or contradict structure/VWAP/momentum.
-  Embed the positioning read inside the edge sentence — not as a separate data recap.
-• **Overall Bias** and **If I Were to Trade Today...** shift when derivatives align with or fight the
-  technical thesis (crowded + extended = caution; liq cascade + structure break = follow impulse).
-• In user-facing text: use the smart labels above as natural language — never "N/A", "unavailable", or raw API dumps."""
+DESK INSTRUCTION — synthesize into **Liquidity & Sentiment** as ONE story:
+• Who is paying whom (funding)? Is OI rising with trend (conviction) or against it (shorts/longs adding)?
+• Are accounts lopsided (L/S) into a level where stops cluster? Did liqs mark exhaustion or fuel continuation?
+• Map to order flow: squeeze setup, cascade risk, fade crowded extension, or stand aside until reset.
+• Good: "Shorts are paying to hold the book while OI bleeds off the highs — long liqs already printed;
+  fade breakdown only while 1h VWAP caps."
+• Bad: four separate clauses restating each metric.
+• **Confluence Summary**, **Overall Bias**, and **If I Were to Trade Today...** must price this in.
+• Never write "N/A" or "unavailable" in the report — translate gaps into neutral positioning language."""
 
 
 def format_usd(price: float) -> str:
@@ -1322,6 +1493,7 @@ def _execute_trade_log_payload(body: dict[str, Any]) -> dict[str, Any]:
         "user_id": body.get("user_id"),
         "coin": body.get("coin"),
         "direction": body.get("direction"),
+        "order_type": body.get("order_type"),
         "entry_price": body.get("entry_price", body.get("entry")),
         "stop_loss": body.get("stop_loss", body.get("sl")),
         "tp1": body.get("tp1"),
@@ -1330,9 +1502,274 @@ def _execute_trade_log_payload(body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _coerce_positive_float(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _normalize_execute_trade_payload(raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    Map Flutter payloads; detect MARKET via order_type or entry_price == \"market\".
+    Does not change limit-order field semantics.
+    """
+    data = dict(raw)
+    order_token = str(data.get("order_type", "limit")).strip().lower()
+    entry_raw = data.get("entry_price", data.get("entry"))
+    entry_is_market = isinstance(entry_raw, str) and entry_raw.strip().lower() == "market"
+    is_market = order_token == "market" or entry_is_market
+
+    if is_market:
+        data["order_type"] = "market"
+        if entry_is_market:
+            sl = _coerce_positive_float(data.get("stop_loss") or data.get("sl"))
+            tp1 = _coerce_positive_float(data.get("tp1"))
+            ref = (tp1 + sl) / 2 if sl is not None and tp1 is not None else None
+            data["entry_price"] = ref if ref is not None else _coerce_positive_float(data.get("entry_price")) or 1.0
+
+    return data
+
+
+def _is_market_trade_request(trade: ExecuteTradeRequest, raw_body: dict[str, Any]) -> bool:
+    """True when client requests immediate market entry."""
+    if trade.order_type == "market":
+        return True
+    entry_raw = raw_body.get("entry_price", raw_body.get("entry"))
+    return isinstance(entry_raw, str) and entry_raw.strip().lower() == "market"
+
+
 def _parse_execute_trade_request(raw_body: dict[str, Any]) -> ExecuteTradeRequest:
-    """Validate Flutter execute_trade payload (snake_case fields)."""
-    return ExecuteTradeRequest.model_validate(raw_body)
+    """Validate execute_trade payload (limit + market aliases)."""
+    return ExecuteTradeRequest.model_validate(_normalize_execute_trade_payload(raw_body))
+
+
+# ---------------------------------------------------------------------------
+# BloFin — Oracle Citadel MARKET execution (limit path unchanged below)
+# ---------------------------------------------------------------------------
+
+
+def _blofin_inst_id(coin: str) -> str:
+    symbol = (coin or "").strip().upper()
+    return symbol if "-" in symbol else f"{symbol}-USDT"
+
+
+def _blofin_sign_headers(
+    *,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    method: str,
+    path: str,
+    body: Optional[dict[str, Any]] = None,
+) -> dict[str, str]:
+    """BloFin REST signature headers (secrets never logged)."""
+    timestamp = str(int(time.time() * 1000))
+    nonce = uuid.uuid4().hex
+    msg = f"{path}{method.upper()}{timestamp}{nonce}"
+    if body is not None:
+        msg += json.dumps(body, separators=(",", ":"))
+    hex_sig = hmac.new(api_secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+    signature = base64.b64encode(hex_sig.encode("utf-8")).decode("ascii")
+    return {
+        "ACCESS-KEY": api_key,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-NONCE": nonce,
+        "ACCESS-PASSPHRASE": passphrase,
+        "Content-Type": "application/json",
+    }
+
+
+def _blofin_safe_response_log(data: Any) -> Any:
+    """Log-safe BloFin JSON — codes, messages, order ids only."""
+    if not isinstance(data, dict):
+        return data
+    out: dict[str, Any] = {}
+    if "code" in data:
+        out["code"] = data.get("code")
+    if "msg" in data:
+        out["msg"] = data.get("msg")
+    payload = data.get("data")
+    if isinstance(payload, list) and payload:
+        first = payload[0] if isinstance(payload[0], dict) else {}
+        out["data"] = {
+            "orderId": first.get("orderId"),
+            "clientOrderId": first.get("clientOrderId"),
+            "code": first.get("code"),
+            "msg": first.get("msg"),
+        }
+    elif isinstance(payload, dict):
+        out["data"] = {
+            "orderId": payload.get("orderId"),
+            "clientOrderId": payload.get("clientOrderId"),
+            "code": payload.get("code"),
+            "msg": payload.get("msg"),
+        }
+    return out
+
+
+def _blofin_extract_order_id(response_json: dict[str, Any]) -> Optional[str]:
+    data = response_json.get("data")
+    if isinstance(data, list) and data:
+        row = data[0]
+        if isinstance(row, dict) and row.get("orderId"):
+            return str(row["orderId"])
+    if isinstance(data, dict) and data.get("orderId"):
+        return str(data["orderId"])
+    return None
+
+
+def _blofin_place_order(
+    *,
+    base_url: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    coin: str,
+    direction: str,
+    order_type: str,
+    size: str,
+    price: Optional[str] = None,
+    tp1: Optional[float] = None,
+    sl: Optional[float] = None,
+    client_order_id: Optional[str] = None,
+    request_id: str = "?",
+) -> dict[str, Any]:
+    """
+    Place order on BloFin. MARKET: orderType=market, no price.
+    LIMIT: orderType=limit + price (not used by current Citadel limit accept path).
+    """
+    inst_id = _blofin_inst_id(coin)
+    side = "buy" if direction == "long" else "sell"
+    body: dict[str, Any] = {
+        "instId": inst_id,
+        "marginMode": BLOFIN_MARGIN_MODE,
+        "positionSide": "net",
+        "side": side,
+        "orderType": order_type,
+        "size": size,
+        "reduceOnly": "false",
+    }
+    if client_order_id:
+        body["clientOrderId"] = client_order_id
+    if order_type == "limit" and price is not None:
+        body["price"] = price
+    if tp1 is not None:
+        body["tpTriggerPrice"] = str(tp1)
+        body["tpOrderPrice"] = "-1"
+    if sl is not None:
+        body["slTriggerPrice"] = str(sl)
+        body["slOrderPrice"] = "-1"
+
+    safe_body = dict(body)
+    url = f"{base_url.rstrip('/')}{BLOFIN_TRADE_ORDER_PATH}"
+    headers = _blofin_sign_headers(
+        api_key=api_key,
+        api_secret=api_secret,
+        passphrase=passphrase,
+        method="POST",
+        path=BLOFIN_TRADE_ORDER_PATH,
+        body=body,
+    )
+
+    logger.info(
+        "blofin_order_request request_id=%s url=%s order_type=%s inst_id=%s side=%s size=%s "
+        "has_tp=%s has_sl=%s client_order_id=%s body=%s",
+        request_id,
+        url,
+        order_type,
+        inst_id,
+        side,
+        size,
+        tp1 is not None,
+        sl is not None,
+        client_order_id,
+        safe_body,
+    )
+
+    started = time.perf_counter()
+    try:
+        response = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.error(
+            "blofin_order_http_error request_id=%s elapsed_ms=%.1f err=%s",
+            request_id,
+            elapsed_ms,
+            exc,
+        )
+        raise
+
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    text_preview = (response.text or "")[:2000]
+    logger.info(
+        "blofin_order_http_response request_id=%s status=%s elapsed_ms=%.1f body_preview=%s",
+        request_id,
+        response.status_code,
+        elapsed_ms,
+        text_preview,
+    )
+
+    try:
+        parsed = response.json()
+    except json.JSONDecodeError:
+        logger.error(
+            "blofin_order_invalid_json request_id=%s status=%s body_preview=%s",
+            request_id,
+            response.status_code,
+            text_preview,
+        )
+        return {
+            "ok": False,
+            "http_status": response.status_code,
+            "error": "invalid_json",
+            "raw_preview": text_preview,
+        }
+
+    logger.info(
+        "blofin_order_parsed_response request_id=%s payload=%s",
+        request_id,
+        _blofin_safe_response_log(parsed),
+    )
+
+    code = str(parsed.get("code", ""))
+    ok = response.status_code == 200 and code == "0"
+    order_id = _blofin_extract_order_id(parsed) if isinstance(parsed, dict) else None
+
+    if ok:
+        logger.info(
+            "blofin_order_success request_id=%s order_id=%s order_type=%s inst_id=%s",
+            request_id,
+            order_id,
+            order_type,
+            inst_id,
+        )
+    else:
+        logger.warning(
+            "blofin_order_failure request_id=%s http_status=%s code=%s msg=%s order_id=%s",
+            request_id,
+            response.status_code,
+            code,
+            parsed.get("msg"),
+            order_id,
+        )
+
+    return {
+        "ok": ok,
+        "http_status": response.status_code,
+        "code": code,
+        "msg": parsed.get("msg"),
+        "order_id": order_id,
+        "response": parsed,
+    }
+
+
+def _resolve_blofin_passphrase(record: dict[str, Any]) -> str:
+    """Passphrase for BloFin headers — env or optional per-user field (never logged)."""
+    stored = (record.get("exchange_passphrase") or "").strip()
+    return stored or BLOFIN_PASSPHRASE
 
 
 def _validate_citadel_trade_geometry(
@@ -1739,106 +2176,123 @@ def is_scalp_context(
 
 def default_system_prompt(mode: str, *, scalp_mode: bool = False) -> str:
     """
-    Elite veteran system prompt — 15+ years real capital, zero filler, natural derivatives integration.
-    Preserves exact Flutter report structure.
+    Master system prompt — 20-year veteran hedge-fund crypto desk. Preserves exact Flutter headings.
     """
     scalp_active = f"""
 ═══════════════════════════════════════
 ⚡ SCALP MODE ACTIVE — BEST SETUP ON THE BOARD OR FLAT
 ═══════════════════════════════════════
-Scalp / quick-move / scalping setup / short-term detected. Deliver the absolute best high-probability
-scalp available RIGHT NOW — or "NO SCALP — STAY FLAT" with TRADE LEVELS omitted. Never force a weak scalp.
+Scalp / quick-move / scalping / short-term detected. Deliver the single highest-probability scalp on the
+desk RIGHT NOW — or state "NO SCALP — STAY FLAT" and OMIT **TRADE LEVELS**. Forcing a B-setup is how
+accounts bleed.
 
-SCALP DOCTRINE (all required when proposing a scalp):
-• TIMEFRAME: State exact TFs — e.g. "5m trigger | 15m bias | 1h filter". Horizon: minutes to ~90 min.
-• PRICE: Entry anchored to live spot — ≤0.8% majors, ≤1.2% high-beta alts only at named structure.
-• TRIGGER: Name the exact event — VWAP reclaim/reject, EMA 5/20 bounce, sweep + reclaim, BOS retest,
-  RSI impulse through 50/55/45. Generic "momentum looks good" is forbidden.
-• MOMENTUM: EMA 5/20 + RSI direction + MACD histogram + volume vs prior 5–10 bars — all aligned or NO SCALP.
-• VWAP: Session VWAP is the scalp battlefield — state position, acceptance/rejection, distance %.
-• DERIVATIVES: Fold funding/OI/positioning/liqs into the scalp thesis — crowded side + liq flow =
-  fade or follow; never ignore live positioning on a scalp call.
-• SL: Micro invalidation beyond sweep wick / VWAP flip / structure — majors ~0.12–0.55%.
-• TP1: First liquidity pocket, ≥{MIN_RR_TP1:.1f}:1 R:R (target {TARGET_RR_TP1:.1f}:1+). TP2 = extension only.
-• TIME-BOX: "Valid next X bars on [TF]" or invalidation condition stated explicitly.
-• LABEL: **If I Were to Trade Today...** → "[Long/Short] SCALP Setup:" with trigger + invalidation in desk language.
+SCALP DOCTRINE (mandatory when proposing a scalp):
+• MTF MAP: Exact TFs — e.g. "5m execution | 15m structure | 1h veto". Horizon: minutes to ~90 min max.
+• PRICE: Entry at live spot or named limit at OB/FVG/VWAP — ≤0.8% drift majors, ≤1.2% high-beta alts.
+• TRIGGER: Precise event — session VWAP reclaim/reject, EMA 5/20 impulse, liquidity sweep + reclaim,
+  BOS/CHoCH retest, RSI through 50 with volume expansion. Vague momentum = NO SCALP.
+• ORDER FLOW / DERIVATIVES: Funding extreme + L/S skew + liq prints = who is trapped; fade crowded or
+  ride cascade. OI rising into breakout = real; OI flat on rip = suspect.
+• SL: Beyond sweep wick / micro structure / VWAP failure — majors ~0.12–0.55%. State invalidation in
+  price AND time ("dead after 12× 5m bars").
+• TP1: Nearest liquidity pool / partial fill of FVG — ≥{MIN_RR_TP1:.1f}:1 R:R (target {TARGET_RR_TP1:.1f}:1+).
+  TP2: Extension into next HTF pool only.
+• PSYCH: Note FOMO trap, chase risk, or "no edge until X clears" when applicable.
+• LABEL: **If I Were to Trade Today...** → "[Long/Short] SCALP Setup:" — trigger, invalidation, time-box.
 """
 
     scalp_standby = f"""
 ═══════════════════════════════════════
-SCALP PROTOCOL (auto: scalp / quick move / scalping setup / short-term / ≤45m TF)
+SCALP PROTOCOL (auto: scalp / quick move / scalping / short-term / ≤45m TF)
 ═══════════════════════════════════════
-On scalp intent: surgical entries, session VWAP, momentum trigger, micro SL, derivatives filter,
-≥{MIN_RR_TP1:.1f}:1 R:R on TP1. Best scalp on the board or explicit refusal — no half-measures.
+On scalp intent: surgical entry, session VWAP battlefield, order-flow + derivatives filter, micro SL,
+≥{MIN_RR_TP1:.1f}:1 R:R on TP1. Best scalp available or explicit flat — half-measures are for tourists.
 """
 
-    shared = f"""You are On-Chain Oracle AI — elite veteran crypto trader. 15+ years. Real capital every session.
-Prop desk, institutional flow, full-cycle survivor. You deliver verdicts, not essays. Call the trade or call FLAT.
+    shared = f"""You are On-Chain Oracle AI — the voice of a 20-year veteran crypto hedge-fund trader who
+helped architect how this generation trades leverage. Prop desk, macro crypto, DeFi-native flow, full
+cycle survivor (2017, 2020, 2021, 2022, 2024). You speak to a funded desk: verdicts, not commentary.
+You have seen every liquidation cascade, funding squeeze, and false breakout — and you price them.
 
-VOICE: Orders to a trading desk. Sharp. Decisive. High conviction. You risk real money on every call.
-Write like a trader who has made and lost seven figures and respects edge above ego.
+IDENTITY: Creator-level trading intelligence. Maximum conviction. Zero fluff. Real money on every word.
+You do not teach basics — you transmit edge. Call the trade, name the invalidation, or command FLAT.
 
-FORBIDDEN (never appear in output):
+VOICE: CIO memo meets live desk shout. Crisp clauses. Active verbs. Price-specific. Psychology-aware.
+Sound like you size seven-figure books before breakfast.
+
+FORBIDDEN (instant credibility kill):
 "might", "could", "possibly", "perhaps", "maybe", "it seems", "appears to", "I think", "I believe",
-"interesting", "worth watching", "mixed signals" without verdict, "let me know", "would you like",
-"consider", "potentially", "somewhat", "moderately", bullet-dumping raw metrics, listing funding/OI/L-S
-as separate sentences, chatbot warmth, tutorial tone.
+"interesting", "worth watching", "mixed signals" without a verdict, "let me know", "would you like",
+"consider", "potentially", "somewhat", "moderately", metric laundry lists, separate sentences for
+funding/OI/L-S/liqs, chatbot warmth, influencer hype, tutorial tone.
 
-REQUIRED: edge, invalidation, acceptance, rejection, liquidity pool, sweep, crowded, squeeze fuel,
-trapped traders, continuation, failed breakdown — woven into verdict-driven prose.
+REQUIRED LEXICON (woven naturally): edge, invalidation, acceptance, rejection, liquidity pool, sweep,
+order block, fair value gap, premium/discount, crowded longs/shorts, squeeze fuel, cascade, trapped
+positioning, delta of OI, funding arb, stop run, mitigation, breaker, imbalance, HTF veto, risk-off/on.
 
 ═══════════════════════════════════════
 RULE 0 — LIVE PRICE (ZERO TOLERANCE)
 ═══════════════════════════════════════
-• User prompt = ONLY authoritative live price. Not memory. Not estimates.
-• **Asset** line: EXACT coin | live price | 24h % from prompt.
-• Every Entry / TP1 / TP2 / SL vs live price NOW. Pre-flight: entry drift %, SL/TP direction correct.
-• Long: SL < Entry < TP1 ≤ TP2. Short: TP2 ≤ TP1 < Entry < SL. Stale levels → adapt or omit.
+• User prompt = sole authoritative price. Never memory. Never round for convenience.
+• **Asset**: EXACT coin | live price | 24h % from prompt.
+• Entry / TP1 / TP2 / SL anchored to live NOW. State drift % vs spot when entry is a limit.
+• Long: SL < Entry < TP1 ≤ TP2. Short: TP2 ≤ TP1 < Entry < SL. Wrong geometry → fix or omit levels.
 
 ═══════════════════════════════════════
-RULE 1 — RISK:REWARD (NON-NEGOTIABLE)
+RULE 1 — RISK:REWARD & LEVEL PRECISION (NON-NEGOTIABLE)
 ═══════════════════════════════════════
-• Minimum {MIN_RR_TP1:.1f}:1 R:R on TP1 vs |Entry − SL|. Target {TARGET_RR_TP1:.1f}:1+. Never below 2.0:1.
-• TRADE LEVELS format (Oracle Citadel / Flutter parser):
+• Minimum {MIN_RR_TP1:.1f}:1 R:R on TP1 vs |Entry − SL|. Target {TARGET_RR_TP1:.1f}:1+. Never ship <2.0:1.
+• TRADE LEVELS — exact parser format (Oracle Citadel / Flutter):
   Entry at $XXXXX, TP1 at $XXXXX, TP2 at $XXXXX, SL at $XXXXX (R:R X.X:1)
-  Reward = |TP1 − Entry| = $X | Risk = |Entry − SL| = $X | R:R = X.X:1
-• No valid ≥{MIN_RR_TP1:.1f}:1 → omit TRADE LEVELS. Stay flat is alpha preservation.
+  Then inline: Reward = |TP1 − Entry| = $X | Risk = |Entry − SL| = $X | R:R = X.X:1
+• TP1 = first high-probability liquidity objective. TP2 = structural extension / runner.
+• SL = invalidation beyond sweep, OB loss, or VWAP failure — not arbitrary %.
+• No valid ≥{MIN_RR_TP1:.1f}:1 → OMIT **TRADE LEVELS**. Capital preservation is the veteran flex.
 
 ═══════════════════════════════════════
-RULE 2 — ANALYTICAL STACK
+RULE 2 — ADVANCED CONFLUENCE STACK
 ═══════════════════════════════════════
-• MTF: Daily/4h → requested TF → LTF trigger. ALIGNED or CONFLICTED — conflict cuts confidence.
-• VWAP stack, structure (BOS/CHoCH, liquidity), momentum (EMA 5/20, RSI, MACD, volume).
-• Key Drivers bullets: verdict-driven prose ending in directional implication — not indicator laundry lists.
+• MTF: Weekly/Daily/4h regime → requested TF bias → LTF trigger. State ALIGNED or CONFLICTED; conflict
+  slashes confidence and demands patience unless a catalyst overrides (funding flip, liq cascade).
+• VWAP: Session, prior session, weekly, monthly — premium vs discount, clusters within ~0.3–0.8%,
+  acceptance/rejection, mean-reversion magnets.
+• STRUCTURE: BOS/CHoCH, order blocks, FVGs, range highs/lows, equal highs/lows (liquidity targets).
+• MOMENTUM: EMA 5/20 regime, RSI regime (>50 bull / <50 bear) + divergence only WITH structure,
+  MACD histogram expansion/contraction, volume on breaks vs fakeouts.
+• ON-CHAIN / MOBULA (when in prompt): liquidity depth, on-chain vs CEX volume — slippage and trap risk.
+• MACRO (when relevant): BTC/ETH risk tone, DXY/rates proxy read, risk-on/off filter for alts.
 
 ═══════════════════════════════════════
-RULE 3 — DERIVATIVES (natural integration — NOT mechanical)
+RULE 3 — LEVERAGE & DERIVATIVES MASTERY (prose integration — NOT a data dump)
 ═══════════════════════════════════════
-Live Binance Futures data in user prompt: funding, OI, 5m long/short accounts, recent liquidations.
+User prompt supplies live Binance Futures: funding rate, open interest, 5m long/short accounts,
+recent liquidations. Mobula may add liquidity/volume context.
 
-**Liquidity & Sentiment** — write ONE cohesive paragraph:
-  Weave all four data points into a positioning story: who is crowded, who got liquidated, whether OI
-  confirms conviction or signals exhaustion. Read like a prop desk note, not a data feed recap.
-  FORBIDDEN: "Funding is X. OI is Y. Long/short is Z. Liquidations are W." in separate clauses.
+**Liquidity & Sentiment** — ONE authoritative paragraph:
+  Tell the positioning story: Who is crowded? Who just got liquidated? Is OI rising with price
+  (new money) or rising against price (shorts adding)? Is funding paying shorts to hold the book?
+  Are liqs fueling continuation or marking exhaustion? Tie to order flow implication (stop runs,
+  cascade risk, squeeze setup). Read like a hedge-fund risk note — never "Funding is X. OI is Y."
 
-**Confluence Summary** — one decisive sentence that fuses structure/VWAP/momentum WITH positioning
-  when derivatives matter. Example: "MODERATE — price holds above daily VWAP while short-heavy accounts
-  and negative funding provide squeeze fuel into the 4h liquidity pool."
+**Confluence Summary** — EXACTLY one sentence. Grade STRONG / MODERATE / WEAK. Fuse structure + VWAP +
+  momentum + derivatives + liquidity when available.
 
-Derivatives shift **Overall Bias** and **If I Were to Trade Today...** when they confirm or fight the
-technical read. Crowded + extended = fade risk. Liq cascade + structure break = follow impulse.
-
-═══════════════════════════════════════
-RULE 4 — CONVICTION & DISCIPLINE
-═══════════════════════════════════════
-• **Overall Bias**: Mildly Bullish / Mildly Bearish / Neutral + Confidence %. Side when evidence supports.
-  75%+ needs MTF + structure + derivatives alignment. Neutral is discipline, not weakness.
-• **Confluence Summary**: EXACTLY one sentence. STRONG / MODERATE / WEAK grade. State the edge plainly.
-• WEAK confluence or MTF conflict without catalyst → no TRADE LEVELS. Wait is the veteran call.
-• **If I Were to Trade Today...**: Trigger, invalidation, thesis flip. Scalp → "[Long/Short] SCALP Setup:".
+Derivatives OVERRIDE or CONFIRM technical bias: extreme positive funding + crowded longs = fade fuel;
+negative funding + rising OI + short liqs = squeeze blueprint; OI collapse after spike = move spent.
 
 ═══════════════════════════════════════
-RULE 5 — DISCLAIMER (terminal)
+RULE 4 — CONVICTION, PSYCHOLOGY & EDGE CASES
+═══════════════════════════════════════
+• **Overall Bias**: Mildly Bullish / Mildly Bearish / Neutral + Confidence %. 80%+ requires MTF +
+  structure + derivatives + liquidity alignment. Neutral = professional discipline, not indecision.
+• **If I Were to Trade Today...**: Exact trigger, hard invalidation, thesis flip, size/risk mindset
+  (e.g. half size into FOMC, full size on clean reclaim). Scalp → "[Long/Short] SCALP Setup:".
+• **Risks & Watchlist**: 2–3 bullets — killer scenarios, event risk, level breaks that void thesis,
+  psychological traps (chase, revenge, over-leverage after win).
+• WEAK / conflicted / no catalyst → NO **TRADE LEVELS**. "Stand down" is a position.
+
+═══════════════════════════════════════
+RULE 5 — DISCLAIMER (terminal — exact text)
 ═══════════════════════════════════════
 {DISCLAIMER}
 
@@ -1879,13 +2333,15 @@ Entry at $XXXXX, TP1 at $XXXXX, TP2 at $XXXXX, SL at $XXXXX (R:R X.X:1)
             shared
             + f"""
 ═══════════════════════════════════════
-MODE: TRADE SETUP — EXECUTE OR DEFEND FLAT
+MODE: TRADE SETUP — ONE SHOT, EXECUTION-READY
 ═══════════════════════════════════════
-• ONE setup only. Long OR Short per direction constraint. No menus. No "either/or."
-• TRADE LEVELS mandatory unless genuinely no ≥{MIN_RR_TP1:.1f}:1 edge — then explain why flat in If I Were to Trade Today.
-• Confluence bar: VWAP + structure + momentum + derivatives must justify the call.
-• TP1 ≥ {MIN_RR_TP1:.1f}:1 (target {TARGET_RR_TP1:.1f}:1+). TP2 = next structural objective.
-• Scalp TF: full SCALP DOCTRINE — surgical, time-boxed, derivatives-filtered.
+• Deliver ONE institutional-grade setup. Long OR Short per direction lock. No A/B menus.
+• **TRADE LEVELS** mandatory unless no ≥{MIN_RR_TP1:.1f}:1 edge exists — then defend flat in **If I Were to Trade Today...**
+  with what would need to change to engage.
+• Confluence bar: VWAP + order blocks/FVGs + structure + momentum + funding/OI/L-S/liqs.
+• TP1 ≥ {MIN_RR_TP1:.1f}:1 (target {TARGET_RR_TP1:.1f}:1+). TP2 = next liquidity pool / HTF objective.
+• Include invalidation price, optional runner logic, and leverage-awareness (cascade/squeeze risk).
+• Scalp TF: full SCALP DOCTRINE — no weak entries.
 """
         )
 
@@ -1893,28 +2349,34 @@ MODE: TRADE SETUP — EXECUTE OR DEFEND FLAT
         shared
         + f"""
 ═══════════════════════════════════════
-MODE: MARKET ANALYSIS — VERDICT FIRST
+MODE: MARKET ANALYSIS — VERDICT FIRST, LEVELS WHEN EARNED
 ═══════════════════════════════════════
-• Sharp bias. Explicit edge. Price-accurate throughout. Derivatives integrated.
-• TRADE LEVELS only when MODERATE/STRONG confluence AND ≥{MIN_RR_TP1:.1f}:1 R:R exists.
-• WEAK or conflicted → no levels. "Wait for clarity" is the veteran call. Discipline beats FOMO.
+• Lead with bias and edge. Integrate macro tone, derivatives, and on-chain liquidity when provided.
+• **TRADE LEVELS** only on MODERATE/STRONG confluence with ≥{MIN_RR_TP1:.1f}:1 R:R — otherwise omit and
+  state what must develop before capital is deployed.
+• WEAK / MTF conflict / crowded fade without catalyst → flat is the professional call.
 """
     )
 
 
 def default_chat_system_prompt() -> str:
-    return f"""You are Oracle Trader AI — elite veteran crypto trader. 15+ years. Millions made. Real capital daily.
+    return f"""You are Oracle Trader AI — 20-year veteran crypto hedge-fund trader. Architect-level leverage
+and flow literacy. You speak to funded operators: sharp, confident, zero fluff. Real capital every day.
 
-Voice: desk orders. Maximum conviction. Zero filler. Flat or fire — no middle ground.
+VOICE: Live desk + risk committee. High conviction. Price-specific. Psychology-aware. No tutorials.
 
-Rules:
-• LIVE PRICE is law — never cite stale or guessed prices.
-• Minimum {MIN_RR_TP1:.1f}:1 R:R on TP1 (target {TARGET_RR_TP1:.1f}:1+).
-• Format: Entry at $X, TP1 at $X, TP2 at $X, SL at $X (R:R X.X:1)
-• SCALP / quick move / short-term: surgical best scalp — tight levels, VWAP, momentum, micro invalidation,
-  derivatives filter, time-box — or say NO SCALP. Never force.
-• Use funding/OI/positioning/liquidations when discussing bias. No N/A — use neutral smart labels.
-• Expert Plan depth. No report disclaimer unless asked."""
+CORE RULES:
+• LIVE PRICE is law — never guess or use stale quotes.
+• Leverage literacy: funding, OI, long/short ratio, liquidation cascades, crowded positioning, order flow.
+• Technical + on-chain: VWAP stack, order blocks, FVGs, liquidity pools, BOS/CHoCH, HTF/LTF alignment.
+• Levels when asked: Entry at $X, TP1 at $X, TP2 at $X, SL at $X (R:R X.X:1) — min {MIN_RR_TP1:.1f}:1 on
+  TP1 (target {TARGET_RR_TP1:.1f}:1+). SL = true invalidation, not a random %.
+• SCALP / quick move: best scalp on the board — VWAP trigger, micro SL, derivatives filter, time-box —
+  or "NO SCALP — STAY FLAT". Never force B-setups.
+• Risk: size for invalidation, note FOMO/chase/revenge traps, event risk, edge cases (funding flip, liq
+  cascade, false breakout).
+• Forbidden: might/could/maybe, hedging without verdict, metric lists without a story, influencer tone.
+• Do not append the full report disclaimer unless the user asks for formal analysis output."""
 
 
 def normalize_direction(direction: str) -> str:
@@ -1941,45 +2403,50 @@ def report_structure_block(*, coin: str, price: float, change_pct: float, mode: 
     price_str = format_usd(price)
 
     if mode == "tradesetup":
-        trade_block = """
-**TRADE LEVELS** (MANDATORY — exact format, minimum 2.1:1 R:R, target 2.3:1+):
+        trade_block = f"""
+**TRADE LEVELS** (MANDATORY unless truly no edge — exact format, min {MIN_RR_TP1:.1f}:1 R:R, target {TARGET_RR_TP1:.1f}:1+):
 Entry at $XXXXX, TP1 at $XXXXX, TP2 at $XXXXX, SL at $XXXXX (R:R X.X:1)
 Reward = |TP1 − Entry| = $X | Risk = |Entry − SL| = $X | R:R = X.X:1
+TP1 = first liquidity pool / partial FVG fill. TP2 = HTF extension. SL = structural invalidation.
 """
     else:
-        trade_block = """
-**TRADE LEVELS** (only if ≥2.1:1 R:R setup exists — otherwise omit section):
+        trade_block = f"""
+**TRADE LEVELS** (only if ≥{MIN_RR_TP1:.1f}:1 R:R edge exists — otherwise OMIT this section entirely):
 Entry at $XXXXX, TP1 at $XXXXX, TP2 at $XXXXX, SL at $XXXXX (R:R X.X:1)
 Reward = |TP1 − Entry| = $X | Risk = |Entry − SL| = $X | R:R = X.X:1
 """
 
     return f"""
-Use this **exact structure**:
+Deliver using this **exact structure** (headings unchanged — maximum depth inside each section):
 
 **Asset**: {coin} | {price_str} | {change_pct:+.2f}%
 
 **Overall Bias**: [Mildly Bullish / Mildly Bearish / Neutral] (Confidence: XX%)
+State regime, HTF veto, and whether derivatives confirm or fight the read.
 
 **Key Drivers**:
-- Volume-Weighted Analysis: ...
-- Liquidity & Sentiment: One flowing paragraph — weave live funding, OI, positioning, liquidations into a positioning verdict (not a metric list).
-- Heikin Ashi Analysis: ...
-- Fibonacci Retracements: ...
-- Technicals: MACD, RSI, EMAs...
-- Market Structure: ...
+- Volume-Weighted Analysis: Session / prior day / weekly / monthly VWAP — premium vs discount,
+  acceptance vs rejection, cluster zones (~0.3–0.8%), mean-reversion vs trend continuation.
+- Liquidity & Sentiment: ONE paragraph — funding, OI delta, long/short positioning, recent liqs,
+  cascade/squeeze risk, order-flow implication. Mobula liquidity/volume if in prompt. No metric list.
+- Heikin Ashi Analysis: Trend quality, indecision wicks, reversal vs continuation read on requested TF.
+- Fibonacci Retracements: Active retracement zone (0.382–0.618 etc.), golden pocket confluence with VWAP/OB.
+- Technicals: MACD, RSI, EMAs — regime, divergence only with structure, volume confirmation on breaks.
+- Market Structure: BOS/CHoCH, order blocks, FVGs, equal highs/lows, range boundaries, liquidity targets.
 
-**Confluence Summary**: One decisive, high-conviction sentence — grade STRONG / MODERATE / WEAK, state the edge.
+**Confluence Summary**: Exactly ONE sentence. Grade STRONG / MODERATE / WEAK. State the edge in plain
+desk language — fuse technicals + derivatives + liquidity.
 
 **If I Were to Trade Today...**
-- [Long/Short] Setup: Professional desk language — trigger, invalidation, thesis flip conditions.
-  Examples:
-  • "Short on rejection at daily VWAP with bearish RSI divergence"
-  • "Long on reclaim and hold of weekly VWAP confluence"
-  • "Continuation lower on breakdown below 0.618 Fib with volume"
-  • "Favor shorts into previous-week VWAP resistance"
+- [Long/Short] Setup: (or [Long/Short] SCALP Setup: if scalping)
+  Trigger at named level/event, hard invalidation, thesis flip, optional size/psych note (chase risk,
+  event window, half-size conditions). Examples of tone:
+  • "Long on reclaim of session VWAP + 15m OB hold; invalidation below sweep low at $X"
+  • "Short into daily VWAP rejection with crowded longs + rising funding; flip if 4h BOS closes above $X"
+  • "NO TRADE — MTF conflict until weekly FVG fills or funding normalizes"
 
 **Risks & Watchlist**:
-- 2-3 bullet points max.
+- 2–3 bullets: killer invalidation scenarios, macro/event risk, psychological traps, edge cases.
 
 {trade_block}
 
@@ -2009,61 +2476,79 @@ def build_analyze_user_prompt(
     )
 
     derivatives_block = format_derivatives_prompt_block(derivatives)
+    mobula_block = format_mobula_market_prompt_block(market)
 
     scalp_banner = ""
     if scalp_mode:
-        scalp_banner = """
-═══ ⚡ SCALP / QUICK-MOVE / SCALPING SETUP — BEST SCALP OR NO SCALP ═══
-Deliver the absolute best high-probability scalp: tight entry vs live price, micro SL, named momentum trigger,
-session VWAP context, derivatives filter, time-box. Label "[Long/Short] SCALP Setup". TP1 ≥2.1:1 R:R.
-If edge is weak → "NO SCALP — STAY FLAT" and omit TRADE LEVELS.
+        scalp_banner = f"""
+═══ ⚡ SCALP / QUICK-MOVE — HEDGE-FUND SURGICAL OR FLAT ═══
+Deliver the single best scalp on the desk: live-price entry, named trigger (VWAP/OB/sweep/BOS), funding/OI/L-S
+filter, micro invalidation, time-box. Label "[Long/Short] SCALP Setup". TP1 ≥{MIN_RR_TP1:.1f}:1 R:R.
+Weak edge → "NO SCALP — STAY FLAT" and OMIT **TRADE LEVELS**.
 """
 
     price_raw = f"{price:.8f}".rstrip("0").rstrip(".")
     max_entry_drift = "0.8%" if scalp_mode else "3%"
 
     fetched_at = market.get("fetched_at")
+    price_source = market.get("source", "unknown")
     freshness_line = ""
     if fetched_at:
         ts = datetime.fromtimestamp(float(fetched_at), tz=timezone.utc).strftime(
             "%Y-%m-%d %H:%M:%S UTC"
         )
         age_sec = max(0.0, time.time() - float(fetched_at))
+        source_note = {
+            "mobula": "Mobula depth-weighted live feed",
+            "coingecko": "CoinGecko aggressive pull (cache-busted)",
+            "binance_spot": "Binance spot 24h ticker",
+            "binance_futures": "Binance futures 24h ticker",
+        }.get(price_source, price_source)
         freshness_line = (
-            f"PRICE FETCHED AT: {ts} ({age_sec:.2f}s ago — aggressive CoinGecko, cache-busted)\n"
+            f"PRICE FETCHED AT: {ts} ({age_sec:.2f}s ago — {source_note})\n"
             f"USE THIS PRICE ONLY: all Entry/TP/SL must anchor to {price_str} as of this timestamp.\n"
         )
 
-    return f"""Generate an elite veteran-grade, high-conviction report for On-Chain Oracle AI.
+    mode_label = "TRADE SETUP (execution-ready)" if mode == "tradesetup" else "MARKET ANALYSIS"
+    return f"""Generate an institutional-grade, high-conviction On-Chain Oracle AI report — 20-year veteran
+hedge-fund desk voice. {mode_label}. No fluff. Call the edge or command flat.
 {scalp_banner}
 ═══════════════════════════════════════════════════════════
-AUTHORITATIVE LIVE PRICE — RULE 0 (ZERO TOLERANCE FOR ERROR)
+AUTHORITATIVE LIVE PRICE — RULE 0 (ZERO TOLERANCE)
 ═══════════════════════════════════════════════════════════
 CURRENT LIVE PRICE: {price_str} (raw: {price_raw} USD)
 24h CHANGE: {change_pct:+.2f}%
 SOURCE: {market.get('source', 'unknown')}
 {freshness_line}MANDATORY:
-• **Asset** line MUST show EXACTLY: {coin.upper()} | {price_str} | {change_pct:+.2f}%
-• ALL Entry/TP/SL levels positioned vs {price_str} RIGHT NOW — not historical, not estimated.
-• Entry should be within ~{max_entry_drift} of live for {'scalp' if scalp_mode else 'active'} setups unless limit at named structure.
-• Verify Long: SL < Entry, TP above Entry. Short: SL > Entry, TP below Entry.
+• **Asset** line EXACTLY: {coin.upper()} | {price_str} | {change_pct:+.2f}%
+• Every Entry / TP1 / TP2 / SL vs {price_str} NOW — limits must name structure (OB, FVG, VWAP, pool).
+• Entry within ~{max_entry_drift} of live for {'scalp' if scalp_mode else 'active'} unless limit at level.
+• Long: SL < Entry < TP1 ≤ TP2. Short: TP2 ≤ TP1 < Entry < SL. Show R:R math inline.
 
 ═══ REQUEST CONTEXT ═══
 **Asset**: {coin.upper()} | {price_str} | {change_pct:+.2f}%
-Timeframe: {timeframe} | Mode: {mode}
+Timeframe: {timeframe} | Mode: {mode} | {mode_label}
 Direction: {direction_instruction(direction)}
 24h Volume: {volume_text}
 
-{derivatives_block}
+═══ LIVE DATA — WEAVE INTO PROSE (not bullet dumps) ═══
+{mobula_block}{derivatives_block}
+Use funding, OI, long/short ratio, liquidations for positioning story: crowded side, cascade risk,
+squeeze fuel, OI conviction vs exhaustion. Cross-check with VWAP, order blocks, FVGs, structure.
 
-═══ VWAP (weave into Key Drivers) ═══
-Daily + Previous Day + Weekly + Monthly VWAP. Flag clusters ~0.3–0.8%.
+═══ ANALYTICAL DEPTH CHECKLIST (Key Drivers) ═══
+• MTF: Weekly/Daily/4h → {timeframe} → LTF trigger. ALIGNED or CONFLICTED.
+• VWAP stack + premium/discount. Liquidity pools, sweeps, stop runs.
+• Order blocks, fair value gaps, BOS/CHoCH, range boundaries.
+• Macro tone for alts (BTC/ETH risk-on/off) when relevant.
+• Psychology: FOMO, chase, over-leverage — call out when price action invites mistakes.
 
-Write like a veteran desk — sharp, decisive, zero filler. Derivatives in prose, not lists. Call the shot.
+Write like the creator of modern crypto trading — confident, experienced, professional. One positioning
+story in Liquidity & Sentiment. Decisive Confluence Summary. Actionable If I Were to Trade Today.
 
 {report_structure_block(coin=coin.upper(), price=price, change_pct=change_pct, mode=mode)}
 
-End with exact disclaimer only."""
+End with the exact disclaimer line only."""
 
 
 def build_review_system_prompt() -> str:
@@ -2816,7 +3301,10 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
     Auth: X-API-Key header must match app_api_key saved via POST /exchange_keys.
 
     Also mounted at /api/execute_trade (same handler) for clients using /api prefix.
-    Does not log secrets; returns status=success on accepted execution request.
+
+    order_type=market or entry_price=\"market\" → BloFin MARKET placement.
+    Default limit flow is unchanged (validate geometry, accept, no exchange REST call).
+    Safe logging at every step — never logs API secrets or passphrases.
     """
     req_id = getattr(http_request.state, "request_id", "?")
     path = http_request.url.path
@@ -2949,7 +3437,8 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             headers={"X-Request-ID": req_id},
         )
 
-    if decrypt_secret_at_rest(exchange_secret_enc) is None:
+    exchange_secret = decrypt_secret_at_rest(exchange_secret_enc)
+    if exchange_secret is None:
         logger.error(
             "execute_trade_secret_decrypt_failed request_id=%s user_id=%s",
             req_id,
@@ -2966,6 +3455,151 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             headers={"X-Request-ID": req_id},
         )
 
+    is_market = _is_market_trade_request(trade, raw_body)
+    order_type = "market" if is_market else "limit"
+    exchange = record.get("exchange") or "unspecified"
+    environment = record.get("environment") or "live"
+    api_base_url = record.get("api_base_url") or BLOFIN_LIVE_API_BASE_URL
+    trade_id = uuid.uuid4().hex[:16]
+
+    logger.info(
+        "execute_trade_parsed request_id=%s trade_id=%s user_id=%s order_type=%s coin=%s direction=%s "
+        "entry=%s sl=%s tp1=%s tp2=%s risk_percent=%.2f exchange=%s environment=%s base_url=%s",
+        req_id,
+        trade_id,
+        user_id,
+        order_type,
+        trade.coin,
+        trade.direction,
+        trade.entry_price,
+        trade.stop_loss,
+        trade.tp1,
+        trade.tp2,
+        trade.risk_percent,
+        exchange,
+        environment,
+        api_base_url,
+    )
+
+    # ── MARKET: BloFin immediate entry (order_type=market or entry_price=\"market\") ──
+    if is_market:
+        if "blofin" not in str(exchange).lower():
+            logger.warning(
+                "execute_trade_market_unsupported_exchange request_id=%s exchange=%s",
+                req_id,
+                exchange,
+            )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "detail": f"MARKET orders are only supported for BloFin (exchange={exchange}).",
+                    "user_message": "MARKET entry is available for BloFin only. Use AI Limit Order or link BloFin keys.",
+                    "request_id": req_id,
+                },
+                headers={"X-Request-ID": req_id},
+            )
+
+        passphrase = _resolve_blofin_passphrase(record)
+        if not passphrase:
+            logger.error(
+                "execute_trade_blofin_passphrase_missing request_id=%s user_id=%s",
+                req_id,
+                user_id,
+            )
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "success": False,
+                    "detail": "BloFin API passphrase is not configured on the server.",
+                    "user_message": "Server BloFin passphrase missing. Set BLOFIN_PASSPHRASE on Railway.",
+                    "request_id": req_id,
+                },
+                headers={"X-Request-ID": req_id},
+            )
+
+        logger.info(
+            "execute_trade_market_dispatch request_id=%s trade_id=%s blofin_base=%s inst=%s",
+            req_id,
+            trade_id,
+            api_base_url,
+            _blofin_inst_id(trade.coin),
+        )
+
+        blofin_result = _blofin_place_order(
+            base_url=api_base_url,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            passphrase=passphrase,
+            coin=trade.coin,
+            direction=trade.direction,
+            order_type="market",
+            size=BLOFIN_ORDER_SIZE,
+            tp1=trade.tp1,
+            sl=trade.stop_loss,
+            client_order_id=trade_id[:32],
+            request_id=req_id,
+        )
+
+        blofin_order_id = blofin_result.get("order_id")
+        if blofin_result.get("ok"):
+            logger.info(
+                "execute_trade_market_success request_id=%s trade_id=%s blofin_order_id=%s",
+                req_id,
+                trade_id,
+                blofin_order_id,
+            )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "status": "success",
+                    "order_type": "market",
+                    "trade_id": trade_id,
+                    "order_id": blofin_order_id,
+                    "user_id": user_id,
+                    "coin": trade.coin,
+                    "direction": trade.direction,
+                    "stop_loss": trade.stop_loss,
+                    "tp1": trade.tp1,
+                    "tp2": trade.tp2,
+                    "risk_percent": trade.risk_percent,
+                    "exchange": exchange,
+                    "environment": environment,
+                    "message": f"MARKET order placed for {trade.coin} {trade.direction.upper()}.",
+                    "user_message": (
+                        f"MARKET order executed on BloFin ({environment}). "
+                        f"{trade.coin} {trade.direction.upper()} · Order ID {blofin_order_id or 'pending'}"
+                    ),
+                    "request_id": req_id,
+                },
+                headers={"X-Request-ID": req_id},
+            )
+
+        logger.warning(
+            "execute_trade_market_failure request_id=%s trade_id=%s http=%s code=%s msg=%s",
+            req_id,
+            trade_id,
+            blofin_result.get("http_status"),
+            blofin_result.get("code"),
+            blofin_result.get("msg"),
+        )
+        return JSONResponse(
+            status_code=502,
+            content={
+                "success": False,
+                "status": "failed",
+                "order_type": "market",
+                "trade_id": trade_id,
+                "detail": blofin_result.get("msg") or "BloFin MARKET order rejected.",
+                "user_message": blofin_result.get("msg") or "BloFin could not place the MARKET order. Try again.",
+                "blofin_code": blofin_result.get("code"),
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    # ── LIMIT: original accept-only flow (unchanged) ─────────────────────────────
     geometry_err = _validate_citadel_trade_geometry(
         direction=trade.direction,
         entry=trade.entry_price,
@@ -2974,6 +3608,11 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
         tp2=trade.tp2,
     )
     if geometry_err:
+        logger.warning(
+            "execute_trade_geometry_rejected request_id=%s reason=%s",
+            req_id,
+            geometry_err,
+        )
         return JSONResponse(
             status_code=400,
             content={
@@ -2986,14 +3625,10 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
         )
 
     rr = compute_rr(trade.entry_price, trade.tp1, trade.stop_loss)
-    trade_id = uuid.uuid4().hex[:16]
-    exchange = record.get("exchange") or "unspecified"
-    environment = record.get("environment") or "live"
-    api_base_url = record.get("api_base_url")
 
     logger.info(
-        "execute_trade_accepted request_id=%s trade_id=%s user_id=%s coin=%s direction=%s "
-        "entry=%s sl=%s tp1=%s tp2=%s risk_percent=%.2f rr=%s exchange=%s environment=%s base_url=%s",
+        "execute_trade_limit_accepted request_id=%s trade_id=%s user_id=%s coin=%s direction=%s "
+        "entry=%s sl=%s tp1=%s tp2=%s risk_percent=%.2f rr=%s exchange=%s environment=%s",
         req_id,
         trade_id,
         user_id,
@@ -3007,16 +3642,14 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
         f"{rr:.2f}" if rr is not None else "n/a",
         exchange,
         environment,
-        api_base_url,
     )
 
-    # Execution hook: exchange REST placement uses stored keys + api_base_url (BloFin demo/live).
-    # Response matches Flutter expectation: HTTP 200 + status=success + user_message.
     return JSONResponse(
         status_code=200,
         content={
             "success": True,
             "status": "success",
+            "order_type": "limit",
             "trade_id": trade_id,
             "user_id": user_id,
             "coin": trade.coin,
