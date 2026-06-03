@@ -519,7 +519,7 @@ def fetch_mobula_price(coin: str) -> Optional[dict[str, Any]]:
 
 
 def format_mobula_market_prompt_block(market: dict[str, Any]) -> str:
-    """Rich Mobula context for Grok — liquidity, volume split, market cap (no secrets)."""
+    """Rich Mobula context for Grok — liquidity, volume split, on-chain vs CEX (analyze/trade-setup)."""
     if market.get("source") != "mobula":
         return ""
 
@@ -531,6 +531,7 @@ def format_mobula_market_prompt_block(market: dict[str, Any]) -> str:
     ch1h = market.get("price_change_1h")
     ch7d = market.get("price_change_7d")
     rank = market.get("mobula_rank")
+    name = market.get("mobula_name") or market.get("coin", "")
 
     def _usd(val: Any) -> str:
         try:
@@ -545,22 +546,75 @@ def format_mobula_market_prompt_block(market: dict[str, Any]) -> str:
             return f"${v / 1e3:.1f}K"
         return format_usd(v)
 
+    def _pct(part: float, whole: float) -> str:
+        if whole <= 0:
+            return "n/a"
+        return f"{100.0 * part / whole:.0f}%"
+
+    on_f = float(on_vol or 0)
+    off_f = float(off_vol or 0)
+    vol_total = on_f + off_f
+    vol_mix = ""
+    if vol_total > 0:
+        vol_mix = (
+            f"Volume mix: {_pct(on_f, vol_total)} on-chain / {_pct(off_f, vol_total)} off-chain (CEX) — "
+        )
+        if on_f > off_f * 1.25:
+            vol_mix += "spot/DEX-led tape; treat perp squeezes as secondary until CEX confirms."
+        elif off_f > on_f * 1.25:
+            vol_mix += "CEX/perp-led tape; weight funding, OI, and liqs heavily in **Liquidity & Sentiment**."
+        else:
+            vol_mix += "balanced tape; require derivatives + structure alignment before sizing up."
+
+    liq_f = float(liq or 0)
+    liq_read = ""
+    if liq_f > 0 and vol_total > 0:
+        liq_to_vol = liq_f / vol_total
+        if liq_to_vol < 0.05:
+            liq_read = "Thin liquidity vs volume — slippage and stop-run risk elevated; favor limits at OB/FVG."
+        elif liq_to_vol > 0.35:
+            liq_read = "Deep pool liquidity vs volume — cleaner mean-reversion at VWAP; breakouts need volume confirmation."
+        else:
+            liq_read = "Moderate liquidity depth — standard execution; watch sweep-and-reject at pools."
+
     lines = [
-        "═══ MOBULA LIVE MARKET (depth-weighted price, on-chain + CEX context) ═══",
-        f"Liquidity (DEX pools): {_usd(liq)} | Max pool liquidity: {_usd(liq_max)}",
-        f"Market cap: {_usd(mcap)}" + (f" | Rank: #{rank}" if rank else ""),
-        f"24h volume — on-chain: {_usd(on_vol)} | off-chain (CEX): {_usd(off_vol)}",
+        "═══ MOBULA LIVE MARKET — AUTHORITATIVE ON-CHAIN + LIQUIDITY (MUST DRIVE THE REPORT) ═══",
+        f"Asset: {name} | Depth-weighted live price already in RULE 0 block above",
+        f"DEX liquidity (pools): {_usd(liq)} | Max pool liquidity: {_usd(liq_max)}",
+        f"Market cap: {_usd(mcap)}" + (f" | Mobula rank: #{rank}" if rank else ""),
+        f"24h volume — on-chain: {_usd(on_vol)} | off-chain (CEX): {_usd(off_vol)} | total: {_usd(vol_total)}",
     ]
+    if vol_mix:
+        lines.append(vol_mix)
+    if liq_read:
+        lines.append(f"Liquidity read: {liq_read}")
     if ch1h is not None:
         try:
-            lines.append(f"Mobula price change: 1h {float(ch1h):+.2f}% | 7d {float(ch7d or 0):+.2f}%")
+            lines.append(f"Mobula momentum: 1h {float(ch1h):+.2f}% | 7d {float(ch7d or 0):+.2f}%")
         except (TypeError, ValueError):
             pass
-    lines.append(
-        "Use liquidity + volume mix to judge slippage risk, trap probability, and whether "
-        "moves are spot-led vs perp/CEX-led. Cross-check with derivatives below."
+    lines.extend(
+        [
+            "MANDATORY MOBULA USAGE (non-negotiable):",
+            "• **Volume-Weighted Analysis** — cite VWAP vs live price AND whether tape is on-chain-led or CEX-led.",
+            "• **Liquidity & Sentiment** — open with liquidity/slippage/trap read from Mobula, then fuse derivatives.",
+            "• **Overall Bias** / **Confluence Summary** / **If I Were to Trade Today...** — price Mobula into the verdict.",
+            "• Do NOT dump raw numbers; translate into edge (trap risk, chase risk, squeeze fuel, stand-aside).",
+        ]
     )
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n\n"
+
+
+def format_market_data_fallback_note(market: dict[str, Any]) -> str:
+    """When Mobula misses, tell the model not to invent on-chain stats."""
+    if market.get("source") == "mobula":
+        return ""
+    return (
+        "═══ ON-CHAIN / MOBULA ═══\n"
+        "Mobula live feed unavailable for this tick — do NOT invent DEX liquidity or on-chain volume. "
+        "Infer liquidity from structure + Binance derivatives only; state 'on-chain depth unverified' once in "
+        "**Liquidity & Sentiment** if relevant.\n\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1036,6 +1090,7 @@ DESK INSTRUCTION — synthesize into **Liquidity & Sentiment** as ONE story:
   fade breakdown only while 1h VWAP caps."
 • Bad: four separate clauses restating each metric.
 • **Confluence Summary**, **Overall Bias**, and **If I Were to Trade Today...** must price this in.
+• If MOBULA block is above: derivatives confirm or fight the on-chain/liquidity read — say which wins.
 • Never write "N/A" or "unavailable" in the report — translate gaps into neutral positioning language."""
 
 
@@ -2259,8 +2314,11 @@ RULE 2 — ADVANCED CONFLUENCE STACK
 • STRUCTURE: BOS/CHoCH, order blocks, FVGs, range highs/lows, equal highs/lows (liquidity targets).
 • MOMENTUM: EMA 5/20 regime, RSI regime (>50 bull / <50 bear) + divergence only WITH structure,
   MACD histogram expansion/contraction, volume on breaks vs fakeouts.
-• ON-CHAIN / MOBULA (when in prompt): liquidity depth, on-chain vs CEX volume — slippage and trap risk.
+• ON-CHAIN / MOBULA (when MOBULA block present — mandatory): DEX liquidity, on-chain vs CEX volume mix,
+  slippage/trap risk, spot-led vs perp-led tape. Weave into VWAP read AND **Liquidity & Sentiment** lead.
 • MACRO (when relevant): BTC/ETH risk tone, DXY/rates proxy read, risk-on/off filter for alts.
+• PREMIUM BREVITY: Tight desk prose. No filler. Each **Key Drivers** bullet: 2–4 crisp sentences max.
+  One positioning story in **Liquidity & Sentiment** — never repeat Mobula numbers in **Technicals**.
 
 ═══════════════════════════════════════
 RULE 3 — LEVERAGE & DERIVATIVES MASTERY (prose integration — NOT a data dump)
@@ -2285,8 +2343,10 @@ RULE 4 — CONVICTION, PSYCHOLOGY & EDGE CASES
 ═══════════════════════════════════════
 • **Overall Bias**: Mildly Bullish / Mildly Bearish / Neutral + Confidence %. 80%+ requires MTF +
   structure + derivatives + liquidity alignment. Neutral = professional discipline, not indecision.
-• **If I Were to Trade Today...**: Exact trigger, hard invalidation, thesis flip, size/risk mindset
-  (e.g. half size into FOMC, full size on clean reclaim). Scalp → "[Long/Short] SCALP Setup:".
+• **If I Were to Trade Today...**: Desk execution card — NOT a summary. Labeled lines:
+  Trigger | Entry (market/limit + level) | Invalidation (price + break) | Time box | Size stance |
+  Thesis flip | Plan B or STAND DOWN. Scalp → "[Long/Short] SCALP Setup:" with minutes-level trigger.
+  If flat: state exactly what must print before capital deploys.
 • **Risks & Watchlist**: 2–3 bullets — killer scenarios, event risk, level breaks that void thesis,
   psychological traps (chase, revenge, over-leverage after win).
 • WEAK / conflicted / no catalyst → NO **TRADE LEVELS**. "Stand down" is a position.
@@ -2317,7 +2377,8 @@ REPORT STRUCTURE — EXACT HEADINGS (Flutter — DO NOT rename or reorder)
 **Confluence Summary**: One decisive, high-conviction sentence.
 
 **If I Were to Trade Today...**
-- [Long/Short] Setup: — or [Long/Short] SCALP Setup: when scalping
+- [Long/Short] Setup: (or [Long/Short] SCALP Setup: if scalping)
+  Trigger: ... | Entry: ... | Invalidation: ... | Time box: ... | Size: ... | Flip if: ... | Plan B: ...
 
 **Risks & Watchlist**:
 - 2-3 bullet points max.
@@ -2337,7 +2398,8 @@ MODE: TRADE SETUP — ONE SHOT, EXECUTION-READY
 ═══════════════════════════════════════
 • Deliver ONE institutional-grade setup. Long OR Short per direction lock. No A/B menus.
 • **TRADE LEVELS** mandatory unless no ≥{MIN_RR_TP1:.1f}:1 edge exists — then defend flat in **If I Were to Trade Today...**
-  with what would need to change to engage.
+  with the exact trigger that would unlock the trade (price + structure + derivatives reset).
+• **If I Were to Trade Today...** must read like a desk ticket: executable trigger, not commentary.
 • Confluence bar: VWAP + order blocks/FVGs + structure + momentum + funding/OI/L-S/liqs.
 • TP1 ≥ {MIN_RR_TP1:.1f}:1 (target {TARGET_RR_TP1:.1f}:1+). TP2 = next liquidity pool / HTF objective.
 • Include invalidation price, optional runner logic, and leverage-awareness (cascade/squeeze risk).
@@ -2553,11 +2615,15 @@ desk language — fuse technicals + derivatives + liquidity.
 
 **If I Were to Trade Today...**
 - [Long/Short] Setup: (or [Long/Short] SCALP Setup: if scalping)
-  Trigger at named level/event, hard invalidation, thesis flip, optional size/psych note (chase risk,
-  event window, half-size conditions). Examples of tone:
-  • "Long on reclaim of session VWAP + 15m OB hold; invalidation below sweep low at $X"
-  • "Short into daily VWAP rejection with crowded longs + rising funding; flip if 4h BOS closes above $X"
-  • "NO TRADE — MTF conflict until weekly FVG fills or funding normalizes"
+  Write as a desk execution card (keep labels; one line each):
+  Trigger: [exact event — reclaim, reject, sweep+hold, BOS retest, funding flip]
+  Entry: [market now | limit at $X structure] — drift vs live spot if limit
+  Invalidation: [$X + what structure breaks] — hard stop thesis
+  Time box: [bars / session / hours — especially scalps]
+  Size: [full | half | stand down — FOMO/chase/event risk]
+  Flip if: [price + condition that makes opposite true]
+  Plan B: [fade vs breakout alternate] OR "STAND DOWN — [one line what must develop]"
+  Mobula-led assets: reference liquidity/volume mix once (slippage or trap), not a data dump.
 
 **Risks & Watchlist**:
 - 2–3 bullets: killer invalidation scenarios, macro/event risk, psychological traps, edge cases.
@@ -2591,6 +2657,8 @@ def build_analyze_user_prompt(
 
     derivatives_block = format_derivatives_prompt_block(derivatives)
     mobula_block = format_mobula_market_prompt_block(market)
+    market_fallback_note = format_market_data_fallback_note(market)
+    has_mobula = market.get("source") == "mobula"
 
     scalp_banner = ""
     if scalp_mode:
@@ -2624,8 +2692,22 @@ Weak edge → "NO SCALP — STAY FLAT" and OMIT **TRADE LEVELS**.
         )
 
     mode_label = "TRADE SETUP (execution-ready)" if mode == "tradesetup" else "MARKET ANALYSIS"
-    return f"""Generate an institutional-grade, high-conviction On-Chain Oracle AI report — 20-year veteran
-hedge-fund desk voice. {mode_label}. No fluff. Call the edge or command flat.
+    mobula_priority = (
+        "MOBULA DATA IS LIVE — liquidity, on-chain vs CEX volume, and pool depth MUST shape bias, "
+        "Liquidity & Sentiment, and your trade card. Lead with on-chain/liquidity read when relevant."
+        if has_mobula
+        else "No Mobula tick — do not fabricate on-chain stats; lean on derivatives + structure."
+    )
+    mode_close = (
+        "TRADE SETUP MODE: One shot. **TRADE LEVELS** required unless flat — then execution card explains "
+        "what unlocks the trade. **If I Were to Trade Today...** = desk ticket (Trigger/Entry/Invalidation/...)."
+        if mode == "tradesetup"
+        else "ANALYSIS MODE: Verdict-first. **TRADE LEVELS** only if edge ≥ "
+        f"{MIN_RR_TP1:.1f}:1 — else omit and use **If I Were to Trade Today...** for stand-down + unlock conditions."
+    )
+
+    return f"""Generate a premium, high-conviction On-Chain Oracle AI report — 20-year veteran hedge-fund desk.
+{mode_label}. Decisive. Zero hedging. {mobula_priority}
 {scalp_banner}
 ═══════════════════════════════════════════════════════════
 AUTHORITATIVE LIVE PRICE — RULE 0 (ZERO TOLERANCE)
@@ -2643,22 +2725,23 @@ SOURCE: {market.get('source', 'unknown')}
 **Asset**: {coin.upper()} | {price_str} | {change_pct:+.2f}%
 Timeframe: {timeframe} | Mode: {mode} | {mode_label}
 Direction: {direction_instruction(direction)}
-24h Volume: {volume_text}
+24h Volume (aggregate): {volume_text}
 
-═══ LIVE DATA — WEAVE INTO PROSE (not bullet dumps) ═══
-{mobula_block}{derivatives_block}
-Use funding, OI, long/short ratio, liquidations for positioning story: crowded side, cascade risk,
-squeeze fuel, OI conviction vs exhaustion. Cross-check with VWAP, order blocks, FVGs, structure.
+═══ LIVE MARKET DATA — ORDER OF AUTHORITY (synthesize; never list metrics alone) ═══
+{mobula_block}{market_fallback_note}{derivatives_block}
+Cross-check: Mobula liquidity/volume mix ↔ funding/OI/L-S/liqs ↔ VWAP/structure on {timeframe}.
+**Liquidity & Sentiment** opens with liquidity/trap/slippage read when Mobula present, then derivatives story.
 
-═══ ANALYTICAL DEPTH CHECKLIST (Key Drivers) ═══
+═══ ANALYTICAL DEPTH CHECKLIST (Key Drivers — tight prose) ═══
 • MTF: Weekly/Daily/4h → {timeframe} → LTF trigger. ALIGNED or CONFLICTED.
-• VWAP stack + premium/discount. Liquidity pools, sweeps, stop runs.
-• Order blocks, fair value gaps, BOS/CHoCH, range boundaries.
-• Macro tone for alts (BTC/ETH risk-on/off) when relevant.
-• Psychology: FOMO, chase, over-leverage — call out when price action invites mistakes.
+• VWAP stack + premium/discount; tie to Mobula tape character if provided.
+• Order blocks, FVGs, BOS/CHoCH, pools, sweeps.
+• Macro (BTC/ETH risk-on/off) for alts when relevant.
+• Psychology: chase/FOMO/revenge only when price invites the mistake.
 
-Write like the creator of modern crypto trading — confident, experienced, professional. One positioning
-story in Liquidity & Sentiment. Decisive Confluence Summary. Actionable If I Were to Trade Today.
+{mode_close}
+**If I Were to Trade Today...** = execution card (Trigger | Entry | Invalidation | Time box | Size | Flip | Plan B).
+Premium brevity: no repetition across sections. One verdict in **Confluence Summary**.
 
 {report_structure_block(coin=coin.upper(), price=price, change_pct=change_pct, mode=mode)}
 
@@ -2938,7 +3021,7 @@ async def _handle_analyze(
     grok_fallback = False
 
     try:
-        # Fresh CoinGecko price injected into prompt — same AI style/format as before
+        # Mobula-first live market → default_system_prompt + build_analyze_user_prompt (both modes)
         market = fetch_live_price_for_analysis(coin)
 
         scalp_mode = is_scalp_context(
@@ -2962,7 +3045,8 @@ async def _handle_analyze(
         )
 
         logger.info(
-            "analyze request_id=%s coin=%s mode=%s tf=%s dir=%s scalp=%s price=%.6f src=%s deriv=%s",
+            "analyze request_id=%s coin=%s mode=%s tf=%s dir=%s scalp=%s price=%.6f src=%s "
+            "mobula_liq=%s on_chain_vol=%s deriv=%s",
             req_id,
             coin,
             mode,
@@ -2971,11 +3055,14 @@ async def _handle_analyze(
             scalp_mode,
             market["price"],
             market.get("source"),
+            market.get("liquidity_usd") if market.get("source") == "mobula" else None,
+            market.get("on_chain_volume_usd") if market.get("source") == "mobula" else None,
             derivatives["has_futures_data"],
         )
 
-        temperature = 0.36 if scalp_mode else (0.39 if mode == "analysis" else 0.35)
-        max_tokens = 1800 if mode == "tradesetup" or scalp_mode else 1580
+        # Slightly lower temperature — tighter, more decisive veteran voice (same headings)
+        temperature = 0.34 if scalp_mode else (0.36 if mode == "analysis" else 0.33)
+        max_tokens = 1750 if mode == "tradesetup" or scalp_mode else 1520
 
         try:
             report = await run_grok_in_executor(
