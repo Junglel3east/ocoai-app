@@ -2458,7 +2458,7 @@ async def chat(request: ChatRequest, http_request: Request):
     return {"success": True, "reply": reply}
 
 
-async def _handle_exchange_keys(http_request: Request) -> JSONResponse | dict[str, Any]:
+async def _handle_exchange_keys(http_request: Request) -> JSONResponse:
     """
     POST /exchange_keys — persist Oracle Citadel credentials (encrypted secret on disk).
 
@@ -2704,7 +2704,7 @@ async def _handle_exchange_keys(http_request: Request) -> JSONResponse | dict[st
 @app.post("/exchange_keys/")
 @app.post("/api/exchange_keys")
 @app.post("/api/exchange_keys/")
-async def exchange_keys(http_request: Request) -> JSONResponse | dict[str, Any]:
+async def exchange_keys(http_request: Request) -> JSONResponse:
     return await _handle_exchange_keys(http_request)
 
 
