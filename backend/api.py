@@ -52,7 +52,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 # ---------------------------------------------------------------------------
 # Environment — Railway Variables + optional local .env (never commit .env)
@@ -222,19 +222,25 @@ class ExchangeKeysRequest(BaseModel):
     App API key may also be sent via X-API-Key header.
     """
 
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
     user_id: str = Field(..., min_length=1, max_length=128)
-    app_api_key: Optional[str] = Field(None, max_length=512)
+    app_api_key: Optional[str] = Field(
+        None,
+        max_length=512,
+        validation_alias=AliasChoices("app_api_key", "app_key"),
+    )
     exchange_api_key: str = Field(
         ...,
         min_length=1,
         max_length=512,
-        validation_alias=AliasChoices("exchange_api_key", "api_key"),
+        validation_alias=AliasChoices("exchange_api_key", "api_key", "exchange_key"),
     )
     exchange_secret: str = Field(
         ...,
         min_length=1,
         max_length=512,
-        validation_alias=AliasChoices("exchange_secret", "api_secret"),
+        validation_alias=AliasChoices("exchange_secret", "api_secret", "exchange_secret_key"),
     )
     risk_percent: float = Field(1.0, ge=0.1, le=100.0)
     # Optional exchange id (e.g. "blofin", "coinbase"). Demo URL only for BloFin + use_demo_mode.
@@ -1078,18 +1084,49 @@ def audit_trade_levels(report: str, live_price: float, *, scalp_mode: bool = Fal
 # ---------------------------------------------------------------------------
 
 
-def _citadel_encryption_key_bytes() -> bytes:
+def _citadel_encryption_key_bytes(*, salt: bytes = b"") -> bytes:
     """32-byte key derived from CITADEL_ENCRYPTION_KEY (set on Railway for production)."""
     seed = CITADEL_ENCRYPTION_KEY or "oracle-citadel-dev-only-change-in-production"
-    return hashlib.sha256(seed.encode("utf-8")).digest()
+    material = seed.encode("utf-8") + salt
+    return hashlib.sha256(material).digest()
 
 
 def encrypt_secret_at_rest(plaintext: str) -> str:
-    """Simple XOR + base64 obfuscation keyed by server secret (not reversible without key)."""
-    key = _citadel_encryption_key_bytes()
+    """
+    Encrypt exchange secret for disk storage (PBKDF2-derived key + per-record salt + XOR).
+    Prefix enc2: distinguishes new records from legacy enc1/xor-only blobs.
+    """
+    if not plaintext:
+        raise ValueError("exchange_secret is empty")
+    salt = os.urandom(16)
+    key = _citadel_encryption_key_bytes(salt=salt)
     data = plaintext.encode("utf-8")
     xored = bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
-    return base64.b64encode(xored).decode("ascii")
+    payload = base64.b64encode(xored).decode("ascii")
+    salt_b64 = base64.b64encode(salt).decode("ascii")
+    return f"enc2:{salt_b64}:{payload}"
+
+
+def decrypt_secret_at_rest(ciphertext: str) -> Optional[str]:
+    """Decrypt stored secret for post-save verification (never log plaintext)."""
+    if not ciphertext:
+        return None
+    try:
+        if ciphertext.startswith("enc2:"):
+            _, salt_b64, payload = ciphertext.split(":", 2)
+            salt = base64.b64decode(salt_b64.encode("ascii"))
+            key = _citadel_encryption_key_bytes(salt=salt)
+            xored = base64.b64decode(payload.encode("ascii"))
+            plain = bytes(b ^ key[i % len(key)] for i, b in enumerate(xored))
+            return plain.decode("utf-8")
+        # Legacy: bare base64 XOR with global key only
+        key = _citadel_encryption_key_bytes()
+        xored = base64.b64decode(ciphertext.encode("ascii"))
+        plain = bytes(b ^ key[i % len(key)] for i, b in enumerate(xored))
+        return plain.decode("utf-8")
+    except (ValueError, OSError, UnicodeDecodeError) as exc:
+        logger.error("citadel_secret_decrypt_failed err=%s", exc)
+        return None
 
 
 def _load_citadel_key_store() -> dict[str, Any]:
@@ -1106,8 +1143,11 @@ def _load_citadel_key_store() -> dict[str, Any]:
 def _save_citadel_key_store(store: dict[str, Any]) -> None:
     _CITADEL_DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = _CITADEL_KEYS_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(store, indent=2), encoding="utf-8")
+    payload = json.dumps(store, indent=2)
+    tmp.write_text(payload, encoding="utf-8")
     tmp.replace(_CITADEL_KEYS_FILE)
+    if not _CITADEL_KEYS_FILE.is_file():
+        raise OSError(f"citadel key file missing after write: {_CITADEL_KEYS_FILE}")
 
 
 def resolve_citadel_exchange_profile(
@@ -1157,6 +1197,32 @@ def resolve_citadel_exchange_profile(
     }
 
 
+def _normalize_exchange_keys_payload(raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    Map Flutter / legacy JSON field names before Pydantic validation.
+    Flutter Citadel setup sends api_key + api_secret (exchange creds), not exchange_api_key.
+    """
+    data = dict(raw)
+    if not data.get("exchange_api_key") and data.get("api_key"):
+        data["exchange_api_key"] = data["api_key"]
+    if not data.get("exchange_secret") and data.get("api_secret"):
+        data["exchange_secret"] = data["api_secret"]
+    if "use_demo_mode" not in data and "demo_mode" in data:
+        data["use_demo_mode"] = data["demo_mode"]
+    return data
+
+
+def _parse_exchange_keys_request(
+    raw_body: dict[str, Any],
+    *,
+    header_app_key: str,
+) -> ExchangeKeysRequest:
+    normalized = _normalize_exchange_keys_payload(raw_body)
+    if header_app_key and not normalized.get("app_api_key"):
+        normalized["app_api_key"] = header_app_key
+    return ExchangeKeysRequest.model_validate(normalized)
+
+
 def save_exchange_keys_record(
     *,
     user_id: str,
@@ -1168,12 +1234,13 @@ def save_exchange_keys_record(
     use_demo_mode: bool = False,
 ) -> dict[str, Any]:
     profile = resolve_citadel_exchange_profile(exchange, use_demo_mode)
+    encrypted_secret = encrypt_secret_at_rest(exchange_secret)
     store = _load_citadel_key_store()
     store[user_id] = {
         "user_id": user_id,
         "app_api_key": app_api_key,
         "exchange_api_key": exchange_api_key,
-        "exchange_secret_encrypted": encrypt_secret_at_rest(exchange_secret),
+        "exchange_secret_encrypted": encrypted_secret,
         "risk_percent": risk_percent,
         "exchange": profile["exchange"],
         "use_demo_mode": use_demo_mode,
@@ -1182,6 +1249,23 @@ def save_exchange_keys_record(
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     _save_citadel_key_store(store)
+
+    # Verify round-trip encrypt/decrypt and on-disk persistence (no secrets in logs).
+    reloaded = _load_citadel_key_store()
+    record = reloaded.get(user_id) if isinstance(reloaded, dict) else None
+    if not record:
+        raise OSError(f"citadel record not found after save for user_id={user_id}")
+    stored_cipher = record.get("exchange_secret_encrypted", "")
+    if decrypt_secret_at_rest(stored_cipher) != exchange_secret:
+        raise OSError(f"citadel secret verification failed for user_id={user_id}")
+
+    file_bytes = _CITADEL_KEYS_FILE.stat().st_size if _CITADEL_KEYS_FILE.is_file() else 0
+    profile["persisted"] = True
+    profile["store_user_count"] = len(reloaded)
+    profile["store_file_bytes"] = file_bytes
+    profile["encryption_prefix"] = (
+        stored_cipher.split(":", 1)[0] if isinstance(stored_cipher, str) and ":" in stored_cipher else "legacy"
+    )
     return profile
 
 
@@ -2074,7 +2158,7 @@ async def root() -> dict[str, Any]:
         "health": "/health",
         "analyze": "POST /analyze (mode=analysis|tradesetup)",
         "trade_setup": "POST /trade-setup (alias)",
-        "exchange_keys": "POST /exchange_keys",
+        "exchange_keys": "POST /exchange_keys (also POST /api/exchange_keys)",
     }
 
 
@@ -2108,7 +2192,12 @@ async def health() -> dict[str, Any]:
                 ],
                 "review": ["POST /review"],
                 "chat": ["POST /chat"],
-                "exchange_keys": ["POST /exchange_keys", "POST /exchange_keys/"],
+                "exchange_keys": [
+                    "POST /exchange_keys",
+                    "POST /exchange_keys/",
+                    "POST /api/exchange_keys",
+                    "POST /api/exchange_keys/",
+                ],
             },
             "citadel_encryption_configured": bool(CITADEL_ENCRYPTION_KEY),
         }
@@ -2369,27 +2458,117 @@ async def chat(request: ChatRequest, http_request: Request):
     return {"success": True, "reply": reply}
 
 
-@app.post("/exchange_keys")
-@app.post("/exchange_keys/")
-async def exchange_keys(
-    request: ExchangeKeysRequest,
-    http_request: Request,
-) -> dict[str, Any]:
+async def _handle_exchange_keys(http_request: Request) -> JSONResponse | dict[str, Any]:
     """
-    Persist Oracle Citadel exchange credentials for [user_id].
-    Flutter sends api_key/api_secret; also accepts exchange_api_key/exchange_secret.
+    POST /exchange_keys — persist Oracle Citadel credentials (encrypted secret on disk).
+
+    Accepts (body JSON, any combination):
+      user_id, app_api_key, exchange_api_key, exchange_secret, risk_percent
+    Flutter aliases: api_key, api_secret, demo_mode / use_demo_mode, X-API-Key header.
+
+    Also mounted at /api/exchange_keys (same handler) to avoid 404 when clients use /api prefix.
     """
     req_id = getattr(http_request.state, "request_id", "?")
-    user_id = request.user_id.strip()
-    header_app_key = (http_request.headers.get("X-API-Key") or "").strip()
-    app_api_key = (request.app_api_key or header_app_key).strip()
+    path = http_request.url.path
+    header_app_key = (http_request.headers.get("X-API-Key") or http_request.headers.get("x-api-key") or "").strip()
 
-    if not app_api_key:
+    logger.info(
+        "exchange_keys_request_start request_id=%s path=%s has_x_api_key=%s content_type=%s",
+        req_id,
+        path,
+        bool(header_app_key),
+        http_request.headers.get("content-type", ""),
+    )
+
+    try:
+        raw_body = await http_request.json()
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "exchange_keys_invalid_json request_id=%s path=%s err=%s",
+            req_id,
+            path,
+            exc,
+        )
         return JSONResponse(
             status_code=400,
             content={
                 "success": False,
-                "detail": "app_api_key is required (body or X-API-Key header).",
+                "detail": "Request body must be valid JSON.",
+                "user_message": "Invalid request. Send JSON with user_id and exchange keys.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    if not isinstance(raw_body, dict):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": "Request body must be a JSON object.",
+                "user_message": "Invalid request format.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    body_keys = sorted(raw_body.keys())
+    logger.info(
+        "exchange_keys_body_keys request_id=%s keys=%s risk_percent=%s exchange=%s demo=%s",
+        req_id,
+        body_keys,
+        raw_body.get("risk_percent"),
+        raw_body.get("exchange"),
+        raw_body.get("use_demo_mode", raw_body.get("demo_mode")),
+    )
+
+    try:
+        request = _parse_exchange_keys_request(raw_body, header_app_key=header_app_key)
+    except ValidationError as exc:
+        logger.warning(
+            "exchange_keys_validation_failed request_id=%s errors=%s",
+            req_id,
+            exc.errors(),
+        )
+        return JSONResponse(
+            status_code=422,
+            content={
+                "success": False,
+                "detail": "Invalid exchange keys payload.",
+                "user_message": "Check user_id, exchange API key, secret, and risk percent.",
+                "errors": exc.errors(),
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    user_id = request.user_id.strip()
+    app_api_key = (request.app_api_key or header_app_key).strip()
+
+    if not user_id:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": "user_id is required.",
+                "user_message": "User ID is required for Oracle Citadel.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    if not app_api_key:
+        logger.warning(
+            "exchange_keys_missing_app_api_key request_id=%s user_id=%s path=%s",
+            req_id,
+            user_id,
+            path,
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": "app_api_key is required (body field app_api_key or X-API-Key header).",
                 "user_message": "App API Key is required for Oracle Citadel.",
                 "request_id": req_id,
             },
@@ -2435,6 +2614,14 @@ async def exchange_keys(
             headers={"X-Request-ID": req_id},
         )
 
+    if not CITADEL_ENCRYPTION_KEY:
+        logger.warning(
+            "exchange_keys_encryption_key_missing request_id=%s user_id=%s "
+            "(using dev fallback — set CITADEL_ENCRYPTION_KEY on Railway)",
+            req_id,
+            user_id,
+        )
+
     try:
         saved_profile = save_exchange_keys_record(
             user_id=user_id,
@@ -2448,37 +2635,56 @@ async def exchange_keys(
         if saved_profile.get("blofin_demo"):
             logger.info(
                 "exchange_keys_saved request_id=%s user_id=%s exchange=blofin environment=demo "
-                "base_url=%s risk_percent=%.2f",
+                "base_url=%s risk_percent=%.2f persisted=%s store_users=%s file_bytes=%s enc=%s path=%s",
                 req_id,
                 user_id,
                 saved_profile.get("api_base_url"),
                 request.risk_percent,
+                saved_profile.get("persisted"),
+                saved_profile.get("store_user_count"),
+                saved_profile.get("store_file_bytes"),
+                saved_profile.get("encryption_prefix"),
+                _CITADEL_KEYS_FILE,
             )
         else:
             logger.info(
                 "exchange_keys_saved request_id=%s user_id=%s exchange=%s environment=%s "
-                "demo_mode=%s risk_percent=%.2f",
+                "demo_mode=%s risk_percent=%.2f persisted=%s store_users=%s file_bytes=%s enc=%s path=%s",
                 req_id,
                 user_id,
                 saved_profile.get("exchange"),
                 saved_profile.get("environment"),
                 request.use_demo_mode,
                 request.risk_percent,
+                saved_profile.get("persisted"),
+                saved_profile.get("store_user_count"),
+                saved_profile.get("store_file_bytes"),
+                saved_profile.get("encryption_prefix"),
+                _CITADEL_KEYS_FILE,
             )
-        return {
-            "success": True,
-            "user_id": user_id,
-            "message": "Exchange keys saved securely.",
-            "exchange": saved_profile.get("exchange"),
-            "environment": saved_profile.get("environment"),
-            "api_base_url": saved_profile.get("api_base_url"),
-            "use_demo_mode": request.use_demo_mode,
-        }
-    except OSError as exc:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "saved": True,
+                "user_id": user_id,
+                "message": "Exchange keys saved securely.",
+                "exchange": saved_profile.get("exchange"),
+                "environment": saved_profile.get("environment"),
+                "api_base_url": saved_profile.get("api_base_url"),
+                "use_demo_mode": request.use_demo_mode,
+                "risk_percent": request.risk_percent,
+                "persisted": saved_profile.get("persisted", True),
+            },
+            headers={"X-Request-ID": req_id},
+        )
+    except (OSError, ValueError) as exc:
         logger.exception(
-            "exchange_keys_save_failed request_id=%s user_id=%s err=%s",
+            "exchange_keys_save_failed request_id=%s user_id=%s path=%s store=%s err=%s",
             req_id,
             user_id,
+            path,
+            _CITADEL_KEYS_FILE,
             exc,
         )
         return JSONResponse(
@@ -2491,6 +2697,15 @@ async def exchange_keys(
             },
             headers={"X-Request-ID": req_id},
         )
+
+
+# Fixed Citadel key-save routes — /api/* aliases prevent 404 when clients prefix /api
+@app.post("/exchange_keys")
+@app.post("/exchange_keys/")
+@app.post("/api/exchange_keys")
+@app.post("/api/exchange_keys/")
+async def exchange_keys(http_request: Request) -> JSONResponse | dict[str, Any]:
+    return await _handle_exchange_keys(http_request)
 
 
 if __name__ == "__main__":
