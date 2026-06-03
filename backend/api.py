@@ -2359,24 +2359,138 @@ MODE: MARKET ANALYSIS — VERDICT FIRST, LEVELS WHEN EARNED
     )
 
 
+# ---------------------------------------------------------------------------
+# Oracle Trader AI Chat — veteran desk (POST /chat only)
+# ---------------------------------------------------------------------------
+
+_CHAT_COIN_PATTERN = re.compile(
+    r"\b("
+    r"BTC|ETH|SOL|BNB|XRP|ADA|DOGE|AVAX|LINK|DOT|MATIC|POL|LTC|TRX|SHIB|"
+    r"ATOM|UNI|NEAR|APT|ARB|OP|SUI|PEPE|WIF|BONK|HYPE|RENDER|FET|TAO|INJ"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def detect_chat_coin_symbol(*texts: str) -> Optional[str]:
+    """Best-effort ticker from user message + history (for live context injection)."""
+    for blob in texts:
+        if not blob:
+            continue
+        match = _CHAT_COIN_PATTERN.search(blob.upper())
+        if match:
+            return match.group(1).upper()
+    return None
+
+
+def build_chat_market_context_note(coin: str) -> tuple[str, list[str]]:
+    """
+    Pull live context for chat (Mobula → snapshot fallback + derivatives).
+    Returns (context block, limitation notes) — never raises; safe for chat.
+    """
+    upper = coin.upper()
+    lines: list[str] = [f"═══ LIVE DESK DATA — {upper} (server-fed, use in your answer) ═══"]
+    limitations: list[str] = []
+
+    mobula = fetch_mobula_price(upper)
+    price: Optional[float] = None
+    if mobula:
+        price = float(mobula["price"])
+        lines.append(
+            f"Price: {format_usd(price)} | 24h {mobula['change_24h_pct']:+.2f}% | source: Mobula (depth-weighted)"
+        )
+        if mobula.get("liquidity_usd"):
+            lines.append(f"DEX liquidity: ${mobula['liquidity_usd']:,.0f}")
+        if mobula.get("on_chain_volume_usd") or mobula.get("off_chain_volume_usd"):
+            lines.append(
+                f"Volume 24h — on-chain: ${float(mobula.get('on_chain_volume_usd') or 0):,.0f} | "
+                f"off-chain: ${float(mobula.get('off_chain_volume_usd') or 0):,.0f}"
+            )
+    else:
+        limitations.append(f"Mobula live quote unavailable for {upper}")
+        try:
+            snap = fetch_market_snapshot(upper)
+            price = float(snap["price"])
+            lines.append(
+                f"Price: {format_usd(price)} | 24h {snap['change_24h_pct']:+.2f}% | source: {snap.get('source', 'fallback')}"
+            )
+        except HTTPException:
+            limitations.append(f"No live price feed for {upper} — analyze from principles; ask user for symbol/chart")
+
+    try:
+        deriv = fetch_derivatives_snapshot(upper, spot_price=price)
+        if deriv.get("has_futures_data"):
+            lines.append(f"Funding: {deriv.get('funding_label', 'n/a')}")
+            lines.append(f"Open interest: {deriv.get('oi_label', 'n/a')}")
+            lines.append(f"Positioning: {deriv.get('ls_label', 'n/a')}")
+            lines.append(f"Liquidations: {deriv.get('liq_label', 'n/a')}")
+        else:
+            limitations.append("Binance Futures derivatives snapshot unavailable")
+    except Exception as exc:
+        logger.debug("chat_derivatives_context_skip coin=%s err=%s", upper, exc)
+        limitations.append("Derivatives data temporarily unavailable")
+
+    if limitations:
+        lines.append("DATA GAPS (state briefly to user after delivering value): " + "; ".join(limitations))
+
+    return "\n".join(lines), limitations
+
+
+def enrich_chat_user_message(
+    message: str,
+    history: list[dict[str, str]],
+) -> tuple[str, Optional[str]]:
+    """Append live market context when a coin is mentioned."""
+    history_blob = " ".join(item.get("content", "") for item in history[-6:])
+    coin = detect_chat_coin_symbol(message, history_blob)
+    if not coin:
+        return message.strip(), None
+
+    context_note, _ = build_chat_market_context_note(coin)
+    enriched = (
+        f"{message.strip()}\n\n"
+        f"[Server context for {coin} — use if relevant, do not recite as a raw data dump]\n"
+        f"{context_note}"
+    )
+    return enriched, coin
+
+
 def default_chat_system_prompt() -> str:
-    return f"""You are Oracle Trader AI — 20-year veteran crypto hedge-fund trader. Architect-level leverage
-and flow literacy. You speak to funded operators: sharp, confident, zero fluff. Real capital every day.
+    """Master chat persona — aligned with analyze/trade-setup veteran identity."""
+    return f"""You are Oracle Trader AI — the same 20-year veteran crypto hedge-fund trader who architects
+On-Chain Oracle AI reports. Creator-level trading intelligence. Prop desk, macro crypto, full-cycle
+survivor. You are the best trader in the room and you act like it — calm, decisive, never defensive.
 
-VOICE: Live desk + risk committee. High conviction. Price-specific. Psychology-aware. No tutorials.
+MISSION: Every reply must deliver REAL EDGE — even on vague questions. You always attempt a full desk-quality
+read with whatever you have. If data is thin, you still call structure, scenarios, and risk — then state
+limitations in one short line at the end. Never open with "I can't" or "I'm unable" without first giving
+actionable value.
 
-CORE RULES:
-• LIVE PRICE is law — never guess or use stale quotes.
-• Leverage literacy: funding, OI, long/short ratio, liquidation cascades, crowded positioning, order flow.
-• Technical + on-chain: VWAP stack, order blocks, FVGs, liquidity pools, BOS/CHoCH, HTF/LTF alignment.
-• Levels when asked: Entry at $X, TP1 at $X, TP2 at $X, SL at $X (R:R X.X:1) — min {MIN_RR_TP1:.1f}:1 on
-  TP1 (target {TARGET_RR_TP1:.1f}:1+). SL = true invalidation, not a random %.
-• SCALP / quick move: best scalp on the board — VWAP trigger, micro SL, derivatives filter, time-box —
-  or "NO SCALP — STAY FLAT". Never force B-setups.
-• Risk: size for invalidation, note FOMO/chase/revenge traps, event risk, edge cases (funding flip, liq
-  cascade, false breakout).
-• Forbidden: might/could/maybe, hedging without verdict, metric lists without a story, influencer tone.
-• Do not append the full report disclaimer unless the user asks for formal analysis output."""
+VOICE: CIO + head of trading on a live call. Short paragraphs. Price-specific when possible. Zero fluff.
+Zero excuses. No influencer hype. No tutorial voice.
+
+FORBIDDEN OPENERS / FILLER:
+"I can't", "I'm unable", "I don't have access" (without prior value), "might", "could", "maybe",
+"possibly", "it seems", "as an AI", hedging without a verdict, metric laundry lists, apologizing.
+
+REQUIRED BEHAVIOR:
+• LEAD WITH THE CALL: bias, edge, or flat — then support it (MTF, VWAP, structure, derivatives).
+• LEVERAGE MASTERY: funding, OI, long/short ratio, liquidation cascades, squeeze/cascade, crowded side,
+  order flow, stop runs, liquidity pools.
+• TECHNICAL DEPTH: VWAP stack (session/prior/week/month), order blocks, FVGs, BOS/CHoCH, premium/discount,
+  equal highs/lows, HTF/LTF alignment, macro risk-on/off for alts.
+• LEVELS (when user wants a trade): Entry at $X, TP1 at $X, TP2 at $X, SL at $X (R:R X.X:1).
+  Min {MIN_RR_TP1:.1f}:1 on TP1 (target {TARGET_RR_TP1:.1f}:1+). SL = structural invalidation.
+• RISK & PSYCH: size for invalidation, FOMO/chase/revenge, event risk, when to stand down.
+• PROACTIVE DESK SERVICE — end EVERY reply with:
+  — 1–2 sharp follow-up questions (specific, not generic), AND
+  — 1 concrete next step (e.g. "pull 15m for trigger", "watch funding flip", "stand aside until VWAP reclaim").
+• ALTERNATIVES: when main idea is weak, offer Plan A / Plan B (e.g. breakout long vs fade into resistance).
+• Server-fed [LIVE DESK DATA] blocks are authoritative when present — weave into prose, not bullet dumps.
+• Do NOT append the formal report disclaimer unless user asks for a full written report.
+• Chat format: conversational markdown OK; no mandatory report headings unless user requests a full report.
+
+You are talking to a funded operator who paid for edge. Sound like you have real money on the line."""
 
 
 def normalize_direction(direction: str) -> str:
@@ -3021,25 +3135,68 @@ async def review(request: ReviewRequest, http_request: Request):
 @app.post("/chat")
 @app.post("/chat/")
 async def chat(request: ChatRequest, http_request: Request):
+    """
+    Expert Oracle Trader AI chat — server-side veteran prompt + optional live market injection.
+    Client system_prompt is ignored so chat stays aligned with analyze/trade-setup identity.
+    """
     message = request.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="message is required.")
 
-    system_prompt = (request.system_prompt or "").strip() or default_chat_system_prompt()
+    req_id = getattr(http_request.state, "request_id", "?")
     history = [{"role": m.role, "content": m.content} for m in request.history]
 
-    req_id = getattr(http_request.state, "request_id", "?")
-    logger.info("chat request_id=%s msg_len=%d history=%d", req_id, len(message), len(history))
+    # Always use backend veteran prompt (Flutter legacy system_prompt not applied to chat).
+    system_prompt = default_chat_system_prompt()
+    client_prompt_len = len((request.system_prompt or "").strip())
+    if client_prompt_len:
+        logger.info(
+            "chat_client_system_prompt_ignored request_id=%s client_chars=%d using=server_veteran_prompt",
+            req_id,
+            client_prompt_len,
+        )
 
-    reply = call_grok_chat(
-        system_prompt=system_prompt,
-        history=history,
-        message=message,
-        temperature=0.55,
-        max_tokens=900,
+    enriched_message, context_coin = enrich_chat_user_message(message, history)
+
+    logger.info(
+        "chat_request request_id=%s msg_len=%d history=%d context_coin=%s enriched_len=%d",
+        req_id,
+        len(message),
+        len(history),
+        context_coin or "none",
+        len(enriched_message),
     )
 
-    return {"success": True, "reply": reply}
+    try:
+        reply = call_grok_chat(
+            system_prompt=system_prompt,
+            history=history,
+            message=enriched_message,
+            temperature=0.62,
+            max_tokens=1400,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("chat_unhandled request_id=%s err=%s", req_id, exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Chat failed unexpectedly. Retry in a moment.",
+        ) from exc
+
+    logger.info(
+        "chat_success request_id=%s reply_chars=%d context_coin=%s",
+        req_id,
+        len(reply),
+        context_coin or "none",
+    )
+
+    return {
+        "success": True,
+        "reply": reply,
+        "request_id": req_id,
+        "context_coin": context_coin,
+    }
 
 
 async def _handle_exchange_keys(http_request: Request) -> JSONResponse:
