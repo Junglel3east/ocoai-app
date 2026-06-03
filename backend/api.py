@@ -1634,6 +1634,14 @@ def _blofin_inst_id(coin: str) -> str:
     return symbol if "-" in symbol else f"{symbol}-USDT"
 
 
+def _blofin_canonical_json(body: dict[str, Any]) -> str:
+    """
+    BloFin signature must match the exact POST bytes (no spaces).
+    See https://docs.blofin.com — \"JSON string should not contain any extra spaces\".
+    """
+    return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+
+
 def _blofin_sign_headers(
     *,
     api_key: str,
@@ -1641,14 +1649,15 @@ def _blofin_sign_headers(
     passphrase: str,
     method: str,
     path: str,
-    body: Optional[dict[str, Any]] = None,
+    body_str: str = "",
 ) -> dict[str, str]:
-    """BloFin REST signature headers (secrets never logged)."""
+    """
+    BloFin REST signature headers (secrets never logged).
+    Prehash: path + METHOD + timestamp + nonce + body_str (body_str empty for GET).
+    """
     timestamp = str(int(time.time() * 1000))
     nonce = uuid.uuid4().hex
-    msg = f"{path}{method.upper()}{timestamp}{nonce}"
-    if body is not None:
-        msg += json.dumps(body, separators=(",", ":"))
+    msg = f"{path}{method.upper()}{timestamp}{nonce}{body_str}"
     hex_sig = hmac.new(api_secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
     signature = base64.b64encode(hex_sig.encode("utf-8")).decode("ascii")
     return {
@@ -1765,22 +1774,34 @@ def _blofin_private_request(
     request_id: str = "?",
     log_tag: str = "blofin_request",
 ) -> tuple[int, str, Any]:
-    """Signed BloFin REST call — returns (http_status, raw_text, parsed_or_none)."""
+    """
+    Signed BloFin REST call — returns (http_status, raw_text, parsed_or_none).
+    POST/PUT: sign and send the same compact JSON string (fixes 152409 signature errors).
+    """
     url = f"{base_url.rstrip('/')}{path}"
+    body_str = ""
+    if body is not None and method.upper() in {"POST", "PUT"}:
+        body_str = _blofin_canonical_json(body)
     headers = _blofin_sign_headers(
         api_key=api_key,
         api_secret=api_secret,
         passphrase=passphrase,
         method=method,
         path=path,
-        body=body if method.upper() in {"POST", "PUT"} else None,
+        body_str=body_str,
     )
     started = time.perf_counter()
     try:
         if method.upper() == "GET":
             response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         else:
-            response = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
+            # Must use data=body_str — NOT json=body (different serialization breaks signature).
+            response = requests.post(
+                url,
+                headers=headers,
+                data=body_str.encode("utf-8"),
+                timeout=REQUEST_TIMEOUT,
+            )
     except requests.RequestException as exc:
         elapsed_ms = (time.perf_counter() - started) * 1000
         logger.error(
@@ -2102,10 +2123,12 @@ def _blofin_place_order(
         body["slOrderPrice"] = "-1"
         body["slTriggerPriceType"] = "last"
 
+    body_str = _blofin_canonical_json(body)
     logger.info(
-        "blofin_order_submit request_id=%s order_params=%s",
+        "blofin_order_submit request_id=%s order_params=%s canonical_json=%s",
         request_id,
         body,
+        body_str,
     )
 
     http_status, raw_text, parsed = _blofin_private_request(
@@ -2167,6 +2190,26 @@ def _resolve_blofin_passphrase(record: dict[str, Any]) -> str:
     """Passphrase for BloFin headers — env or optional per-user field (never logged)."""
     stored = (record.get("exchange_passphrase") or "").strip()
     return stored or BLOFIN_PASSPHRASE
+
+
+def _blofin_user_friendly_error(code: Any, msg: Optional[str]) -> str:
+    """Map BloFin API errors to actionable Citadel messages."""
+    text = (msg or "").strip()
+    code_str = str(code or "")
+    lower = text.lower()
+    if code_str == "152409" or "signature verification failed" in lower:
+        return (
+            "BloFin rejected the order: API signature mismatch. "
+            "Re-save your BloFin Demo API Key and Secret in Oracle Citadel Setup, "
+            "confirm BLOFIN_PASSPHRASE on Railway matches the passphrase you set when creating the key, "
+            "then retry MARKET."
+        )
+    if "ip" in lower and "whitelist" in lower:
+        return (
+            "BloFin rejected the order: API key IP whitelist does not include the Oracle Citadel server. "
+            "In BloFin Demo → API Management, disable IP restriction for testing or whitelist Railway egress."
+        )
+    return text or "BloFin could not place the MARKET order. Try again."
 
 
 def _validate_citadel_trade_geometry(
@@ -4250,6 +4293,10 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             if isinstance(blofin_result.get("response"), dict)
             else blofin_result.get("response"),
         )
+        friendly = _blofin_user_friendly_error(
+            blofin_result.get("code"),
+            blofin_result.get("msg"),
+        )
         return JSONResponse(
             status_code=502,
             content={
@@ -4258,7 +4305,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
                 "order_type": "market",
                 "trade_id": trade_id,
                 "detail": blofin_result.get("msg") or "BloFin MARKET order rejected.",
-                "user_message": blofin_result.get("msg") or "BloFin could not place the MARKET order. Try again.",
+                "user_message": friendly,
                 "blofin_code": blofin_result.get("code"),
                 "request_id": req_id,
             },
