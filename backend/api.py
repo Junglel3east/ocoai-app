@@ -21,6 +21,7 @@ Endpoints (lib/main.dart):
   POST /trade-setup, /trade_setup, /tradesetup — aliases → same handler (mode=tradesetup)
   POST /review    — report performance review
   POST /chat      — Expert Oracle Trader AI chat
+  POST /exchange_keys — Oracle Citadel exchange key storage (encrypted secret)
 
 Price chain: Binance Spot → Binance Futures → CoinGecko
 Derivatives (/analyze): funding, OI, long/short ratio, liquidations (Binance Futures)
@@ -31,6 +32,9 @@ Trade levels format (Oracle Citadel / Flutter parsing):
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -48,7 +52,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # Environment — Railway Variables + optional local .env (never commit .env)
@@ -84,6 +88,11 @@ UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN = int(os.getenv("UVICORN_TIMEOUT_GRACEFUL_SHUT
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 # Railway sets PORT; fall back to API_PORT then 8000 for local `python api.py`
 API_PORT = int(os.getenv("PORT", os.getenv("API_PORT", "8000")))
+
+# Oracle Citadel — exchange key storage (encrypted secrets on disk under backend/data/).
+CITADEL_ENCRYPTION_KEY = (os.getenv("CITADEL_ENCRYPTION_KEY") or "").strip()
+_CITADEL_DATA_DIR = _BACKEND_DIR / "data"
+_CITADEL_KEYS_FILE = _CITADEL_DATA_DIR / "exchange_keys.json"
 
 MIN_RR_TP1 = 2.1
 TARGET_RR_TP1 = 2.3
@@ -198,6 +207,45 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] = Field(default_factory=list)
     system_prompt: Optional[str] = None
     request_ts: Optional[int] = None
+
+
+class ExchangeKeysRequest(BaseModel):
+    """
+    Oracle Citadel key link — matches Flutter (api_key/api_secret) and explicit names.
+    App API key may also be sent via X-API-Key header.
+    """
+
+    user_id: str = Field(..., min_length=1, max_length=128)
+    app_api_key: Optional[str] = Field(None, max_length=512)
+    exchange_api_key: str = Field(
+        ...,
+        min_length=1,
+        max_length=512,
+        validation_alias=AliasChoices("exchange_api_key", "api_key"),
+    )
+    exchange_secret: str = Field(
+        ...,
+        min_length=1,
+        max_length=512,
+        validation_alias=AliasChoices("exchange_secret", "api_secret"),
+    )
+    risk_percent: float = Field(1.0, ge=0.1, le=100.0)
+
+    @field_validator("user_id", "exchange_api_key", "exchange_secret", mode="before")
+    @classmethod
+    def _strip_required_strings(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("app_api_key", mode="before")
+    @classmethod
+    def _strip_optional_app_key(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
 
 
 def normalize_analyze_mode(raw: Optional[str], *, default: str = "analysis") -> str:
@@ -823,6 +871,63 @@ def audit_trade_levels(report: str, live_price: float, *, scalp_mode: bool = Fal
                 max_drift,
                 scalp_mode,
             )
+
+
+# ---------------------------------------------------------------------------
+# Oracle Citadel — exchange keys (encrypted at rest)
+# ---------------------------------------------------------------------------
+
+
+def _citadel_encryption_key_bytes() -> bytes:
+    """32-byte key derived from CITADEL_ENCRYPTION_KEY (set on Railway for production)."""
+    seed = CITADEL_ENCRYPTION_KEY or "oracle-citadel-dev-only-change-in-production"
+    return hashlib.sha256(seed.encode("utf-8")).digest()
+
+
+def encrypt_secret_at_rest(plaintext: str) -> str:
+    """Simple XOR + base64 obfuscation keyed by server secret (not reversible without key)."""
+    key = _citadel_encryption_key_bytes()
+    data = plaintext.encode("utf-8")
+    xored = bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+    return base64.b64encode(xored).decode("ascii")
+
+
+def _load_citadel_key_store() -> dict[str, Any]:
+    if not _CITADEL_KEYS_FILE.is_file():
+        return {}
+    try:
+        raw = json.loads(_CITADEL_KEYS_FILE.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("citadel_store_read_failed path=%s err=%s", _CITADEL_KEYS_FILE, exc)
+        return {}
+
+
+def _save_citadel_key_store(store: dict[str, Any]) -> None:
+    _CITADEL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = _CITADEL_KEYS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(store, indent=2), encoding="utf-8")
+    tmp.replace(_CITADEL_KEYS_FILE)
+
+
+def save_exchange_keys_record(
+    *,
+    user_id: str,
+    app_api_key: str,
+    exchange_api_key: str,
+    exchange_secret: str,
+    risk_percent: float,
+) -> None:
+    store = _load_citadel_key_store()
+    store[user_id] = {
+        "user_id": user_id,
+        "app_api_key": app_api_key,
+        "exchange_api_key": exchange_api_key,
+        "exchange_secret_encrypted": encrypt_secret_at_rest(exchange_secret),
+        "risk_percent": risk_percent,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _save_citadel_key_store(store)
 
 
 # ---------------------------------------------------------------------------
@@ -1714,6 +1819,7 @@ async def root() -> dict[str, Any]:
         "health": "/health",
         "analyze": "POST /analyze (mode=analysis|tradesetup)",
         "trade_setup": "POST /trade-setup (alias)",
+        "exchange_keys": "POST /exchange_keys",
     }
 
 
@@ -1747,7 +1853,9 @@ async def health() -> dict[str, Any]:
                 ],
                 "review": ["POST /review"],
                 "chat": ["POST /chat"],
+                "exchange_keys": ["POST /exchange_keys", "POST /exchange_keys/"],
             },
+            "citadel_encryption_configured": bool(CITADEL_ENCRYPTION_KEY),
         }
     except Exception as exc:
         # Last resort — still return 200 so Railway does not mark the service dead.
@@ -2004,6 +2112,97 @@ async def chat(request: ChatRequest, http_request: Request):
     )
 
     return {"success": True, "reply": reply}
+
+
+@app.post("/exchange_keys")
+@app.post("/exchange_keys/")
+async def exchange_keys(
+    request: ExchangeKeysRequest,
+    http_request: Request,
+) -> dict[str, Any]:
+    """
+    Persist Oracle Citadel exchange credentials for [user_id].
+    Flutter sends api_key/api_secret; also accepts exchange_api_key/exchange_secret.
+    """
+    req_id = getattr(http_request.state, "request_id", "?")
+    user_id = request.user_id.strip()
+    header_app_key = (http_request.headers.get("X-API-Key") or "").strip()
+    app_api_key = (request.app_api_key or header_app_key).strip()
+
+    if not app_api_key:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": "app_api_key is required (body or X-API-Key header).",
+                "user_message": "App API Key is required for Oracle Citadel.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    if header_app_key and request.app_api_key and header_app_key != request.app_api_key:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": "X-API-Key header does not match app_api_key in body.",
+                "user_message": "App API Key mismatch. Use the same key in the header and form.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    exchange_api_key = request.exchange_api_key.strip()
+    exchange_secret = request.exchange_secret.strip()
+    if not exchange_api_key or not exchange_secret:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": "exchange_api_key and exchange_secret are required.",
+                "user_message": "Exchange API Key and Secret are required.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    try:
+        save_exchange_keys_record(
+            user_id=user_id,
+            app_api_key=app_api_key,
+            exchange_api_key=exchange_api_key,
+            exchange_secret=exchange_secret,
+            risk_percent=float(request.risk_percent),
+        )
+        logger.info(
+            "exchange_keys_saved request_id=%s user_id=%s risk_percent=%.2f",
+            req_id,
+            user_id,
+            request.risk_percent,
+        )
+        return {
+            "success": True,
+            "user_id": user_id,
+            "message": "Exchange keys saved securely.",
+        }
+    except OSError as exc:
+        logger.exception(
+            "exchange_keys_save_failed request_id=%s user_id=%s err=%s",
+            req_id,
+            user_id,
+            exc,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "detail": "Could not persist exchange keys on the server.",
+                "user_message": "Server could not save your keys. Try again or contact support.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
 
 
 if __name__ == "__main__":
