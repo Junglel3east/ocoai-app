@@ -36,8 +36,44 @@ class NotificationService {
   bool _firebaseReady = false;
   bool _localReady = false;
 
+  /// Set from [MainScreen] — opens Home and scrolls to Daily Analyses.
+  VoidCallback? onOpenDailyAnalyses;
+
+  bool _pendingOpenDailyAnalyses = false;
+
   bool get isFirebaseReady => _firebaseReady;
   bool get isLocalReady => _localReady;
+
+  /// Wire Home navigation (call from MainScreen.initState).
+  void registerDailyAnalysesNavigator(VoidCallback? navigator) {
+    onOpenDailyAnalyses = navigator;
+    if (navigator != null && _pendingOpenDailyAnalyses) {
+      _pendingOpenDailyAnalyses = false;
+      navigator();
+    }
+  }
+
+  /// After navigator is registered, handle cold-start notification tap.
+  Future<void> dispatchPendingDailyAnalysesNavigation() async {
+    if (!_pendingOpenDailyAnalyses) return;
+    if (onOpenDailyAnalyses != null) {
+      _pendingOpenDailyAnalyses = false;
+      onOpenDailyAnalyses!();
+    }
+  }
+
+  static bool isDailyAnalysesNotificationType(String? typeName) {
+    if (typeName == null) return false;
+    switch (typeName) {
+      case 'dailyUpdate':
+      case 'daily_update':
+      case 'analysisReady':
+      case 'analysis_ready':
+        return true;
+      default:
+        return false;
+    }
+  }
 
   /// Background FCM handler (must be top-level).
   @pragma('vm:entry-point')
@@ -93,6 +129,10 @@ class NotificationService {
       final initial = await _fcm.getInitialMessage();
       if (initial != null) {
         debugPrint('[FCM] Opened from terminated: ${initial.data}');
+        final typeName = (initial.data['type'] ?? initial.data['notification_type'])?.toString();
+        if (isDailyAnalysesNotificationType(typeName)) {
+          _pendingOpenDailyAnalyses = true;
+        }
       }
 
       debugPrint('[FCM] Token: ${await _fcm.getToken()}');
@@ -246,10 +286,37 @@ class NotificationService {
 
   void _onMessageOpenedApp(RemoteMessage message) {
     debugPrint('[FCM] Notification opened: ${message.data}');
+    _maybeOpenDailyAnalysesFromPayload(message.data);
   }
 
   void _onNotificationTapped(NotificationResponse response) {
     debugPrint('[Notifications] Tapped payload: ${response.payload}');
+    Map<String, dynamic>? data;
+    final raw = response.payload;
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map<String, dynamic>) {
+          data = decoded;
+        } else if (decoded is Map) {
+          data = decoded.map((k, v) => MapEntry(k.toString(), v));
+        }
+      } catch (_) {
+        data = {'type': raw};
+      }
+    }
+    _maybeOpenDailyAnalysesFromPayload(data);
+  }
+
+  void _maybeOpenDailyAnalysesFromPayload(Map<String, dynamic>? data) {
+    if (data == null) return;
+    final typeName = (data['type'] ?? data['notification_type'])?.toString();
+    if (!isDailyAnalysesNotificationType(typeName)) return;
+    if (onOpenDailyAnalyses != null) {
+      onOpenDailyAnalyses!();
+    } else {
+      _pendingOpenDailyAnalyses = true;
+    }
   }
 
   void _handleTypedPayload(

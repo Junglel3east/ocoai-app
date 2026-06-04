@@ -7,3 +7,6 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Citadel encrypted key store (never commit)
+data/

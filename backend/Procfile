@@ -1,3 +1,2 @@
 # Railway / Heroku-style process file (root directory = backend/)
-# Railway also reads railway.json; either works when service root is /backend
-web: uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000}
+web: uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000} --timeout-keep-alive 120 --timeout-graceful-shutdown 180
