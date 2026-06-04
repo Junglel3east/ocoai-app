@@ -26,11 +26,19 @@ android {
         versionName = flutter.versionName
     }
 
+    lint {
+        // Avoid JVM crashes during lintVital on some Windows + JBR setups.
+        checkReleaseBuilds = false
+    }
+
     buildTypes {
         release {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            // R8 minify can crash the Gradle JVM on this machine; UI-only launch builds are fine without it.
+            isMinifyEnabled = false
+            isShrinkResources = false
         }
     }
 }
