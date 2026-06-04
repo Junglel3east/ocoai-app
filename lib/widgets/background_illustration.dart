@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'profile_avatar.dart';
+
 /// Bottom clearance above main tab bar (Home, Analyze, Trade Setup, Charts, Portfolio).
 const double kMainTabBottomClearance = 80;
 
@@ -220,6 +222,7 @@ class OracleOrbHeroCard extends StatelessWidget {
   final String subtitle;
   final VoidCallback? onTap;
   final Widget? trailing;
+  final String? profileImagePath;
 
   const OracleOrbHeroCard({
     super.key,
@@ -227,6 +230,7 @@ class OracleOrbHeroCard extends StatelessWidget {
     required this.subtitle,
     this.onTap,
     this.trailing,
+    this.profileImagePath,
   });
 
   @override
@@ -240,21 +244,10 @@ class OracleOrbHeroCard extends StatelessWidget {
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(12),
-              child: Image.asset(
-                'assets/images/app_logo.png',
-                width: 72,
-                height: 72,
-                fit: BoxFit.cover,
-                filterQuality: FilterQuality.high,
-                errorBuilder: (_, __, ___) => Image.asset(
-                  'assets/images/app_icon.png',
-                  width: 72,
-                  height: 72,
-                  fit: BoxFit.cover,
-                ),
-              ),
+            ProfileAvatarImage(
+              size: 72,
+              imagePath: profileImagePath,
+              circular: false,
             ),
             const SizedBox(width: 14),
             Expanded(

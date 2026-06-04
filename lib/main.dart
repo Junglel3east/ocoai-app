@@ -25,6 +25,7 @@ import 'package:webview_flutter_android/webview_flutter_android.dart';
 import 'package:webview_flutter_wkwebview/webview_flutter_wkwebview.dart';
 
 import 'services/analysis_history_store.dart';
+import 'services/daily_analysis_store.dart';
 import 'services/market_movers_service.dart';
 import 'services/watchlist_binance_ws_service.dart';
 import 'services/notification_service.dart';
@@ -1868,15 +1869,19 @@ void _showExpertCoinUpgradePrompt(BuildContext context, String coin) {
   );
 }
 
-/// TradingView-style symbol search for adding coins to the Home watchlist.
+/// TradingView-style symbol search — watchlist add or pick-only (Trade Setup / Analyze).
 class WatchlistCoinSearchScreen extends StatefulWidget {
   final List<String> existingWatchlist;
   final ValueChanged<String> onCoinSelected;
+  final bool pickOnly;
+  final String title;
 
   const WatchlistCoinSearchScreen({
     super.key,
     required this.existingWatchlist,
     required this.onCoinSelected,
+    this.pickOnly = false,
+    this.title = 'Add Symbol',
   });
 
   @override
@@ -1930,14 +1935,14 @@ class _WatchlistCoinSearchScreenState extends State<WatchlistCoinSearchScreen> {
   Future<void> _selectCoin(String raw) async {
     final coin = await resolveCoinForCurrentPlan(context, raw);
     if (coin == null || !mounted) return;
-    if (widget.existingWatchlist.contains(coin)) {
+    if (!widget.pickOnly && widget.existingWatchlist.contains(coin)) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('$coin is already in your watchlist')),
       );
       return;
     }
     widget.onCoinSelected(coin);
-    Navigator.pop(context);
+    Navigator.pop(context, widget.pickOnly ? coin : null);
   }
 
   @override
@@ -1949,7 +1954,7 @@ class _WatchlistCoinSearchScreenState extends State<WatchlistCoinSearchScreen> {
       backgroundColor: const Color(0xFF0F0F0F),
       appBar: AppBar(
         backgroundColor: const Color(0xFF0F0F0F),
-        title: const Text('Add Symbol'),
+        title: Text(widget.title),
         leading: IconButton(
           icon: const Icon(Icons.close),
           onPressed: () => Navigator.pop(context),
@@ -2023,7 +2028,7 @@ class _WatchlistCoinSearchScreenState extends State<WatchlistCoinSearchScreen> {
                       color: inList ? Colors.grey[600] : const Color(0xFF00BFFF),
                       fontWeight: FontWeight.w600,
                     ),
-                    onPressed: inList ? null : () => _selectCoin(symbol),
+                    onPressed: (!widget.pickOnly && inList) ? null : () => _selectCoin(symbol),
                   );
                 },
               ),
@@ -2105,7 +2110,7 @@ class _WatchlistCoinSearchScreenState extends State<WatchlistCoinSearchScreen> {
                             trailing: inList
                                 ? Icon(Icons.check_circle, color: Colors.grey[600], size: 22)
                                 : const Icon(Icons.add, color: Color(0xFF00BFFF)),
-                            onTap: inList ? null : () => _selectCoin(symbol),
+                            onTap: (!widget.pickOnly && inList) ? null : () => _selectCoin(symbol),
                           ),
                         ),
                       );
@@ -2116,6 +2121,24 @@ class _WatchlistCoinSearchScreenState extends State<WatchlistCoinSearchScreen> {
       ),
     );
   }
+}
+
+/// Full symbol search modal — same UI as watchlist Add Symbol; returns chosen ticker.
+Future<String?> showCoinSymbolSearchModal(BuildContext context, {String? currentSymbol}) {
+  final normalized = currentSymbol != null && currentSymbol.trim().isNotEmpty
+      ? (CoinAccessPolicy.normalizeCoinSymbol(currentSymbol) ?? currentSymbol.trim().toUpperCase())
+      : null;
+  return Navigator.push<String>(
+    context,
+    _premiumPageRoute(
+      (_) => WatchlistCoinSearchScreen(
+        existingWatchlist: normalized != null ? [normalized] : const [],
+        pickOnly: true,
+        title: 'Select Symbol',
+        onCoinSelected: (_) {},
+      ),
+    ),
+  );
 }
 
 Future<void> openAiChat(BuildContext context) async {
@@ -2793,6 +2816,7 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   // Hive — Recent Analyses / trade setup history survives app restarts.
   await AnalysisHistoryStore.init();
+  await DailyAnalysisStore.init();
   await NotificationService.instance.initialize();
   pingBackendHealth();
   runApp(const OnChainOracleAI());
@@ -2868,20 +2892,44 @@ class _MainScreenState extends State<MainScreen> {
     OracleCitadelStore.load();
     UserProfileStore.load();
     NotificationService.instance.registerDailyAnalysesNavigator(_openDailyAnalysesFromNotification);
+    NotificationService.instance.onDailyAnalysisPayload = _ingestDailyAnalysisFromPush;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       NotificationService.instance.dispatchPendingDailyAnalysesNavigation();
+      _refreshDailyAnalysesForHome();
     });
   }
 
   @override
   void dispose() {
     NotificationService.instance.registerDailyAnalysesNavigator(null);
+    NotificationService.instance.onDailyAnalysisPayload = null;
     super.dispose();
+  }
+
+  Future<void> _ingestDailyAnalysisFromPush(Map<String, dynamic> data) async {
+    await DailyAnalysisStore.ingestNotificationPayload(data);
+    await _applyDailyAnalysesToHistory();
+  }
+
+  Future<void> _refreshDailyAnalysesForHome() async {
+    await DailyAnalysisStore.fetchAndPersistFromBackend(kBackendBaseUrl);
+    await _applyDailyAnalysesToHistory();
+  }
+
+  Future<void> _applyDailyAnalysesToHistory() async {
+    final merged = DailyAnalysisStore.mergeIntoHistory(history);
+    if (!mounted) return;
+    setState(() => history
+      ..clear()
+      ..addAll(merged));
+    await AnalysisHistoryStore.saveHistory(history);
+    _homeKey.currentState?.reloadDailyAnalysesFromParent();
   }
 
   /// Push notification → Home tab → Daily Analyses section.
   void _openDailyAnalysesFromNotification() {
     if (!mounted) return;
+    unawaited(_refreshDailyAnalysesForHome());
     setState(() => _selectedIndex = _tabHome);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _homeKey.currentState?.scrollToDailyAnalysesSection();
@@ -2934,9 +2982,17 @@ class _MainScreenState extends State<MainScreen> {
     _migrateAndPruneDailyAnalyses();
     _repairTradeHistoryLinks();
     await _refreshOpenTrades();
+    await DailyAnalysisStore.init();
+    final merged = DailyAnalysisStore.mergeIntoHistory(history);
+    if (mounted) {
+      history
+        ..clear()
+        ..addAll(merged);
+    }
     if (mounted) {
       await AnalysisHistoryStore.saveHistory(history);
       await AnalysisHistoryStore.saveTrades(trades);
+      _homeKey.currentState?.reloadDailyAnalysesFromParent();
     }
   }
 
@@ -2994,6 +3050,12 @@ class _MainScreenState extends State<MainScreen> {
   void addToHistory(String coin, String report) {
     final now = DateTime.now();
     final dayKey = _analysisDayKey(now);
+    unawaited(DailyAnalysisStore.upsert(
+      coin: coin,
+      report: report,
+      ingestSource: 'quick_analyze',
+      at: now,
+    ));
     setState(() {
       // New daily analyses replace yesterday's Quick Analyze rows only.
       _pruneAnalysisHistoryBeforeDay(dayKey);
@@ -3007,6 +3069,7 @@ class _MainScreenState extends State<MainScreen> {
       });
     });
     _persistHistory();
+    _homeKey.currentState?.reloadDailyAnalysesFromParent();
   }
 
   void addTradeSetupResult(Map<String, dynamic> payload) {
@@ -3053,6 +3116,9 @@ class _MainScreenState extends State<MainScreen> {
       final removed = history.where((item) => _historyIdsMatch(item['id'], id)).toList();
       history.removeWhere((item) => _historyIdsMatch(item['id'], id));
       for (final item in removed) {
+        if (item['source'] == 'analysis') {
+          unawaited(DailyAnalysisStore.removeCoin(item['coin']?.toString() ?? ''));
+        }
         if (item['source'] == 'trade_setup' && item['tradeId'] != null) {
           trades.removeWhere((t) => _historyIdsMatch(t['id'], item['tradeId']));
         }
@@ -3060,6 +3126,7 @@ class _MainScreenState extends State<MainScreen> {
     });
     _persistHistory();
     _persistTrades();
+    _homeKey.currentState?.reloadDailyAnalysesFromParent();
   }
 
   /// Trade Performance trash — removes trade and any linked history row.
@@ -3076,10 +3143,12 @@ class _MainScreenState extends State<MainScreen> {
 
   /// Clears only Quick Analyze rows — trade setups stay for Trade Performance.
   void clearDailyAnalyses() {
+    unawaited(DailyAnalysisStore.clearToday());
     setState(() {
       history.removeWhere((item) => item['source'] == 'analysis');
     });
     _persistHistory();
+    _homeKey.currentState?.reloadDailyAnalysesFromParent();
   }
 
   int get _winCount => trades.where((t) => t["status"] == "Win").length;
@@ -3253,6 +3322,7 @@ class _MainScreenState extends State<MainScreen> {
             resolveTradeHistory: _resolveHistoryForTrade,
             repairTradeHistoryLinks: _repairTradeHistoryLinks,
             onClearDailyAnalyses: clearDailyAnalyses,
+            onRefreshDailyAnalyses: _refreshDailyAnalysesForHome,
           ),
           QuickAnalyzeScreen(addToHistory: addToHistory),
           TradeSetupScreen(
@@ -4214,6 +4284,7 @@ class HomeScreen extends StatefulWidget {
   final Map<String, dynamic>? Function(Map<String, dynamic> trade) resolveTradeHistory;
   final VoidCallback repairTradeHistoryLinks;
   final VoidCallback onClearDailyAnalyses;
+  final Future<void> Function() onRefreshDailyAnalyses;
 
   const HomeScreen({
     super.key,
@@ -4230,6 +4301,7 @@ class HomeScreen extends StatefulWidget {
     required this.resolveTradeHistory,
     required this.repairTradeHistoryLinks,
     required this.onClearDailyAnalyses,
+    required this.onRefreshDailyAnalyses,
   });
 
   @override
@@ -4238,6 +4310,7 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   bool _chatFabHidden = false;
+  List<Map<String, dynamic>> _dailyAnalysisItems = [];
 
   final GlobalKey<_DailyOracleBiasBlockState> _dailyBiasKey = GlobalKey<_DailyOracleBiasBlockState>();
   final GlobalKey<_HomeWatchlistSectionState> _watchlistKey = GlobalKey<_HomeWatchlistSectionState>();
@@ -4246,9 +4319,15 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Push notifications scroll target — Daily Analysis section on Home.
   final GlobalKey _dailyAnalysesSectionKey = GlobalKey();
 
-  /// Quick Analyze rows only (trade setups live on Trade Performance).
-  List<Map<String, dynamic>> get _dailyAnalysisItems =>
-      widget.history.where((item) => item['source'] == 'analysis').toList();
+  /// Reload today's BTC / ETH / SOL cards from local store (after push, pull-refresh, Quick Analyze).
+  void reloadDailyAnalysesFromParent() {
+    if (!mounted) return;
+    _reloadDailyAnalysisItems();
+  }
+
+  void _reloadDailyAnalysisItems() {
+    setState(() => _dailyAnalysisItems = DailyAnalysisStore.loadTodayOrdered());
+  }
 
   /// Called from MainScreen when user opens a daily-analysis notification.
   void scrollToDailyAnalysesSection() {
@@ -4265,12 +4344,21 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    _reloadDailyAnalysisItems();
     _loadChatFabPreference();
   }
 
-  /// Pull-to-refresh — bias, watchlist quotes, and news (no manual refresh buttons on bias).
+  @override
+  void didUpdateWidget(covariant HomeScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!listEquals(oldWidget.history, widget.history)) {
+      _reloadDailyAnalysisItems();
+    }
+  }
+
+  /// Pull-to-refresh — bias, watchlist, news, and persisted daily analyses.
   Future<void> _refreshHome() async {
-    final tasks = <Future<void>>[];
+    final tasks = <Future<void>>[widget.onRefreshDailyAnalyses()];
     final bias = _dailyBiasKey.currentState;
     if (bias != null) tasks.add(bias.reload());
     final watchlist = _watchlistKey.currentState;
@@ -4278,6 +4366,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final news = _homeNewsKey.currentState;
     if (news != null) tasks.add(news.refreshFromPull());
     await Future.wait(tasks);
+    if (mounted) _reloadDailyAnalysisItems();
   }
 
   Future<void> _loadChatFabPreference() async {
@@ -5632,6 +5721,7 @@ class _AccountScreenState extends State<AccountScreen> {
           OracleOrbHeroCard(
             displayName: UserProfileStore.displayName,
             subtitle: UserProfileStore.email,
+            profileImagePath: UserProfileStore.avatarPath,
           ),
           const SizedBox(height: _AppSpacing.section),
           const _SectionHeader(title: 'Profile Details'),
@@ -6400,7 +6490,22 @@ class AboutScreen extends StatelessWidget {
                       borderRadius: BorderRadius.circular(20),
                       border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.3)),
                     ),
-                    child: const Icon(Icons.auto_graph, size: 42, color: Color(0xFF00BFFF)),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(20),
+                      child: Image.asset(
+                        kAppLogoAsset,
+                        width: 80,
+                        height: 80,
+                        fit: BoxFit.cover,
+                        filterQuality: FilterQuality.high,
+                        errorBuilder: (_, __, ___) => Image.asset(
+                          'assets/images/app_icon.png',
+                          width: 80,
+                          height: 80,
+                          fit: BoxFit.cover,
+                        ),
+                      ),
+                    ),
                   ),
                   const SizedBox(height: 16),
                   const Text(

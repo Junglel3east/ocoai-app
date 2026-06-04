@@ -26,6 +26,7 @@ class _TradeSetupScreenState extends State<TradeSetupScreen> {
   final TextEditingController _coinController = TextEditingController();
   String selectedCoin = "BTC";
   bool useCustomCoin = false;
+  bool _useFallbackCoinDropdown = false;
   String selectedTimeframe = "1h";
   String selectedDirection = "Smart Direction";
 
@@ -40,6 +41,65 @@ class _TradeSetupScreenState extends State<TradeSetupScreen> {
   void dispose() {
     _coinController.dispose();
     super.dispose();
+  }
+
+  Future<void> _openCoinSymbolSearch() async {
+    try {
+      final picked = await showCoinSymbolSearchModal(
+        context,
+        currentSymbol: useCustomCoin ? _coinController.text : selectedCoin,
+      );
+      if (!mounted || picked == null) return;
+      setState(() {
+        useCustomCoin = false;
+        selectedCoin = picked;
+        _coinController.text = picked;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _useFallbackCoinDropdown = true);
+    }
+  }
+
+  Widget _buildCoinSymbolFallback() {
+    return Column(
+      children: [
+        DropdownButton<String>(
+          value: useCustomCoin ? "Custom" : selectedCoin,
+          isExpanded: true,
+          items: const [
+            DropdownMenuItem(value: "BTC", child: Text("BTC")),
+            DropdownMenuItem(value: "ETH", child: Text("ETH")),
+            DropdownMenuItem(value: "SOL", child: Text("SOL")),
+            DropdownMenuItem(value: "XRP", child: Text("XRP")),
+            DropdownMenuItem(value: "BNB", child: Text("BNB")),
+            DropdownMenuItem(value: "Custom", child: Text("Custom")),
+          ],
+          onChanged: (v) {
+            if (v == null) return;
+            setState(() {
+              if (v == "Custom") {
+                useCustomCoin = true;
+              } else {
+                useCustomCoin = false;
+                selectedCoin = v;
+                _coinController.text = v;
+              }
+            });
+          },
+        ),
+        if (useCustomCoin) ...[
+          const SizedBox(height: 12),
+          TextField(
+            controller: _coinController,
+            textCapitalization: TextCapitalization.characters,
+            decoration: const InputDecoration(
+              labelText: 'Custom Coin Symbol (e.g. HYPE, AVAX)',
+            ),
+          ),
+        ],
+      ],
+    );
   }
 
   Future<void> generateSetup() async {
@@ -108,44 +168,18 @@ class _TradeSetupScreenState extends State<TradeSetupScreen> {
                         const SizedBox(height: _AppSpacing.section),
                         _formSection(
                           label: 'Coin Symbol',
-                          child: Column(
-                            children: [
-                              DropdownButton<String>(
-                                value: useCustomCoin ? "Custom" : selectedCoin,
-                                isExpanded: true,
-                                items: const [
-                                  DropdownMenuItem(value: "BTC", child: Text("BTC")),
-                                  DropdownMenuItem(value: "ETH", child: Text("ETH")),
-                                  DropdownMenuItem(value: "SOL", child: Text("SOL")),
-                                  DropdownMenuItem(value: "XRP", child: Text("XRP")),
-                                  DropdownMenuItem(value: "BNB", child: Text("BNB")),
-                                  DropdownMenuItem(value: "Custom", child: Text("Custom")),
-                                ],
-                                onChanged: (v) {
-                                  if (v == null) return;
-                                  setState(() {
-                                    if (v == "Custom") {
-                                      useCustomCoin = true;
-                                    } else {
-                                      useCustomCoin = false;
-                                      selectedCoin = v;
-                                      _coinController.text = v;
-                                    }
-                                  });
-                                },
-                              ),
-                              if (useCustomCoin) ...[
-                                const SizedBox(height: 12),
-                                TextField(
+                          child: _useFallbackCoinDropdown
+                              ? _buildCoinSymbolFallback()
+                              : TextField(
+                                  readOnly: true,
                                   controller: _coinController,
+                                  onTap: _openCoinSymbolSearch,
                                   textCapitalization: TextCapitalization.characters,
                                   decoration: const InputDecoration(
-                                    labelText: 'Custom Coin Symbol (e.g. HYPE, AVAX)',
+                                    hintText: 'Tap to search symbols',
+                                    suffixIcon: Icon(Icons.search, color: Color(0xFF00BFFF)),
                                   ),
                                 ),
-                              ],
-                            ],
-                          ),
                         ),
                         const SizedBox(height: _AppSpacing.item),
                         _formSection(

@@ -17,34 +17,39 @@ const String _kCitadelExchangeLinkedPref = 'citadel_exchange_linked';
 /// BloFin exchange id sent when linking keys (live vs demo resolved on backend).
 const String _kCitadelBlofinExchangeId = 'blofin';
 
-// ─── Legal & exchange guidance copy (exact user-provided text) ───────────────
+// ─── Legal & exchange guidance copy ─────────────────────────────────────────
 
-const String kCitadelSecurityDisclaimer =
-    'Your API keys are 100% yours. We never see or store your Secret. '
-    'Oracle Citadel is completely non-custodial. You control all trading permissions.\n\n'
-    '• Never enable Withdrawals or Fund Transfers\n'
-    '• Enable IP restrictions + Trade Only permissions\n'
-    '• You are solely responsible for all trades and losses\n'
-    '• This is NOT financial advice. Trading involves substantial risk of loss. Always DYOR.';
+const String kCitadelSetupTagline = 'Live trade execution on your exchange';
+const String kCitadelLiveExecutionNotice =
+    'All trades will be executed as LIVE trades on the selected exchange.';
 
-const List<({String title, String reason})> _kCitadelRecommendedExchanges = [
-  (title: 'Coinbase Advanced Trade', reason: 'Strong US regulation and reliability'),
-  (title: 'Kraken', reason: 'Excellent security and API'),
-  (title: 'Gemini', reason: 'Regulatory-first platform'),
-  (title: 'Crypto.com', reason: 'Good compliance and features'),
-  (title: 'Binance.US (in supported states)', reason: 'US-compliant where available'),
-];
+const String kCitadelLegalDisclaimer =
+    'Oracle Citadel is a non-custodial LIVE execution tool. Unless you explicitly '
+    'enable Demo/Testnet Mode, every order sent through Citadel is a real market order '
+    'on your connected exchange using real funds.\n\n'
+    'On-Chain Oracle does not hold your funds, does not provide investment advice, '
+    'and is not a broker-dealer or financial institution.\n\n'
+    'You are solely responsible for API key security, exchange selection, and every '
+    'live trade placed through your account. Past performance and AI-generated analysis '
+    'do not guarantee future results. Cryptocurrency trading involves substantial risk '
+    'of loss, including total loss of capital.\n\n'
+    'By connecting an exchange you confirm that you understand these risks, that live '
+    'execution is the default, that you comply with applicable laws in your jurisdiction, '
+    'and that you will never enable withdrawal or transfer permissions on API keys used '
+    'with this app.';
 
-const String _kCitadelNotRecommendedSummary =
-    'Binance.com (international), Bybit, OKX, KuCoin, MEXC, Bitget, BloFin, Phemex';
+const String _kCitadelPrimaryRecommendedTitle = 'Kraken (Recommended)';
+const String _kCitadelPrimaryRecommendedReason =
+    'US & EU regulated • Up to 50x leverage • Strongest compliance & security';
 
-const String _kCitadelNotRecommendedReason =
-    'Offshore platforms with stricter restrictions in many countries.';
+const String _kCitadelNotRecommendedTitle = 'BloFin';
+const String _kCitadelNotRecommendedWarning =
+    'Strong leverage (up to 150x) for live high-risk trading. Demo mode available for testing only.';
 
 // ─── Premium palette (Citadel Setup only) ───────────────────────────────────
 
 const Color _kCitadelOrange = Color(0xFFFF9800);
-const Color _kCitadelOrangeMuted = Color(0xFF3D2E1A);
+const Color _kCitadelOrangeMuted = Color(0xFF3D2A18);
 const Color _kCitadelGreen = Color(0xFF43A047);
 const Color _kCitadelGreenMuted = Color(0xFF1B3320);
 const Color _kCitadelCard = Color(0xFF1E1E1E);
@@ -147,56 +152,27 @@ void _showCitadelSetupGuideSheet(BuildContext context) {
                   style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
                 ),
                 const SizedBox(height: 14),
-                const _CitadelDisclaimerCard(compact: true),
+                const _CitadelLegalDisclaimerCard(compact: true),
                 const SizedBox(height: 20),
                 _CitadelGuideSection(
-                  exchange: 'Binance',
+                  exchange: 'Kraken (Recommended — LIVE default)',
                   steps: const [
-                    'Log in → Profile → API Management → Create API.',
+                    'Log in → Settings → API → Add key.',
                     'Label the key (e.g. "Oracle Citadel") and complete 2FA.',
-                    'Enable only "Enable Spot & Margin Trading" — never Withdrawals.',
-                    'Optional: restrict to trusted IPs under "Restrict access to trusted IPs".',
-                    'Copy API Key and Secret once; Secret is shown only once.',
+                    'Enable Query Funds and Create & Modify Orders only — never Withdraw, Deposit, or Transfer.',
+                    'Set IP restriction and nonce window when offered.',
+                    'Copy API Key and Private Key (Secret) once; Secret is shown only once.',
+                    'Paste into Citadel Setup with Demo Mode OFF — trades execute LIVE on Kraken.',
                   ],
                 ),
                 _CitadelGuideSection(
-                  exchange: 'Bybit',
+                  exchange: 'BloFin (LIVE or demo testing)',
                   steps: const [
-                    'Account & Security → API → Create New Key.',
-                    'Choose "System-generated API Keys" and set a clear note.',
-                    'Permissions: Read-Write with Trade only; disable Withdraw and Transfer.',
-                    'Bind IP whitelist if your network has a static IP.',
-                    'Save Key and Secret securely; paste into Citadel Setup.',
-                  ],
-                ),
-                _CitadelGuideSection(
-                  exchange: 'OKX',
-                  steps: const [
-                    'Profile → API → Create V5 API key.',
-                    'Passphrase is required — store it with your Secret.',
-                    'Permissions: Trade only; do not enable Withdrawal.',
-                    'Add IP whitelist under API key settings when possible.',
-                    'Confirm via email/2FA, then copy Key and Secret.',
-                  ],
-                ),
-                _CitadelGuideSection(
-                  exchange: 'Coinbase Advanced',
-                  steps: const [
-                    'Settings → API → New API Key.',
-                    'Select portfolio and permissions: View + Trade only.',
-                    'Do not grant Transfer or Withdraw permissions.',
-                    'Use API key restrictions (IP allowlist) if available.',
-                    'Download or copy credentials immediately after creation.',
-                  ],
-                ),
-                _CitadelGuideSection(
-                  exchange: 'Kraken',
-                  steps: const [
-                    'Settings → API → Add key.',
-                    'Enable Query Funds and Create & Modify Orders only.',
-                    'Never enable Withdraw, Deposit, or Transfer permissions.',
-                    'Set nonce window and IP restriction for added safety.',
-                    'Generate and copy Key + Private Key (Secret).',
+                    'For LIVE: use BloFin live API keys with Demo Mode OFF (default).',
+                    'For testing only: enable Use Demo/Testnet Mode and use BloFin Demo API keys.',
+                    'API Management → Create key → Trade permissions only; disable Withdrawals.',
+                    'Whitelist Railway/server IP if prompted (see BloFin API docs).',
+                    'Copy API Key and Secret immediately; paste into Oracle Citadel Setup.',
                   ],
                 ),
                 const SizedBox(height: 8),
@@ -213,11 +189,11 @@ void _showCitadelSetupGuideSheet(BuildContext context) {
   );
 }
 
-/// Orange-accent legal disclaimer card (top of setup screen).
-class _CitadelDisclaimerCard extends StatelessWidget {
+/// Prominent legal disclaimer — placed at the bottom of the setup screen.
+class _CitadelLegalDisclaimerCard extends StatelessWidget {
   final bool compact;
 
-  const _CitadelDisclaimerCard({this.compact = false});
+  const _CitadelLegalDisclaimerCard({this.compact = false});
 
   @override
   Widget build(BuildContext context) {
@@ -227,11 +203,11 @@ class _CitadelDisclaimerCard extends StatelessWidget {
       decoration: BoxDecoration(
         color: _kCitadelOrangeMuted,
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: _kCitadelOrange.withValues(alpha: 0.45)),
+        border: Border.all(color: _kCitadelOrange.withValues(alpha: 0.5)),
         boxShadow: [
           BoxShadow(
-            color: _kCitadelOrange.withValues(alpha: 0.08),
-            blurRadius: 12,
+            color: _kCitadelOrange.withValues(alpha: 0.1),
+            blurRadius: 14,
             offset: const Offset(0, 4),
           ),
         ],
@@ -245,7 +221,7 @@ class _CitadelDisclaimerCard extends StatelessWidget {
               Container(
                 padding: const EdgeInsets.all(8),
                 decoration: BoxDecoration(
-                  color: _kCitadelOrange.withValues(alpha: 0.18),
+                  color: _kCitadelOrange.withValues(alpha: 0.2),
                   borderRadius: BorderRadius.circular(10),
                 ),
                 child: Icon(
@@ -260,20 +236,20 @@ class _CitadelDisclaimerCard extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'Important — Read Before Connecting',
+                      compact ? 'Legal Notice' : 'Legal Disclaimer & Risk Disclosure',
                       style: TextStyle(
-                        fontSize: compact ? 13 : 14,
-                        fontWeight: FontWeight.w700,
+                        fontSize: compact ? 13 : 15,
+                        fontWeight: FontWeight.w800,
                         color: Colors.orange[100],
-                        letterSpacing: 0.2,
+                        letterSpacing: 0.15,
                       ),
                     ),
-                    const SizedBox(height: 8),
+                    const SizedBox(height: 10),
                     Text(
-                      kCitadelSecurityDisclaimer,
+                      kCitadelLegalDisclaimer,
                       style: TextStyle(
-                        fontSize: compact ? 12 : 13,
-                        height: 1.55,
+                        fontSize: compact ? 11.5 : 12.5,
+                        height: 1.6,
                         color: Colors.grey[300],
                       ),
                     ),
@@ -420,10 +396,10 @@ class _CitadelExchangeGuidanceSection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final accent = recommended ? const Color(0xFF00BFFF) : Colors.redAccent.shade200;
-    final bg = recommended
-        ? const Color(0xFF0D2230)
-        : const Color(0xFF2A1A1A);
+    final accent = recommended ? const Color(0xFF00BFFF) : const Color(0xFFE57373);
+    final headerBg = recommended
+        ? const Color(0xFF0D2230).withValues(alpha: 0.6)
+        : const Color(0xFF2A1818).withValues(alpha: 0.6);
 
     return Theme(
       data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
@@ -432,19 +408,21 @@ class _CitadelExchangeGuidanceSection extends StatelessWidget {
         decoration: BoxDecoration(
           color: _kCitadelCard,
           borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: accent.withValues(alpha: 0.25)),
+          border: Border.all(color: accent.withValues(alpha: 0.3)),
         ),
         child: ExpansionTile(
-          tilePadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+          tilePadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
           childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          backgroundColor: headerBg,
+          collapsedBackgroundColor: Colors.transparent,
           iconColor: accent,
           collapsedIconColor: Colors.grey[500],
           title: Row(
             children: [
               Icon(
-                recommended ? Icons.verified_outlined : Icons.warning_amber_rounded,
+                recommended ? Icons.verified_user_outlined : Icons.report_gmailerrorred_outlined,
                 color: accent,
-                size: 20,
+                size: 22,
               ),
               const SizedBox(width: 10),
               Expanded(
@@ -454,78 +432,275 @@ class _CitadelExchangeGuidanceSection extends StatelessWidget {
                       : 'Not Recommended (Higher Regulatory Risk)',
                   style: const TextStyle(
                     fontSize: 14,
-                    fontWeight: FontWeight.w600,
+                    fontWeight: FontWeight.w700,
                     height: 1.3,
+                    color: Colors.white,
                   ),
                 ),
               ),
             ],
           ),
+          subtitle: Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              recommended
+                  ? 'US and EU-aligned venues with stronger oversight'
+                  : 'Offshore platforms — use at your own regulatory risk',
+              style: TextStyle(fontSize: 11.5, color: Colors.grey[500], height: 1.3),
+            ),
+          ),
           children: [
-            if (recommended)
-              ..._kCitadelRecommendedExchanges.map((item) {
-                return Padding(
-                  padding: const EdgeInsets.only(bottom: 10),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('• ', style: TextStyle(color: accent, fontSize: 14, height: 1.4)),
-                      Expanded(
-                        child: RichText(
-                          text: TextSpan(
-                            style: TextStyle(fontSize: 13, height: 1.45, color: Colors.grey[300]),
-                            children: [
-                              TextSpan(
-                                text: '${item.title} — ',
-                                style: const TextStyle(fontWeight: FontWeight.w600, color: Colors.white),
-                              ),
-                              TextSpan(text: item.reason),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                );
-              })
-            else
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  color: bg,
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: Column(
+            if (recommended) ...[
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      '• $_kCitadelNotRecommendedSummary',
-                      style: TextStyle(fontSize: 13, height: 1.5, color: Colors.grey[300]),
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Icon(Icons.verified_outlined, color: accent, size: 16),
                     ),
-                    const SizedBox(height: 10),
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('→ ', style: TextStyle(color: accent, fontSize: 14)),
-                        Expanded(
-                          child: Text(
-                            _kCitadelNotRecommendedReason,
-                            style: TextStyle(
-                              fontSize: 13,
-                              height: 1.45,
-                              color: Colors.redAccent.shade100,
-                              fontStyle: FontStyle.italic,
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: RichText(
+                        text: TextSpan(
+                          style: TextStyle(fontSize: 13, height: 1.5, color: Colors.grey[300]),
+                          children: [
+                            TextSpan(
+                              text: '$_kCitadelPrimaryRecommendedTitle\n',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w800,
+                                color: Colors.white,
+                                fontSize: 13.5,
+                              ),
                             ),
-                          ),
+                            TextSpan(
+                              text: _kCitadelPrimaryRecommendedReason,
+                              style: TextStyle(color: Colors.grey[400]),
+                            ),
+                          ],
                         ),
-                      ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ] else
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Icon(Icons.warning_amber_rounded, color: accent, size: 16),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: RichText(
+                        text: TextSpan(
+                          style: TextStyle(fontSize: 13, height: 1.5, color: Colors.grey[300]),
+                          children: [
+                            TextSpan(
+                              text: '$_kCitadelNotRecommendedTitle\n',
+                              style: TextStyle(
+                                fontWeight: FontWeight.w700,
+                                color: Colors.red[100],
+                                fontSize: 13.5,
+                              ),
+                            ),
+                            TextSpan(
+                              text: _kCitadelNotRecommendedWarning,
+                              style: TextStyle(
+                                color: Colors.grey[500],
+                                fontStyle: FontStyle.italic,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
                     ),
                   ],
                 ),
               ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// Expandable API key setup guide — matches exchange guidance card style.
+class _CitadelApiKeysHowToSection extends StatelessWidget {
+  const _CitadelApiKeysHowToSection();
+
+  static const _accent = Color(0xFF00BFFF);
+
+  @override
+  Widget build(BuildContext context) {
+    return Theme(
+      data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 10),
+        decoration: BoxDecoration(
+          color: _kCitadelCard,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: _accent.withValues(alpha: 0.3)),
+        ),
+        child: ExpansionTile(
+          tilePadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+          childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          backgroundColor: const Color(0xFF0D2230).withValues(alpha: 0.6),
+          collapsedBackgroundColor: Colors.transparent,
+          iconColor: _accent,
+          collapsedIconColor: Colors.grey[500],
+          title: const Row(
+            children: [
+              Icon(Icons.vpn_key_outlined, color: _accent, size: 22),
+              SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  'How to Connect API Keys',
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                    height: 1.3,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          subtitle: Padding(
+            padding: EdgeInsets.only(top: 4),
+            child: Text(
+              'Step-by-step setup and security checklist',
+              style: TextStyle(fontSize: 11.5, color: Colors.grey, height: 1.3),
+            ),
+          ),
+          children: const [
+            _CitadelHowToBlock(
+              title: 'Before you start (LIVE default)',
+              steps: [
+                'Citadel executes LIVE market orders on your exchange unless Demo Mode is enabled.',
+                'Create a dedicated API key on Kraken (recommended) or BloFin — never enable withdrawals.',
+                'Label the key "Oracle Citadel" and complete all exchange security prompts.',
+                'Copy Key and Secret once, then paste below and tap Save & Connect.',
+              ],
+            ),
+            _CitadelHowToBlock(
+              title: 'Kraken (Recommended — LIVE trading)',
+              steps: [
+                'Settings → API → Add key → name it "Oracle Citadel".',
+                'Permissions: Query Funds + Create & Modify Orders only.',
+                'Disable Withdraw, Deposit, and Transfer permissions.',
+                'Enable IP restriction if your connection uses a fixed IP.',
+                'Keep Demo Mode OFF — all Citadel orders execute as LIVE trades on Kraken.',
+              ],
+            ),
+            _CitadelHowToBlock(
+              title: 'BloFin (LIVE trading or demo testing)',
+              steps: [
+                'LIVE (default): use BloFin live API keys with Demo Mode OFF.',
+                'Testing only: enable Demo Mode and use BloFin Demo API keys (simulated funds).',
+                'API Management → Create key → Trade only; disable Withdrawals and Transfers.',
+                'Whitelist outbound IP if required (Railway server IP for production backend).',
+                'Understand up to 150x leverage — live orders use real funds when Demo Mode is off.',
+              ],
+            ),
+            _CitadelHowToBlock(
+              title: 'Security best practices',
+              bullets: [
+                'Default is LIVE execution — verify Demo Mode is off before connecting production keys.',
+                'Use separate keys for Kraken vs BloFin and for live vs demo testing.',
+                'Bind IP whitelist on the exchange whenever static IPs are available.',
+                'Oracle Citadel is non-custodial — trading permissions only, no withdrawal access.',
+              ],
+            ),
+            _CitadelHowToBlock(
+              title: 'Demo vs live mode',
+              isWarning: true,
+              bullets: [
+                'Live trading is the default: real MARKET orders on your connected exchange.',
+                'Demo Mode is for internal testing only (BloFin Demo with simulated funds).',
+                'Never enable Demo Mode unless you intend to test — all other connections are LIVE.',
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _CitadelHowToBlock extends StatelessWidget {
+  final String title;
+  final List<String> steps;
+  final List<String> bullets;
+  final bool isWarning;
+
+  const _CitadelHowToBlock({
+    required this.title,
+    this.steps = const [],
+    this.bullets = const [],
+    this.isWarning = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = isWarning ? const Color(0xFFFFB74D) : const Color(0xFF00BFFF);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: isWarning ? Colors.orange[100] : Colors.white,
+            ),
+          ),
+          const SizedBox(height: 8),
+          ...steps.asMap().entries.map((e) {
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '${e.key + 1}. ',
+                    style: TextStyle(fontSize: 12.5, color: Colors.grey[500], height: 1.45),
+                  ),
+                  Expanded(
+                    child: Text(
+                      e.value,
+                      style: TextStyle(fontSize: 12.5, height: 1.45, color: Colors.grey[400]),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }),
+          ...bullets.map((b) {
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('• ', style: TextStyle(fontSize: 12.5, color: accent, height: 1.45)),
+                  Expanded(
+                    child: Text(
+                      b,
+                      style: TextStyle(fontSize: 12.5, height: 1.45, color: Colors.grey[400]),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }),
+        ],
       ),
     );
   }
@@ -794,18 +969,18 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                       child: const Icon(Icons.shield_outlined, color: Color(0xFF00BFFF), size: 24),
                     ),
                     const SizedBox(width: 14),
-                    const Expanded(
+                    Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(
+                          const Text(
                             'Oracle Citadel',
                             style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800, letterSpacing: -0.3),
                           ),
-                          SizedBox(height: 2),
+                          const SizedBox(height: 2),
                           Text(
-                            'Secure automated execution',
-                            style: TextStyle(fontSize: 13, color: Colors.grey),
+                            kCitadelSetupTagline,
+                            style: TextStyle(fontSize: 13, color: Colors.grey[400], height: 1.35),
                           ),
                         ],
                       ),
@@ -832,6 +1007,16 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
+                      Text(
+                        kCitadelLiveExecutionNotice,
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.orange[100],
+                          height: 1.45,
+                        ),
+                      ),
+                      const SizedBox(height: 14),
                       if (showConnected) ...[
                         _CitadelConnectionStatusCard(
                           exchangeLabel: _displayExchangeLabel,
@@ -840,11 +1025,6 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                         ),
                         const SizedBox(height: 18),
                       ],
-                      const _CitadelDisclaimerCard(),
-                      const SizedBox(height: 16),
-                      const _CitadelExchangeGuidanceSection(recommended: true),
-                      const _CitadelExchangeGuidanceSection(recommended: false),
-                      const SizedBox(height: 20),
                       Text(
                         'Connection credentials',
                         style: TextStyle(
@@ -897,7 +1077,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                             style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
                           ),
                           subtitle: Text(
-                            'BloFin demo only — fake funds on the testnet API',
+                            'Leave OFF for LIVE trading (default). ON enables BloFin Demo for testing.',
                             style: TextStyle(fontSize: 12, color: Colors.grey[500]),
                           ),
                           value: _useDemoMode,
@@ -908,6 +1088,13 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                                   if (!mounted) return;
                                   setState(() => _useDemoMode = value);
                                 },
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.only(top: 6, left: 2, right: 2),
+                        child: Text(
+                          '(Demo mode available for testing only. Default is Live trading.)',
+                          style: TextStyle(fontSize: 11.5, color: Colors.grey[600], height: 1.35),
                         ),
                       ),
                       if (_useDemoMode) ...[
@@ -926,7 +1113,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                               SizedBox(width: 10),
                               Expanded(
                                 child: Text(
-                                  'Using BloFin Demo with fake funds',
+                                  'Demo active — testnet only, not LIVE trading',
                                   style: TextStyle(
                                     fontSize: 13,
                                     fontWeight: FontWeight.w600,
@@ -946,6 +1133,28 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                           style: TextStyle(fontSize: 12.5, color: Colors.grey[500]),
                         ),
                       ],
+                      const SizedBox(height: 24),
+                      Text(
+                        'Exchange guidance',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.grey[400],
+                          letterSpacing: 0.6,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        '(e.g. USA, Canada, UK, EU countries have stricter regulations)',
+                        style: TextStyle(fontSize: 11.5, color: Colors.grey[500], height: 1.35),
+                      ),
+                      const SizedBox(height: 12),
+                      const _CitadelExchangeGuidanceSection(recommended: true),
+                      const _CitadelExchangeGuidanceSection(recommended: false),
+                      const _CitadelApiKeysHowToSection(),
+                      const SizedBox(height: 20),
+                      const _CitadelLegalDisclaimerCard(),
+                      const SizedBox(height: 8),
                     ],
                   ),
                 ),

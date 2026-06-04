@@ -17,6 +17,7 @@ class QuickAnalyzeScreen extends StatefulWidget {
 class _QuickAnalyzeScreenState extends State<QuickAnalyzeScreen> {
   final TextEditingController _controller = TextEditingController(text: "BTC");
   String _coinHint = CoinAccessPolicy.tierCoinHint();
+  bool _useFallbackCoinField = false;
 
   @override
   void initState() {
@@ -30,6 +31,17 @@ class _QuickAnalyzeScreenState extends State<QuickAnalyzeScreen> {
   void dispose() {
     _controller.dispose();
     super.dispose();
+  }
+
+  Future<void> _openCoinSymbolSearch() async {
+    try {
+      final picked = await showCoinSymbolSearchModal(context, currentSymbol: _controller.text);
+      if (!mounted || picked == null) return;
+      setState(() => _controller.text = picked);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _useFallbackCoinField = true);
+    }
   }
 
   Future<void> analyze() async {
@@ -87,15 +99,28 @@ class _QuickAnalyzeScreenState extends State<QuickAnalyzeScreen> {
                         Card(
                           child: Padding(
                             padding: const EdgeInsets.all(_AppSpacing.card),
-                            child: TextField(
-                              controller: _controller,
-                              textCapitalization: TextCapitalization.characters,
-                              decoration: InputDecoration(
-                                labelText: 'Coin Symbol',
-                                hintText: _coinHint,
-                                prefixIcon: const Icon(Icons.currency_bitcoin, color: Color(0xFF00BFFF)),
-                              ),
-                            ),
+                            child: _useFallbackCoinField
+                                ? TextField(
+                                    controller: _controller,
+                                    textCapitalization: TextCapitalization.characters,
+                                    decoration: InputDecoration(
+                                      labelText: 'Coin Symbol',
+                                      hintText: _coinHint,
+                                      prefixIcon: const Icon(Icons.currency_bitcoin, color: Color(0xFF00BFFF)),
+                                    ),
+                                  )
+                                : TextField(
+                                    readOnly: true,
+                                    controller: _controller,
+                                    onTap: _openCoinSymbolSearch,
+                                    textCapitalization: TextCapitalization.characters,
+                                    decoration: const InputDecoration(
+                                      labelText: 'Coin Symbol',
+                                      hintText: 'Tap to search symbols',
+                                      prefixIcon: Icon(Icons.currency_bitcoin, color: Color(0xFF00BFFF)),
+                                      suffixIcon: Icon(Icons.search, color: Color(0xFF00BFFF)),
+                                    ),
+                                  ),
                           ),
                         ),
                         const SizedBox(height: _AppSpacing.section),

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:firebase_core/firebase_core.dart';
@@ -38,6 +39,9 @@ class NotificationService {
 
   /// Set from [MainScreen] — opens Home and scrolls to Daily Analyses.
   VoidCallback? onOpenDailyAnalyses;
+
+  /// Persist daily analysis payload from FCM / local notification tap.
+  Future<void> Function(Map<String, dynamic> data)? onDailyAnalysisPayload;
 
   bool _pendingOpenDailyAnalyses = false;
 
@@ -269,6 +273,12 @@ class NotificationService {
     final typeName = data['type'] ?? data['notification_type'];
 
     if (typeName != null) {
+      if (isDailyAnalysesNotificationType(typeName.toString())) {
+        final ingest = onDailyAnalysisPayload;
+        if (ingest != null) {
+          unawaited(ingest(Map<String, dynamic>.from(data)));
+        }
+      }
       _handleTypedPayload(typeName.toString(), data, notification?.title, notification?.body);
       return;
     }
@@ -312,6 +322,10 @@ class NotificationService {
     if (data == null) return;
     final typeName = (data['type'] ?? data['notification_type'])?.toString();
     if (!isDailyAnalysesNotificationType(typeName)) return;
+    final ingest = onDailyAnalysisPayload;
+    if (ingest != null) {
+      unawaited(ingest(Map<String, dynamic>.from(data)));
+    }
     if (onOpenDailyAnalyses != null) {
       onOpenDailyAnalyses!();
     } else {
