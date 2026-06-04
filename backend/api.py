@@ -110,6 +110,7 @@ BLOFIN_LIVE_API_BASE_URL = os.getenv(
 )
 # BloFin trade placement (Oracle Citadel MARKET orders)
 BLOFIN_TRADE_ORDER_PATH = "/api/v1/trade/order"
+BLOFIN_TRADE_ORDER_TPSL_PATH = "/api/v1/trade/order-tpsl"
 BLOFIN_ORDER_DETAIL_PATH = "/api/v1/trade/order-detail"
 BLOFIN_ACCOUNT_BALANCE_PATH = "/api/v1/account/balance"
 BLOFIN_MARKET_INSTRUMENTS_PATH = "/api/v1/market/instruments"
@@ -2202,6 +2203,125 @@ def _blofin_place_order(
     return result
 
 
+def _blofin_tp_close_side(direction: str) -> str:
+    """Side for reduce-only take-profit legs (closes long/short)."""
+    return "sell" if direction == "long" else "buy"
+
+
+def _blofin_dual_tp_contract_sizes(
+    total_size: str,
+    *,
+    lot_size: float,
+    min_size: float,
+) -> tuple[str, str]:
+    """Split position into TP1 (40%) and TP2 (60%) contract counts, lot-aligned."""
+    try:
+        total = float(total_size)
+    except (TypeError, ValueError):
+        total = float(min_size)
+    lot = lot_size if lot_size > 0 else 0.1
+    min_s = min_size if min_size > 0 else lot
+
+    if total < min_s * 2:
+        half = max(min_s, total / 2.0)
+        tp1 = _blofin_format_contract_size(half, lot)
+        tp2 = _blofin_format_contract_size(max(min_s, total - float(tp1)), lot)
+        return tp1, tp2
+
+    tp1_raw = total * 0.4
+    remaining = max(min_s, total - tp1_raw)
+    tp1_steps = max(1, int(tp1_raw / lot))
+    tp1_val = tp1_steps * lot
+    tp2_val = max(min_s, remaining)
+    tp2_steps = max(1, int(tp2_val / lot))
+    tp2_val = min(remaining, tp2_steps * lot)
+    if tp1_val + tp2_val > total:
+        tp2_val = max(min_s, total - tp1_val)
+    return _blofin_format_contract_size(tp1_val, lot), _blofin_format_contract_size(tp2_val, lot)
+
+
+def _blofin_parse_tpsl_response(
+    response_json: dict[str, Any],
+    *,
+    http_status: int,
+) -> dict[str, Any]:
+    """Parse POST /api/v1/trade/order-tpsl."""
+    top_code = str(response_json.get("code", ""))
+    top_msg = response_json.get("msg")
+    data = response_json.get("data")
+    row = data if isinstance(data, dict) else {}
+    row_code = str(row.get("code", top_code))
+    row_msg = row.get("msg") or top_msg
+    tpsl_id = row.get("tpslId")
+    tpsl_id_str = str(tpsl_id) if tpsl_id else None
+    ok = http_status == 200 and top_code == "0" and row_code == "0" and bool(tpsl_id_str)
+    return {
+        "ok": ok,
+        "http_status": http_status,
+        "code": row_code,
+        "top_code": top_code,
+        "msg": row_msg,
+        "tpsl_id": tpsl_id_str,
+        "response": response_json,
+    }
+
+
+def _blofin_place_tpsl_take_profit(
+    *,
+    base_url: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    coin: str,
+    direction: str,
+    tp_price: float,
+    size: str,
+    client_order_id: Optional[str] = None,
+    request_id: str = "?",
+) -> dict[str, Any]:
+    """Reduce-only take-profit via BloFin order-tpsl (MARKET dual-TP legs)."""
+    inst_id = _blofin_inst_id(coin)
+    body: dict[str, Any] = {
+        "instId": inst_id,
+        "marginMode": BLOFIN_MARGIN_MODE,
+        "positionSide": "net",
+        "side": _blofin_tp_close_side(direction),
+        "tpTriggerPrice": str(tp_price),
+        "tpOrderPrice": "-1",
+        "tpTriggerPriceType": "last",
+        "size": str(size),
+        "reduceOnly": "true",
+    }
+    if client_order_id:
+        body["clientOrderId"] = client_order_id[:32]
+
+    http_status, raw_text, parsed = _blofin_private_request(
+        base_url=base_url,
+        api_key=api_key,
+        api_secret=api_secret,
+        passphrase=passphrase,
+        method="POST",
+        path=BLOFIN_TRADE_ORDER_TPSL_PATH,
+        body=body,
+        request_id=request_id,
+        log_tag="blofin_place_tpsl_tp",
+    )
+
+    if not isinstance(parsed, dict):
+        return {
+            "ok": False,
+            "http_status": http_status,
+            "code": "invalid_json",
+            "msg": "BloFin TP/SL returned non-JSON",
+            "tpsl_id": None,
+            "raw_preview": (raw_text or "")[:2000],
+        }
+
+    result = _blofin_parse_tpsl_response(parsed, http_status=http_status)
+    result["order_params"] = body
+    return result
+
+
 def _resolve_blofin_passphrase(record: dict[str, Any]) -> str:
     """Passphrase for BloFin headers — env or optional per-user field (never logged)."""
     stored = (record.get("exchange_passphrase") or "").strip()
@@ -4228,7 +4348,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             direction=trade.direction,
             order_type="market",
             size=order_size,
-            tp1=trade.tp1,
+            tp1=None,
             sl=trade.stop_loss,
             client_order_id=trade_id[:32],
             request_id=req_id,
@@ -4266,6 +4386,95 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
                 confirm.get("filled_size"),
                 confirm.get("average_price"),
             )
+
+            # Dual TP (40% / 60%) — separate order-tpsl legs after MARKET entry + SL on entry.
+            position_size = (
+                confirm.get("filled_size")
+                or confirm.get("size")
+                or order_size
+            )
+            position_size_str = str(position_size)
+            spec = _blofin_fetch_instrument_spec(
+                base_url=api_base_url,
+                inst_id=inst_id,
+                request_id=req_id,
+            )
+            tp1_size, tp2_size = _blofin_dual_tp_contract_sizes(
+                position_size_str,
+                lot_size=float(spec["lotSize"]),
+                min_size=float(spec["minSize"]),
+            )
+
+            tp1_tpsl_id: Optional[str] = None
+            tp2_tpsl_id: Optional[str] = None
+            tp_warnings: list[str] = []
+
+            tp1_result = _blofin_place_tpsl_take_profit(
+                base_url=api_base_url,
+                api_key=exchange_api_key,
+                api_secret=exchange_secret,
+                passphrase=passphrase,
+                coin=trade.coin,
+                direction=trade.direction,
+                tp_price=trade.tp1,
+                size=tp1_size,
+                client_order_id=f"{trade_id[:28]}m1",
+                request_id=req_id,
+            )
+            tp1_tpsl_id = tp1_result.get("tpsl_id")
+            if tp1_result.get("ok"):
+                logger.info(
+                    "market_tp1_40pct_placed request_id=%s trade_id=%s tpsl_id=%s size=%s trigger=%s",
+                    req_id,
+                    trade_id,
+                    tp1_tpsl_id,
+                    tp1_size,
+                    trade.tp1,
+                )
+            else:
+                logger.warning(
+                    "market_tp1_40pct_failed request_id=%s trade_id=%s code=%s msg=%s size=%s",
+                    req_id,
+                    trade_id,
+                    tp1_result.get("code"),
+                    tp1_result.get("msg"),
+                    tp1_size,
+                )
+                tp_warnings.append(f"TP1 (40%) not placed: {tp1_result.get('msg') or 'unknown'}")
+
+            tp2_result = _blofin_place_tpsl_take_profit(
+                base_url=api_base_url,
+                api_key=exchange_api_key,
+                api_secret=exchange_secret,
+                passphrase=passphrase,
+                coin=trade.coin,
+                direction=trade.direction,
+                tp_price=trade.tp2,
+                size=tp2_size,
+                client_order_id=f"{trade_id[:28]}m2",
+                request_id=req_id,
+            )
+            tp2_tpsl_id = tp2_result.get("tpsl_id")
+            if tp2_result.get("ok"):
+                logger.info(
+                    "market_tp2_60pct_placed request_id=%s trade_id=%s tpsl_id=%s size=%s trigger=%s",
+                    req_id,
+                    trade_id,
+                    tp2_tpsl_id,
+                    tp2_size,
+                    trade.tp2,
+                )
+            else:
+                logger.warning(
+                    "market_tp2_60pct_failed request_id=%s trade_id=%s code=%s msg=%s size=%s",
+                    req_id,
+                    trade_id,
+                    tp2_result.get("code"),
+                    tp2_result.get("msg"),
+                    tp2_size,
+                )
+                tp_warnings.append(f"TP2 (60%) not placed: {tp2_result.get('msg') or 'unknown'}")
+
             return JSONResponse(
                 status_code=200,
                 content={
@@ -4274,6 +4483,10 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
                     "order_type": "market",
                     "trade_id": trade_id,
                     "order_id": blofin_order_id,
+                    "tp1_tpsl_id": tp1_tpsl_id,
+                    "tp2_tpsl_id": tp2_tpsl_id,
+                    "tp1_size": tp1_size,
+                    "tp2_size": tp2_size,
                     "user_id": user_id,
                     "coin": trade.coin,
                     "direction": trade.direction,
@@ -4295,6 +4508,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
                         "filled_size": confirm.get("filled_size"),
                         "average_price": confirm.get("average_price"),
                     },
+                    "tp_warnings": tp_warnings,
                     "request_id": req_id,
                 },
                 headers={"X-Request-ID": req_id},
