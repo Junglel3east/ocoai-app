@@ -7,7 +7,7 @@
 - Dynamic Watchlist with + button (session memory) → Charts navigation
 - Bottom nav: Home, Analyze, Trade Setup, Charts, Portfolio (Alerts via Home AppBar bell)
 - Expert-plan AI Chat FAB on Home + report screens
-- Expert-plan Oracle Citadel: Send trade setups to secure /execute_trade backend
+- Expert-plan Oracle Citadel: MARKET execution via /execute_trade (BloFin)
 - App logo: splash screen, Home AppBar, Profile header (assets/images/app_logo.png)
 - Professional Portfolio screen with mock holdings data
 */
@@ -736,56 +736,7 @@ abstract final class OracleCitadelService {
     throw OracleCitadelException(friendly);
   }
 
-  static Future<Map<String, dynamic>> executeTrade({
-    required String userId,
-    required String coin,
-    required String direction,
-    required double entryPrice,
-    required double stopLoss,
-    required double tp1,
-    required double tp2,
-    required double riskPercent,
-  }) async {
-    final uri = Uri.parse('$kCitadelBaseUrl/execute_trade');
-    final payload = {
-      'user_id': userId,
-      'coin': coin.toUpperCase(),
-      'direction': direction,
-      'entry_price': entryPrice,
-      'stop_loss': stopLoss,
-      'tp1': tp1,
-      'tp2': tp2,
-      'risk_percent': riskPercent,
-    };
-
-    debugPrint('[Citadel] POST $uri coin=$coin direction=$direction');
-
-    final response = await http
-        .post(uri, headers: _authHeaders(), body: jsonEncode(payload))
-        .timeout(const Duration(seconds: 90));
-
-    Map<String, dynamic> body = {};
-    try {
-      final decoded = jsonDecode(response.body);
-      if (decoded is Map<String, dynamic>) body = decoded;
-    } catch (_) {}
-
-    if (response.statusCode == 200) return body;
-
-    var friendly = _parseUserMessage(response) ??
-        body['user_message']?.toString() ??
-        'Trade could not be sent (${response.statusCode}).';
-    final whitelistIp = body['whitelist_ip']?.toString().trim();
-    if (whitelistIp != null && whitelistIp.isNotEmpty) {
-      friendly = '$friendly\n\nWhitelist this IP in BloFin Demo → API Management: $whitelistIp';
-    }
-    throw OracleCitadelException(
-      friendly,
-      errorCode: body['error_code']?.toString(),
-    );
-  }
-
-  /// Simplified MARKET payload — order_type + protective levels only (no limit entry).
+  /// MARKET-only Citadel execution — order_type + protective levels.
   static Future<Map<String, dynamic>> executeMarketOrder({
     required String userId,
     required String coin,
@@ -844,11 +795,20 @@ String citadelDirectionFromSetup(String selectedDirection, double entry, double 
   return sl < entry ? 'long' : 'short';
 }
 
-/// MARKET entry — separate simplified POST after user confirms in execution dialog.
+String _formatCitadelPrice(double value) {
+  if (value >= 1000) {
+    return '\$${value.toStringAsFixed(value >= 10000 ? 0 : 2)}';
+  }
+  return '\$${value.toStringAsFixed(4).replaceAll(RegExp(r'\.?0+$'), '')}';
+}
+
+/// MARKET entry — BloFin execution after user confirms in Citadel dialog.
 Future<void> _sendMarketOrder(
   BuildContext context,
   String coin,
   String direction, {
+  required String reportText,
+  required double plannedEntry,
   required double stopLoss,
   required double tp1,
   required double tp2,
@@ -886,6 +846,13 @@ Future<void> _sendMarketOrder(
         duration: const Duration(seconds: 5),
       ),
     );
+    _showCitadelPostExecutionReviewDialog(
+      context,
+      reportText: reportText,
+      plannedEntry: plannedEntry,
+      originalStopLoss: stopLoss,
+      marketResult: result,
+    );
   } on OracleCitadelException catch (e) {
     if (!context.mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
@@ -907,21 +874,151 @@ Future<void> _sendMarketOrder(
   }
 }
 
-/// Premium execution choice — shown after green success banner (~800ms).
+/// Oracle Citadel — MARKET execution confirmation (no limit orders).
 void _showCitadelExecuteChoiceDialog(
   BuildContext context, {
+  required String reportText,
   required String coin,
   required String direction,
+  required double plannedEntry,
   required double stopLoss,
   required double tp1,
   required double tp2,
 }) {
-  Future.delayed(const Duration(milliseconds: 800), () {
+  showDialog<void>(
+    context: context,
+    barrierDismissible: true,
+    barrierColor: Colors.black.withValues(alpha: 0.72),
+    builder: (dialogContext) => Dialog(
+      backgroundColor: const Color(0xFF141414),
+      insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 28),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 400),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(22, 22, 22, 18),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF43A047).withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: const Icon(Icons.rocket_launch_rounded, color: Color(0xFF43A047), size: 24),
+                  ),
+                  const SizedBox(width: 14),
+                  const Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Oracle Citadel',
+                          style: TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.w800,
+                            color: Colors.white,
+                            letterSpacing: -0.3,
+                          ),
+                        ),
+                        SizedBox(height: 4),
+                        Text(
+                          'Market execution only · BloFin Demo',
+                          style: TextStyle(fontSize: 13, color: Colors.grey),
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.grey),
+                    onPressed: () => Navigator.pop(dialogContext),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              Text(
+                'Entry ${_formatCitadelPrice(plannedEntry)} · SL ${_formatCitadelPrice(stopLoss)}',
+                style: TextStyle(fontSize: 13, color: Colors.grey[400], height: 1.4),
+              ),
+              const SizedBox(height: 20),
+              _CitadelExecutionOptionTile(
+                icon: Icons.rocket_launch_rounded,
+                iconColor: const Color(0xFF43A047),
+                title: 'Execute as MARKET Order NOW',
+                subtitle:
+                    'Enter immediately at the current market price on BloFin. '
+                    'Stop loss is placed on entry; TP1 (40%) and TP2 (60%) legs follow fill.',
+                highlighted: true,
+                onTap: () {
+                  Navigator.pop(dialogContext);
+                  _sendMarketOrder(
+                    context,
+                    coin,
+                    direction,
+                    reportText: reportText,
+                    plannedEntry: plannedEntry,
+                    stopLoss: stopLoss,
+                    tp1: tp1,
+                    tp2: tp2,
+                  );
+                },
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '$coin · ${direction.toUpperCase()}',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12, color: Colors.grey[600], letterSpacing: 0.3),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+/// Post-fill desk review — confluence + stop-loss guidance after MARKET success.
+void _showCitadelPostExecutionReviewDialog(
+  BuildContext context, {
+  required String reportText,
+  required double plannedEntry,
+  required double originalStopLoss,
+  required Map<String, dynamic> marketResult,
+}) {
+  Future.delayed(const Duration(milliseconds: 500), () {
     if (!context.mounted) return;
+    final analysis = parseCitadelAnalysisSnapshot(reportText);
+    final review = marketResult['post_trade_review'];
+    final reviewMap = review is Map<String, dynamic> ? review : marketResult;
+
+    double parseNum(dynamic v) {
+      if (v is num) return v.toDouble();
+      return double.tryParse(v?.toString() ?? '') ?? 0;
+    }
+
+    final fillEntry = parseNum(
+      reviewMap['fill_entry_price'] ??
+          (marketResult['blofin_confirm'] is Map
+              ? (marketResult['blofin_confirm'] as Map)['average_price']
+              : null),
+    );
+    final planned = parseNum(reviewMap['planned_entry_price'] ?? plannedEntry);
+    final originalSl = parseNum(reviewMap['original_stop_loss'] ?? originalStopLoss);
+    final suggestedSl = parseNum(reviewMap['suggested_stop_loss'] ?? originalSl);
+
+    final confidence = analysis.confidencePercent;
+    final grade = analysis.confluenceGrade;
+    final slDrift = (suggestedSl - originalSl).abs() > 0.0001;
+    final entryDrift = fillEntry > 0 && (fillEntry - planned).abs() / planned > 0.002;
+
     showDialog<void>(
       context: context,
-      barrierDismissible: false,
-      barrierColor: Colors.black.withValues(alpha: 0.72),
+      barrierDismissible: true,
+      barrierColor: Colors.black.withValues(alpha: 0.75),
       builder: (dialogContext) => Dialog(
         backgroundColor: const Color(0xFF141414),
         insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 28),
@@ -934,77 +1031,123 @@ void _showCitadelExecuteChoiceDialog(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.all(10),
-                      decoration: BoxDecoration(
-                        color: Colors.amber.withValues(alpha: 0.12),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: const Icon(Icons.bolt_rounded, color: Colors.amber, size: 24),
+                const Text(
+                  'Position Live — Desk Review',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w800,
+                    color: Colors.white,
+                    letterSpacing: -0.3,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Your MARKET order filled on BloFin. Review confluence and stop placement.',
+                  style: TextStyle(fontSize: 13, color: Colors.grey[400], height: 1.45),
+                ),
+                const SizedBox(height: 18),
+                if (confidence != null || grade != null)
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1E2A1E),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: const Color(0xFF43A047).withValues(alpha: 0.35)),
                     ),
-                    const SizedBox(width: 14),
-                    const Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Confluence (from your analysis)',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.green[200],
+                            letterSpacing: 0.2,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        if (confidence != null)
                           Text(
-                            'How to Enter',
-                            style: TextStyle(
-                              fontSize: 20,
+                            'Confidence: $confidence%',
+                            style: const TextStyle(
+                              fontSize: 22,
                               fontWeight: FontWeight.w800,
                               color: Colors.white,
-                              letterSpacing: -0.3,
                             ),
                           ),
-                          SizedBox(height: 4),
+                        if (grade != null) ...[
+                          const SizedBox(height: 4),
                           Text(
-                            'Your setup was sent · choose execution',
-                            style: TextStyle(fontSize: 13, color: Colors.grey),
+                            'Grade: $grade',
+                            style: TextStyle(fontSize: 14, color: Colors.grey[300]),
                           ),
                         ],
-                      ),
+                      ],
                     ),
-                  ],
+                  ),
+                const SizedBox(height: 14),
+                Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1A1A2E),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.white12),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Stop loss reference',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.blue[200],
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      if (fillEntry > 0)
+                        Text(
+                          'Market fill (entry): ${_formatCitadelPrice(fillEntry)}'
+                          '${entryDrift ? ' — vs planned ${_formatCitadelPrice(planned)}' : ''}',
+                          style: const TextStyle(fontSize: 14, color: Colors.white, height: 1.4),
+                        ),
+                      const SizedBox(height: 6),
+                      Text(
+                        'Original SL (from setup): ${_formatCitadelPrice(originalSl)}',
+                        style: TextStyle(fontSize: 14, color: Colors.grey[300], height: 1.4),
+                      ),
+                      if (slDrift) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          'Suggested SL (same risk distance from fill): ${_formatCitadelPrice(suggestedSl)}',
+                          style: const TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700,
+                            color: Color(0xFFFFB74D),
+                            height: 1.4,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          'Adjust in BloFin if fill diverged from your planned entry.',
+                          style: TextStyle(fontSize: 12, color: Colors.grey[500], height: 1.35),
+                        ),
+                      ] else
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Text(
+                            'Stop distance matches your setup relative to fill.',
+                            style: TextStyle(fontSize: 12, color: Colors.grey[500]),
+                          ),
+                        ),
+                    ],
+                  ),
                 ),
-                const SizedBox(height: 20),
-                _CitadelExecutionOptionTile(
-                  icon: Icons.tune_rounded,
-                  iconColor: const Color(0xFF00BFFF),
-                  title: 'Use AI Limit Order',
-                  subtitle:
-                      'Place at the exact Entry, TP1, TP2, and SL from your analysis. '
-                      'Best when you want precision and are willing to wait for fill.',
-                  badge: 'Default',
-                  onTap: () => Navigator.pop(dialogContext),
-                ),
-                const SizedBox(height: 12),
-                _CitadelExecutionOptionTile(
-                  icon: Icons.rocket_launch_rounded,
-                  iconColor: const Color(0xFF43A047),
-                  title: 'Execute as MARKET Order NOW',
-                  subtitle:
-                      'Enter immediately at the current market price. '
-                      'Recommended if you do not want to miss the move — SL and targets still apply.',
-                  highlighted: true,
-                  onTap: () {
-                    Navigator.pop(dialogContext);
-                    _sendMarketOrder(
-                      context,
-                      coin,
-                      direction,
-                      stopLoss: stopLoss,
-                      tp1: tp1,
-                      tp2: tp2,
-                    );
-                  },
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  '$coin · ${direction.toUpperCase()}',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 12, color: Colors.grey[600], letterSpacing: 0.3),
+                const SizedBox(height: 18),
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('Done', style: TextStyle(fontWeight: FontWeight.w700)),
                 ),
               ],
             ),
@@ -1176,7 +1319,6 @@ class SendToCitadelButton extends StatefulWidget {
 }
 
 class _SendToCitadelButtonState extends State<SendToCitadelButton> {
-  bool _sending = false;
   bool _validating = false;
   bool _isExpert = false;
   CitadelParsedLevels? _previewLevels;
@@ -1265,80 +1407,18 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
       return;
     }
 
-    setState(() {
-      _sending = true;
-      _sendErrorMessage = null;
-    });
-
-    try {
-      final direction = citadelDirectionFromSetup(widget.directionLabel, entry, sl);
-      final result = await OracleCitadelService.executeTrade(
-        userId: OracleCitadelStore.userId,
-        coin: widget.coin,
-        direction: direction,
-        entryPrice: entry,
-        stopLoss: sl,
-        tp1: tp1,
-        tp2: tp2,
-        riskPercent: OracleCitadelStore.defaultRiskPercent,
-      );
-
-      final status = result['status']?.toString() ?? '';
-
-      if (mounted) {
-        final isSuccess = status == 'success';
-        if (isSuccess) {
-          setState(() => _sendErrorMessage = null);
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('✅ Trade sent to Oracle Citadel'),
-              backgroundColor: Colors.green,
-              duration: Duration(seconds: 5),
-              behavior: SnackBarBehavior.floating,
-            ),
-          );
-          _showCitadelExecuteChoiceDialog(
-            context,
-            coin: widget.coin,
-            direction: direction,
-            stopLoss: sl,
-            tp1: tp1,
-            tp2: tp2,
-          );
-        } else {
-          final userMessage = result['user_message']?.toString() ??
-              result['message']?.toString() ??
-              'Trade could not be sent to Oracle Citadel.';
-          setState(() => _sendErrorMessage = userMessage);
-        }
-      }
-    } on OracleCitadelException catch (e) {
-      if (mounted) {
-        setState(() => _sendErrorMessage = e.userMessage);
-        if (e.errorCode == 'credentials_missing') {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(e.userMessage),
-              backgroundColor: const Color(0xFFB71C1C),
-              duration: const Duration(seconds: 5),
-              behavior: SnackBarBehavior.floating,
-              action: SnackBarAction(
-                label: 'Setup',
-                textColor: Colors.white,
-                onPressed: () => showCitadelSetupDialog(context),
-              ),
-            ),
-          );
-        }
-      }
-    } catch (_) {
-      if (mounted) {
-        setState(() => _sendErrorMessage =
-            'Cannot reach Oracle Citadel. Check your connection and try again.');
-      }
-    } finally {
-      if (mounted) setState(() => _sending = false);
-    }
+    final direction = citadelDirectionFromSetup(widget.directionLabel, entry, sl);
+    if (!mounted) return;
+    _showCitadelExecuteChoiceDialog(
+      context,
+      reportText: widget.reportText,
+      coin: widget.coin,
+      direction: direction,
+      plannedEntry: entry,
+      stopLoss: sl,
+      tp1: tp1,
+      tp2: tp2,
+    );
   }
 
   @override
@@ -1450,8 +1530,8 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
         SizedBox(
           width: double.infinity,
           child: ElevatedButton.icon(
-            onPressed: (_sending || _validating) ? null : _onPressed,
-            icon: (_sending || _validating)
+            onPressed: _validating ? null : _onPressed,
+            icon: _validating
                 ? const SizedBox(
                     width: 20,
                     height: 20,
@@ -1459,11 +1539,7 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
                   )
                 : const Icon(Icons.shield_outlined, size: 22),
             label: Text(
-              _validating
-                  ? 'Validating trade levels…'
-                  : _sending
-                      ? 'Sending to Citadel…'
-                      : 'Send to Oracle Citadel',
+              _validating ? 'Validating trade levels…' : 'Send to Oracle Citadel',
               style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
             ),
             style: ElevatedButton.styleFrom(

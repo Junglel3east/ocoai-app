@@ -220,3 +220,53 @@ double? extractTradeLevel(String input, List<String> keys) {
   if (lowerKeys.any((k) => k.contains('sl') || k.contains('stop'))) return parsed.sl;
   return null;
 }
+
+/// Confluence / confidence extracted from the latest AI trade setup or analysis report.
+class CitadelAnalysisSnapshot {
+  final int? confidencePercent;
+  final String? confluenceGrade;
+
+  const CitadelAnalysisSnapshot({
+    this.confidencePercent,
+    this.confluenceGrade,
+  });
+}
+
+CitadelAnalysisSnapshot parseCitadelAnalysisSnapshot(String report) {
+  final text = _normalizeReportForParsing(report);
+  int? confidence;
+  final confMatch = RegExp(
+    r'Confidence:\s*(\d+(?:\.\d+)?)\s*%',
+    caseSensitive: false,
+  ).firstMatch(text);
+  if (confMatch != null) {
+    final parsed = double.tryParse(confMatch.group(1)!);
+    if (parsed != null) confidence = parsed.round();
+  }
+
+  String? grade;
+  final gradePatterns = [
+    RegExp(
+      r'Confluence\s+Summary[^:]*:.*?(\bSTRONG\b|\bMODERATE\b|\bWEAK\b)',
+      caseSensitive: false,
+      dotAll: true,
+    ),
+    RegExp(
+      r'Overall\s+Bias[^:]*:.*?(\bSTRONG\b|\bMODERATE\b|\bWEAK\b)',
+      caseSensitive: false,
+      dotAll: true,
+    ),
+  ];
+  for (final pattern in gradePatterns) {
+    final match = pattern.firstMatch(text);
+    if (match != null) {
+      grade = match.group(1)?.toUpperCase();
+      break;
+    }
+  }
+
+  return CitadelAnalysisSnapshot(
+    confidencePercent: confidence,
+    confluenceGrade: grade,
+  );
+}

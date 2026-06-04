@@ -303,7 +303,7 @@ class ExchangeKeysRequest(BaseModel):
 
 class ExecuteTradeRequest(BaseModel):
     """
-    Oracle Citadel trade execution — matches Flutter OracleCitadelService.executeTrade().
+    Oracle Citadel trade execution — MARKET only (BloFin).
     """
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
@@ -316,7 +316,7 @@ class ExecuteTradeRequest(BaseModel):
     tp1: float = Field(..., gt=0)
     tp2: float = Field(..., gt=0)
     risk_percent: float = Field(1.0, ge=0.1, le=100.0)
-    order_type: str = Field("limit", max_length=16)
+    order_type: str = Field("market", max_length=16)
 
     @field_validator("user_id", "coin", "direction", mode="before")
     @classmethod
@@ -343,9 +343,7 @@ class ExecuteTradeRequest(BaseModel):
     @field_validator("order_type", mode="before")
     @classmethod
     def _normalize_order_type(cls, value: Any) -> str:
-        if value is None:
-            return "limit"
-        return str(value).strip().lower() or "limit"
+        return "market"
 
 
 def normalize_analyze_mode(raw: Optional[str], *, default: str = "analysis") -> str:
@@ -1579,42 +1577,50 @@ def _coerce_positive_float(value: Any) -> Optional[float]:
 
 
 def _normalize_execute_trade_payload(raw: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map Flutter payloads; detect MARKET via order_type or entry_price == \"market\".
-    Does not change limit-order field semantics.
-    """
+    """Map Flutter payloads — Oracle Citadel accepts MARKET orders only."""
     data = dict(raw)
-    order_token = str(data.get("order_type", "limit")).strip().lower()
+    data["order_type"] = "market"
     entry_raw = data.get("entry_price", data.get("entry"))
     entry_is_market = isinstance(entry_raw, str) and entry_raw.strip().lower() == "market"
-    is_market = order_token == "market" or entry_is_market
-
-    if is_market:
-        data["order_type"] = "market"
-        if entry_is_market:
-            sl = _coerce_positive_float(data.get("stop_loss") or data.get("sl"))
-            tp1 = _coerce_positive_float(data.get("tp1"))
-            ref = (tp1 + sl) / 2 if sl is not None and tp1 is not None else None
-            data["entry_price"] = ref if ref is not None else _coerce_positive_float(data.get("entry_price")) or 1.0
-
+    if entry_is_market:
+        sl = _coerce_positive_float(data.get("stop_loss") or data.get("sl"))
+        tp1 = _coerce_positive_float(data.get("tp1"))
+        ref = (tp1 + sl) / 2 if sl is not None and tp1 is not None else None
+        data["entry_price"] = ref if ref is not None else _coerce_positive_float(data.get("entry_price")) or 1.0
     return data
 
 
-def _is_market_trade_request(trade: ExecuteTradeRequest, raw_body: dict[str, Any]) -> bool:
-    """True when client requests immediate market entry."""
-    if trade.order_type == "market":
-        return True
-    entry_raw = raw_body.get("entry_price", raw_body.get("entry"))
-    return isinstance(entry_raw, str) and entry_raw.strip().lower() == "market"
-
-
 def _parse_execute_trade_request(raw_body: dict[str, Any]) -> ExecuteTradeRequest:
-    """Validate execute_trade payload (limit + market aliases)."""
+    """Validate execute_trade payload (MARKET-only Citadel)."""
     return ExecuteTradeRequest.model_validate(_normalize_execute_trade_payload(raw_body))
 
 
+def _parse_blofin_price_token(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        parsed = float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _citadel_suggested_stop_loss(
+    *,
+    direction: str,
+    fill_entry: float,
+    planned_entry: float,
+    original_sl: float,
+) -> float:
+    """Preserve planned risk distance from fill entry (desk-style SL adjustment)."""
+    risk_distance = abs(planned_entry - original_sl)
+    if direction == "long":
+        return fill_entry - risk_distance
+    return fill_entry + risk_distance
+
+
 # ---------------------------------------------------------------------------
-# BloFin — Oracle Citadel MARKET execution (limit path unchanged below)
+# BloFin — Oracle Citadel MARKET execution
 # ---------------------------------------------------------------------------
 
 _INSTRUMENT_SPEC_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -2229,7 +2235,7 @@ def _blofin_place_order(
     """
     Place order on BloFin.
     MARKET: orderType=market — no price field (BloFin rejects price on market orders).
-    LIMIT: orderType=limit + price (Citadel limit accept path does not call this today).
+    LIMIT: orderType=limit + price (not used by Citadel — MARKET-only).
     TP/SL: trigger prices + -1 market execution + triggerPriceType=last per BloFin docs.
     """
     inst_id = _blofin_inst_id(coin)
@@ -4192,17 +4198,11 @@ async def exchange_keys(http_request: Request) -> JSONResponse:
 
 async def _handle_execute_trade(http_request: Request) -> JSONResponse:
     """
-    POST /execute_trade — Oracle Citadel trade execution (Flutter "Send to Oracle Citadel").
+    POST /execute_trade — Oracle Citadel MARKET execution only (BloFin).
 
     Accepts JSON:
-      user_id, coin, direction, entry_price, stop_loss, tp1, tp2, risk_percent
+      user_id, coin, direction, entry_price, stop_loss, tp1, tp2, risk_percent, order_type=market
     Auth: X-API-Key header must match app_api_key saved via POST /exchange_keys.
-
-    Also mounted at /api/execute_trade (same handler) for clients using /api prefix.
-
-    order_type=market or entry_price=\"market\" → BloFin MARKET placement.
-    Default limit flow is unchanged (validate geometry, accept, no exchange REST call).
-    Safe logging at every step — never logs API secrets or passphrases.
     """
     req_id = getattr(http_request.state, "request_id", "?")
     path = http_request.url.path
@@ -4353,8 +4353,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             headers={"X-Request-ID": req_id},
         )
 
-    is_market = _is_market_trade_request(trade, raw_body)
-    order_type = "market" if is_market else "limit"
+    order_type = "market"
     effective_risk, requested_risk = _resolve_effective_risk_percent(trade.risk_percent)
     exchange = record.get("exchange") or "unspecified"
     environment = record.get("environment") or "live"
@@ -4391,352 +4390,23 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
         api_base_url,
     )
 
-    # ── MARKET: BloFin immediate entry (order_type=market or entry_price=\"market\") ──
-    if is_market:
-        if "blofin" not in str(exchange).lower():
-            logger.warning(
-                "execute_trade_market_unsupported_exchange request_id=%s exchange=%s",
-                req_id,
-                exchange,
-            )
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "success": False,
-                    "detail": f"MARKET orders are only supported for BloFin (exchange={exchange}).",
-                    "user_message": "MARKET entry is available for BloFin only. Use AI Limit Order or link BloFin keys.",
-                    "request_id": req_id,
-                },
-                headers={"X-Request-ID": req_id},
-            )
-
-        passphrase = _resolve_blofin_passphrase(record)
-        if not passphrase:
-            logger.error(
-                "execute_trade_blofin_passphrase_missing request_id=%s user_id=%s",
-                req_id,
-                user_id,
-            )
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "success": False,
-                    "detail": "BloFin API passphrase is not configured on the server.",
-                    "user_message": "Server BloFin passphrase missing. Set BLOFIN_PASSPHRASE on Railway.",
-                    "request_id": req_id,
-                },
-                headers={"X-Request-ID": req_id},
-            )
-
-        inst_id = _blofin_inst_id(trade.coin)
-
-        # Reference price for sizing (live Mobula/CG/Binance — not sent as limit price on market).
-        try:
-            live = fetch_live_price_for_analysis(trade.coin)
-            reference_price = float(live["price"])
-        except Exception as exc:
-            logger.warning(
-                "execute_trade_market_price_fallback request_id=%s coin=%s err=%s using_entry=%s",
-                req_id,
-                trade.coin,
-                exc,
-                trade.entry_price,
-            )
-            reference_price = float(trade.entry_price)
-
-        order_size, size_meta = _blofin_calculate_order_size(
-            coin=trade.coin,
-            entry_price=reference_price,
-            stop_loss=trade.stop_loss,
-            risk_percent=effective_risk,
-            base_url=api_base_url,
-            api_key=exchange_api_key,
-            api_secret=exchange_secret,
-            passphrase=passphrase,
-            request_id=req_id,
-        )
-
-        logger.info(
-            "execute_trade_market_dispatch request_id=%s trade_id=%s blofin_base=%s inst=%s "
-            "reference_price=%.6f order_size=%s size_meta=%s",
-            req_id,
-            trade_id,
-            api_base_url,
-            inst_id,
-            reference_price,
-            order_size,
-            size_meta,
-        )
-
-        blofin_result = _blofin_place_order(
-            base_url=api_base_url,
-            api_key=exchange_api_key,
-            api_secret=exchange_secret,
-            passphrase=passphrase,
-            coin=trade.coin,
-            direction=trade.direction,
-            order_type="market",
-            size=order_size,
-            tp1=None,
-            sl=trade.stop_loss,
-            client_order_id=trade_id[:32],
-            request_id=req_id,
-        )
-
-        blofin_order_id = blofin_result.get("order_id")
-        order_params = blofin_result.get("order_params") or {}
-
-        if blofin_result.get("ok") and blofin_order_id:
-            # Fill confirmation — success only when contracts actually filled (not just orderId).
-            confirm = await _blofin_confirm_market_fill(
-                base_url=api_base_url,
-                api_key=exchange_api_key,
-                api_secret=exchange_secret,
-                passphrase=passphrase,
-                inst_id=inst_id,
-                order_id=blofin_order_id,
-                placement=blofin_result,
-                request_id=req_id,
-            )
-            logger.info(
-                "execute_trade_post_confirm request_id=%s trade_id=%s order_id=%s confirm=%s",
-                req_id,
-                trade_id,
-                blofin_order_id,
-                {
-                    "fill_ok": confirm.get("fill_ok"),
-                    "state": confirm.get("state"),
-                    "filled_size": confirm.get("filled_size"),
-                    "average_price": confirm.get("average_price"),
-                    "poll_attempt": confirm.get("poll_attempt"),
-                    "source": confirm.get("source"),
-                },
-            )
-
-            if not confirm.get("fill_ok"):
-                logger.warning(
-                    "execute_trade_market_unfilled request_id=%s trade_id=%s order_id=%s "
-                    "environment=%s base_url=%s state=%s filled=%s order_size=%s",
-                    req_id,
-                    trade_id,
-                    blofin_order_id,
-                    environment,
-                    api_base_url,
-                    confirm.get("state"),
-                    confirm.get("filled_size"),
-                    order_size,
-                )
-                return JSONResponse(
-                    status_code=502,
-                    content={
-                        "success": False,
-                        "status": "failed",
-                        "order_type": "market",
-                        "trade_id": trade_id,
-                        "order_id": blofin_order_id,
-                        "detail": (
-                            "BloFin accepted the MARKET order but no contracts were filled. "
-                            f"state={confirm.get('state')!s} filledSize={confirm.get('filled_size')!s}"
-                        ),
-                        "user_message": (
-                            "MARKET order was submitted to BloFin but did not fill — no position opened. "
-                            "Check Demo margin, minimum size, and that Citadel Demo mode matches your BloFin "
-                            f"account ({environment}). Order ID {blofin_order_id} may appear in order history only."
-                        ),
-                        "blofin_confirm": {
-                            "state": confirm.get("state"),
-                            "filled_size": confirm.get("filled_size"),
-                            "average_price": confirm.get("average_price"),
-                        },
-                        "api_base_url": api_base_url,
-                        "request_id": req_id,
-                    },
-                    headers={"X-Request-ID": req_id},
-                )
-
-            logger.info(
-                "execute_trade_market_outcome request_id=%s trade_id=%s "
-                "Order placed successfully - Order ID: %s state=%s filled=%s avg=%s",
-                req_id,
-                trade_id,
-                blofin_order_id,
-                confirm.get("state"),
-                confirm.get("filled_size"),
-                confirm.get("average_price"),
-            )
-
-            # Dual TP (40% / 60%) — separate order-tpsl legs after confirmed MARKET fill + SL on entry.
-            position_size = (
-                confirm.get("filled_size")
-                or confirm.get("size")
-                or order_size
-            )
-            position_size_str = str(position_size)
-            spec = _blofin_fetch_instrument_spec(
-                base_url=api_base_url,
-                inst_id=inst_id,
-                request_id=req_id,
-            )
-            tp1_size, tp2_size = _blofin_dual_tp_contract_sizes(
-                position_size_str,
-                lot_size=float(spec["lotSize"]),
-                min_size=float(spec["minSize"]),
-            )
-
-            tp1_tpsl_id: Optional[str] = None
-            tp2_tpsl_id: Optional[str] = None
-            tp_warnings: list[str] = []
-
-            tp1_result = _blofin_place_tpsl_take_profit(
-                base_url=api_base_url,
-                api_key=exchange_api_key,
-                api_secret=exchange_secret,
-                passphrase=passphrase,
-                coin=trade.coin,
-                direction=trade.direction,
-                tp_price=trade.tp1,
-                size=tp1_size,
-                client_order_id=f"{trade_id[:28]}m1",
-                request_id=req_id,
-            )
-            tp1_tpsl_id = tp1_result.get("tpsl_id")
-            if tp1_result.get("ok"):
-                logger.info(
-                    "market_tp1_40pct_placed request_id=%s trade_id=%s tpsl_id=%s size=%s trigger=%s",
-                    req_id,
-                    trade_id,
-                    tp1_tpsl_id,
-                    tp1_size,
-                    trade.tp1,
-                )
-            else:
-                logger.warning(
-                    "market_tp1_40pct_failed request_id=%s trade_id=%s code=%s msg=%s size=%s",
-                    req_id,
-                    trade_id,
-                    tp1_result.get("code"),
-                    tp1_result.get("msg"),
-                    tp1_size,
-                )
-                tp_warnings.append(f"TP1 (40%) not placed: {tp1_result.get('msg') or 'unknown'}")
-
-            tp2_result = _blofin_place_tpsl_take_profit(
-                base_url=api_base_url,
-                api_key=exchange_api_key,
-                api_secret=exchange_secret,
-                passphrase=passphrase,
-                coin=trade.coin,
-                direction=trade.direction,
-                tp_price=trade.tp2,
-                size=tp2_size,
-                client_order_id=f"{trade_id[:28]}m2",
-                request_id=req_id,
-            )
-            tp2_tpsl_id = tp2_result.get("tpsl_id")
-            if tp2_result.get("ok"):
-                logger.info(
-                    "market_tp2_60pct_placed request_id=%s trade_id=%s tpsl_id=%s size=%s trigger=%s",
-                    req_id,
-                    trade_id,
-                    tp2_tpsl_id,
-                    tp2_size,
-                    trade.tp2,
-                )
-            else:
-                logger.warning(
-                    "market_tp2_60pct_failed request_id=%s trade_id=%s code=%s msg=%s size=%s",
-                    req_id,
-                    trade_id,
-                    tp2_result.get("code"),
-                    tp2_result.get("msg"),
-                    tp2_size,
-                )
-                tp_warnings.append(f"TP2 (60%) not placed: {tp2_result.get('msg') or 'unknown'}")
-
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "success": True,
-                    "status": "success",
-                    "order_type": "market",
-                    "trade_id": trade_id,
-                    "order_id": blofin_order_id,
-                    "tp1_tpsl_id": tp1_tpsl_id,
-                    "tp2_tpsl_id": tp2_tpsl_id,
-                    "tp1_size": tp1_size,
-                    "tp2_size": tp2_size,
-                    "user_id": user_id,
-                    "coin": trade.coin,
-                    "direction": trade.direction,
-                    "stop_loss": trade.stop_loss,
-                    "tp1": trade.tp1,
-                    "tp2": trade.tp2,
-                    "risk_percent": effective_risk,
-                    "risk_percent_requested": requested_risk,
-                    "order_size": order_size,
-                    "exchange": exchange,
-                    "environment": environment,
-                    "message": f"MARKET order placed for {trade.coin} {trade.direction.upper()}.",
-                    "user_message": (
-                        f"MARKET order executed on BloFin ({environment}). "
-                        f"{trade.coin} {trade.direction.upper()} · Order ID {blofin_order_id}"
-                    ),
-                    "blofin_confirm": {
-                        "state": confirm.get("state"),
-                        "filled_size": confirm.get("filled_size"),
-                        "average_price": confirm.get("average_price"),
-                    },
-                    "tp_warnings": tp_warnings,
-                    "request_id": req_id,
-                },
-                headers={"X-Request-ID": req_id},
-            )
-
+    if "blofin" not in str(exchange).lower():
         logger.warning(
-            "execute_trade_market_failure request_id=%s trade_id=%s http=%s code=%s msg=%s "
-            "order_params=%s blofin_response=%s",
+            "execute_trade_market_unsupported_exchange request_id=%s exchange=%s",
             req_id,
-            trade_id,
-            blofin_result.get("http_status"),
-            blofin_result.get("code"),
-            blofin_result.get("msg"),
-            order_params,
-            _blofin_safe_response_log(blofin_result.get("response"))
-            if isinstance(blofin_result.get("response"), dict)
-            else blofin_result.get("response"),
+            exchange,
         )
-        friendly = _blofin_user_friendly_error(
-            blofin_result.get("code"),
-            blofin_result.get("msg"),
-        )
-        fail_body: dict[str, Any] = {
-            "success": False,
-            "status": "failed",
-            "order_type": "market",
-            "trade_id": trade_id,
-            "detail": blofin_result.get("msg") or "BloFin MARKET order rejected.",
-            "user_message": friendly,
-            "blofin_code": blofin_result.get("code"),
-            "request_id": req_id,
-        }
-        if _blofin_is_ip_whitelist_error(blofin_result.get("code"), blofin_result.get("msg")):
-            egress_ip = _citadel_egress_ip_for_whitelist()
-            if egress_ip:
-                fail_body["whitelist_ip"] = egress_ip
-                logger.warning(
-                    "execute_trade_market_ip_whitelist request_id=%s trade_id=%s "
-                    "whitelist_this_ip_in_blofin=%s",
-                    req_id,
-                    trade_id,
-                    egress_ip,
-                )
         return JSONResponse(
-            status_code=502,
-            content=fail_body,
+            status_code=400,
+            content={
+                "success": False,
+                "detail": f"Oracle Citadel requires BloFin (exchange={exchange}).",
+                "user_message": "Link BloFin keys in Oracle Citadel Setup to execute MARKET orders.",
+                "request_id": req_id,
+            },
             headers={"X-Request-ID": req_id},
         )
 
-    # ── LIMIT: validate + accept (no BloFin REST — user uses MARKET from execution dialog) ──
     geometry_err = _validate_citadel_trade_geometry(
         direction=trade.direction,
         entry=trade.entry_price,
@@ -4761,57 +4431,351 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             headers={"X-Request-ID": req_id},
         )
 
-    rr = compute_rr(trade.entry_price, trade.tp1, trade.stop_loss)
+    passphrase = _resolve_blofin_passphrase(record)
+    if not passphrase:
+        logger.error(
+            "execute_trade_blofin_passphrase_missing request_id=%s user_id=%s",
+            req_id,
+            user_id,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "detail": "BloFin API passphrase is not configured on the server.",
+                "user_message": "Server BloFin passphrase missing. Set BLOFIN_PASSPHRASE on Railway.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    inst_id = _blofin_inst_id(trade.coin)
+
+    # Reference price for sizing (live Mobula/CG/Binance — not sent as limit price on market).
+    try:
+        live = fetch_live_price_for_analysis(trade.coin)
+        reference_price = float(live["price"])
+    except Exception as exc:
+        logger.warning(
+            "execute_trade_market_price_fallback request_id=%s coin=%s err=%s using_entry=%s",
+            req_id,
+            trade.coin,
+            exc,
+            trade.entry_price,
+        )
+        reference_price = float(trade.entry_price)
+
+    order_size, size_meta = _blofin_calculate_order_size(
+        coin=trade.coin,
+        entry_price=reference_price,
+        stop_loss=trade.stop_loss,
+        risk_percent=effective_risk,
+        base_url=api_base_url,
+        api_key=exchange_api_key,
+        api_secret=exchange_secret,
+        passphrase=passphrase,
+        request_id=req_id,
+    )
 
     logger.info(
-        "execute_trade_limit_accepted request_id=%s trade_id=%s user_id=%s coin=%s direction=%s "
-        "entry=%s sl=%s tp1=%s tp2=%s risk_requested=%.2f risk_effective=%.2f rr=%s exchange=%s environment=%s",
+        "execute_trade_market_dispatch request_id=%s trade_id=%s blofin_base=%s inst=%s "
+        "reference_price=%.6f order_size=%s size_meta=%s",
         req_id,
         trade_id,
-        user_id,
-        trade.coin,
-        trade.direction,
-        trade.entry_price,
-        trade.stop_loss,
-        trade.tp1,
-        trade.tp2,
-        requested_risk,
-        effective_risk,
-        f"{rr:.2f}" if rr is not None else "n/a",
-        exchange,
-        environment,
+        api_base_url,
+        inst_id,
+        reference_price,
+        order_size,
+        size_meta,
     )
 
+    blofin_result = _blofin_place_order(
+        base_url=api_base_url,
+        api_key=exchange_api_key,
+        api_secret=exchange_secret,
+        passphrase=passphrase,
+        coin=trade.coin,
+        direction=trade.direction,
+        order_type="market",
+        size=order_size,
+        tp1=None,
+        sl=trade.stop_loss,
+        client_order_id=trade_id[:32],
+        request_id=req_id,
+    )
+
+    blofin_order_id = blofin_result.get("order_id")
+    order_params = blofin_result.get("order_params") or {}
+
+    if blofin_result.get("ok") and blofin_order_id:
+        # Fill confirmation — success only when contracts actually filled (not just orderId).
+        confirm = await _blofin_confirm_market_fill(
+            base_url=api_base_url,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            passphrase=passphrase,
+            inst_id=inst_id,
+            order_id=blofin_order_id,
+            placement=blofin_result,
+            request_id=req_id,
+        )
+        logger.info(
+            "execute_trade_post_confirm request_id=%s trade_id=%s order_id=%s confirm=%s",
+            req_id,
+            trade_id,
+            blofin_order_id,
+            {
+                "fill_ok": confirm.get("fill_ok"),
+                "state": confirm.get("state"),
+                "filled_size": confirm.get("filled_size"),
+                "average_price": confirm.get("average_price"),
+                "poll_attempt": confirm.get("poll_attempt"),
+                "source": confirm.get("source"),
+            },
+        )
+
+        if not confirm.get("fill_ok"):
+            logger.warning(
+                "execute_trade_market_unfilled request_id=%s trade_id=%s order_id=%s "
+                "environment=%s base_url=%s state=%s filled=%s order_size=%s",
+                req_id,
+                trade_id,
+                blofin_order_id,
+                environment,
+                api_base_url,
+                confirm.get("state"),
+                confirm.get("filled_size"),
+                order_size,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "success": False,
+                    "status": "failed",
+                    "order_type": "market",
+                    "trade_id": trade_id,
+                    "order_id": blofin_order_id,
+                    "detail": (
+                        "BloFin accepted the MARKET order but no contracts were filled. "
+                        f"state={confirm.get('state')!s} filledSize={confirm.get('filled_size')!s}"
+                    ),
+                    "user_message": (
+                        "MARKET order was submitted to BloFin but did not fill — no position opened. "
+                        "Check Demo margin, minimum size, and that Citadel Demo mode matches your BloFin "
+                        f"account ({environment}). Order ID {blofin_order_id} may appear in order history only."
+                    ),
+                    "blofin_confirm": {
+                        "state": confirm.get("state"),
+                        "filled_size": confirm.get("filled_size"),
+                        "average_price": confirm.get("average_price"),
+                    },
+                    "api_base_url": api_base_url,
+                    "request_id": req_id,
+                },
+                headers={"X-Request-ID": req_id},
+            )
+
+        logger.info(
+            "execute_trade_market_outcome request_id=%s trade_id=%s "
+            "Order placed successfully - Order ID: %s state=%s filled=%s avg=%s",
+            req_id,
+            trade_id,
+            blofin_order_id,
+            confirm.get("state"),
+            confirm.get("filled_size"),
+            confirm.get("average_price"),
+        )
+
+        # Dual TP (40% / 60%) — separate order-tpsl legs after confirmed MARKET fill + SL on entry.
+        position_size = (
+            confirm.get("filled_size")
+            or confirm.get("size")
+            or order_size
+        )
+        position_size_str = str(position_size)
+        spec = _blofin_fetch_instrument_spec(
+            base_url=api_base_url,
+            inst_id=inst_id,
+            request_id=req_id,
+        )
+        tp1_size, tp2_size = _blofin_dual_tp_contract_sizes(
+            position_size_str,
+            lot_size=float(spec["lotSize"]),
+            min_size=float(spec["minSize"]),
+        )
+
+        tp1_tpsl_id: Optional[str] = None
+        tp2_tpsl_id: Optional[str] = None
+        tp_warnings: list[str] = []
+
+        tp1_result = _blofin_place_tpsl_take_profit(
+            base_url=api_base_url,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            passphrase=passphrase,
+            coin=trade.coin,
+            direction=trade.direction,
+            tp_price=trade.tp1,
+            size=tp1_size,
+            client_order_id=f"{trade_id[:28]}m1",
+            request_id=req_id,
+        )
+        tp1_tpsl_id = tp1_result.get("tpsl_id")
+        if tp1_result.get("ok"):
+            logger.info(
+                "market_tp1_40pct_placed request_id=%s trade_id=%s tpsl_id=%s size=%s trigger=%s",
+                req_id,
+                trade_id,
+                tp1_tpsl_id,
+                tp1_size,
+                trade.tp1,
+            )
+        else:
+            logger.warning(
+                "market_tp1_40pct_failed request_id=%s trade_id=%s code=%s msg=%s size=%s",
+                req_id,
+                trade_id,
+                tp1_result.get("code"),
+                tp1_result.get("msg"),
+                tp1_size,
+            )
+            tp_warnings.append(f"TP1 (40%) not placed: {tp1_result.get('msg') or 'unknown'}")
+
+        tp2_result = _blofin_place_tpsl_take_profit(
+            base_url=api_base_url,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            passphrase=passphrase,
+            coin=trade.coin,
+            direction=trade.direction,
+            tp_price=trade.tp2,
+            size=tp2_size,
+            client_order_id=f"{trade_id[:28]}m2",
+            request_id=req_id,
+        )
+        tp2_tpsl_id = tp2_result.get("tpsl_id")
+        if tp2_result.get("ok"):
+            logger.info(
+                "market_tp2_60pct_placed request_id=%s trade_id=%s tpsl_id=%s size=%s trigger=%s",
+                req_id,
+                trade_id,
+                tp2_tpsl_id,
+                tp2_size,
+                trade.tp2,
+            )
+        else:
+            logger.warning(
+                "market_tp2_60pct_failed request_id=%s trade_id=%s code=%s msg=%s size=%s",
+                req_id,
+                trade_id,
+                tp2_result.get("code"),
+                tp2_result.get("msg"),
+                tp2_size,
+            )
+            tp_warnings.append(f"TP2 (60%) not placed: {tp2_result.get('msg') or 'unknown'}")
+
+        planned_entry = float(trade.entry_price)
+        original_sl = float(trade.stop_loss)
+        fill_entry = _parse_blofin_price_token(confirm.get("average_price")) or reference_price
+        suggested_sl = _citadel_suggested_stop_loss(
+            direction=trade.direction,
+            fill_entry=fill_entry,
+            planned_entry=planned_entry,
+            original_sl=original_sl,
+        )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "status": "success",
+                "order_type": "market",
+                "trade_id": trade_id,
+                "order_id": blofin_order_id,
+                "tp1_tpsl_id": tp1_tpsl_id,
+                "tp2_tpsl_id": tp2_tpsl_id,
+                "tp1_size": tp1_size,
+                "tp2_size": tp2_size,
+                "user_id": user_id,
+                "coin": trade.coin,
+                "direction": trade.direction,
+                "stop_loss": trade.stop_loss,
+                "tp1": trade.tp1,
+                "tp2": trade.tp2,
+                "risk_percent": effective_risk,
+                "risk_percent_requested": requested_risk,
+                "order_size": order_size,
+                "exchange": exchange,
+                "environment": environment,
+                "planned_entry_price": planned_entry,
+                "fill_entry_price": fill_entry,
+                "original_stop_loss": original_sl,
+                "suggested_stop_loss": suggested_sl,
+                "message": f"MARKET order placed for {trade.coin} {trade.direction.upper()}.",
+                "user_message": (
+                    f"MARKET order executed on BloFin ({environment}). "
+                    f"{trade.coin} {trade.direction.upper()} · Order ID {blofin_order_id}"
+                ),
+                "blofin_confirm": {
+                    "state": confirm.get("state"),
+                    "filled_size": confirm.get("filled_size"),
+                    "average_price": confirm.get("average_price"),
+                },
+                "post_trade_review": {
+                    "planned_entry_price": planned_entry,
+                    "fill_entry_price": fill_entry,
+                    "original_stop_loss": original_sl,
+                    "suggested_stop_loss": suggested_sl,
+                },
+                "tp_warnings": tp_warnings,
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    logger.warning(
+        "execute_trade_market_failure request_id=%s trade_id=%s http=%s code=%s msg=%s "
+        "order_params=%s blofin_response=%s",
+        req_id,
+        trade_id,
+        blofin_result.get("http_status"),
+        blofin_result.get("code"),
+        blofin_result.get("msg"),
+        order_params,
+        _blofin_safe_response_log(blofin_result.get("response"))
+        if isinstance(blofin_result.get("response"), dict)
+        else blofin_result.get("response"),
+    )
+    friendly = _blofin_user_friendly_error(
+        blofin_result.get("code"),
+        blofin_result.get("msg"),
+    )
+    fail_body: dict[str, Any] = {
+        "success": False,
+        "status": "failed",
+        "order_type": "market",
+        "trade_id": trade_id,
+        "detail": blofin_result.get("msg") or "BloFin MARKET order rejected.",
+        "user_message": friendly,
+        "blofin_code": blofin_result.get("code"),
+        "request_id": req_id,
+    }
+    if _blofin_is_ip_whitelist_error(blofin_result.get("code"), blofin_result.get("msg")):
+        egress_ip = _citadel_egress_ip_for_whitelist()
+        if egress_ip:
+            fail_body["whitelist_ip"] = egress_ip
+            logger.warning(
+                "execute_trade_market_ip_whitelist request_id=%s trade_id=%s "
+                "whitelist_this_ip_in_blofin=%s",
+                req_id,
+                trade_id,
+                egress_ip,
+            )
     return JSONResponse(
-        status_code=200,
-        content={
-            "success": True,
-            "status": "success",
-            "order_type": "limit",
-            "trade_id": trade_id,
-            "user_id": user_id,
-            "coin": trade.coin,
-            "direction": trade.direction,
-            "entry_price": trade.entry_price,
-            "stop_loss": trade.stop_loss,
-            "tp1": trade.tp1,
-            "tp2": trade.tp2,
-            "risk_percent": effective_risk,
-            "risk_percent_requested": requested_risk,
-            "rr": rr,
-            "exchange": exchange,
-            "environment": environment,
-            "api_base_url": api_base_url,
-            "message": f"Trade request accepted for {trade.coin} {trade.direction.upper()}.",
-            "user_message": (
-                f"Trade sent to Oracle Citadel ({exchange}, {environment}). "
-                f"{trade.coin} {trade.direction.upper()} · Entry {format_usd(trade.entry_price)}"
-            ),
-            "request_id": req_id,
-        },
+        status_code=502,
+        content=fail_body,
         headers={"X-Request-ID": req_id},
     )
-
 
 # Oracle Citadel execute — /api/* aliases prevent 404 (mirrors exchange_keys pattern)
 @app.post("/execute_trade")
