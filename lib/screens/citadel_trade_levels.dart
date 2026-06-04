@@ -28,7 +28,7 @@ class CitadelParsedLevels {
     'sl': 'Stop Loss',
   };
 
-  /// Missing fields required by Oracle Citadel execute flow.
+  /// All fields required to send to Oracle Citadel (dual TP execution).
   List<String> get missingLabels {
     final out = <String>[];
     if (entry == null) out.add(_labels['entry']!);
@@ -38,12 +38,26 @@ class CitadelParsedLevels {
     return out;
   }
 
+  /// Orange banner — only when Entry, SL, or both TPs are absent (not one TP alone).
+  List<String> get missingLabelsForPreview {
+    final out = <String>[];
+    if (entry == null) out.add(_labels['entry']!);
+    if (sl == null) out.add(_labels['sl']!);
+    if (tp1 == null && tp2 == null) {
+      out.add(_labels['tp1']!);
+      out.add(_labels['tp2']!);
+    }
+    return out;
+  }
+
   bool get isComplete => missingLabels.isEmpty;
+
+  bool get hasMinimumForPreview => missingLabelsForPreview.isEmpty;
 
   String? get userErrorMessage {
     if (isComplete) return null;
     return 'Could not find ${missingLabels.join(', ')} in this report. '
-        'Add TRADE LEVELS: Entry at \$X, TP1 at \$X, TP2 at \$X, SL at \$X (R:R X.X:1).';
+        'Add TRADE LEVELS: Entry at \$X, TP1 (40%) at \$X, TP2 (60%) at \$X, SL at \$X (R:R X.X:1).';
   }
 }
 
@@ -79,12 +93,18 @@ CitadelParsedLevels parseCitadelTradeLevels(String report) {
   double? sl;
   double? rr;
 
-  // Canonical: Entry at $X, TP1 at $X, TP2 at $X, SL at $X
+  // Canonical: Entry at $X, TP1 (40%) at $X, TP2 (60%) at $X, SL at $X
+  const tp1PctOpt = r'(?:\(\s*40\s*%?\s*(?:\s+of\s+position)?\s*\))?';
+  const tp2PctOpt = r'(?:\(\s*60\s*%?\s*(?:\s+of\s+position)?\s*\))?';
   final canonical = RegExp(
     r'entry\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)'
-    r'.{0,120}?tp\s*[-_]?\s*1\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)'
-    r'.{0,120}?tp\s*[-_]?\s*2\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)'
-    r'.{0,120}?s(?:top\s*[-_]?\s*loss|l)\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
+    r'.{0,160}?tp\s*[-_]?\s*1\s*' +
+        tp1PctOpt +
+        r'\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)'
+    r'.{0,160}?tp\s*[-_]?\s*2\s*' +
+        tp2PctOpt +
+        r'\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)'
+    r'.{0,160}?s(?:top\s*[-_]?\s*loss|l)\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
     caseSensitive: false,
     dotAll: true,
   );
@@ -97,10 +117,14 @@ CitadelParsedLevels parseCitadelTradeLevels(String report) {
   } else {
     // Alternate ordering: TP1, TP2, SL, then Entry
     final alt = RegExp(
-      r'tp\s*[-_]?\s*1\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)'
-      r'.{0,120}?tp\s*[-_]?\s*2\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)'
-      r'.{0,120}?s(?:top\s*[-_]?\s*loss|l)\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)'
-      r'.{0,120}?entry\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
+      r'tp\s*[-_]?\s*1\s*' +
+          tp1PctOpt +
+          r'\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)'
+      r'.{0,160}?tp\s*[-_]?\s*2\s*' +
+          tp2PctOpt +
+          r'\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)'
+      r'.{0,160}?s(?:top\s*[-_]?\s*loss|l)\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)'
+      r'.{0,160}?entry\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
       caseSensitive: false,
       dotAll: true,
     );
@@ -123,7 +147,11 @@ CitadelParsedLevels parseCitadelTradeLevels(String report) {
     RegExp(r'buy\s+(?:at|@|:)\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)', caseSensitive: false),
   ];
   final tp1Patterns = [
-    RegExp(r'tp\s*[-_]?\s*1\s*(?:at|@|:|is|=|-)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)', caseSensitive: false),
+    RegExp(
+      r'tp\s*[-_]?\s*1\s*(?:\(\s*40\s*%?\s*(?:\s+of\s+position)?\s*\))?\s*(?:at|@|:|is|=|-)?\s*\$?\s*'
+      r'([0-9][0-9,]*(?:\.[0-9]+)?)',
+      caseSensitive: false,
+    ),
     RegExp(
       r'take\s*[-_]?\s*profit\s*[-_]?\s*1\s*(?:at|@|:|is|=|-)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
       caseSensitive: false,
@@ -132,7 +160,11 @@ CitadelParsedLevels parseCitadelTradeLevels(String report) {
     RegExp(r't\.?p\.?\s*1\s*[=:]\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)', caseSensitive: false),
   ];
   final tp2Patterns = [
-    RegExp(r'tp\s*[-_]?\s*2\s*(?:at|@|:|is|=|-)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)', caseSensitive: false),
+    RegExp(
+      r'tp\s*[-_]?\s*2\s*(?:\(\s*60\s*%?\s*(?:\s+of\s+position)?\s*\))?\s*(?:at|@|:|is|=|-)?\s*\$?\s*'
+      r'([0-9][0-9,]*(?:\.[0-9]+)?)',
+      caseSensitive: false,
+    ),
     RegExp(
       r'take\s*[-_]?\s*profit\s*[-_]?\s*2\s*(?:at|@|:|is|=|-)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
       caseSensitive: false,

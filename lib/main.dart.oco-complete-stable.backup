@@ -1344,7 +1344,7 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
   @override
   Widget build(BuildContext context) {
     _previewLevels ??= parseCitadelTradeLevels(widget.reportText);
-    final incomplete = _previewLevels != null && !_previewLevels!.isComplete;
+    final incomplete = _previewLevels != null && !_previewLevels!.hasMinimumForPreview;
 
     if (!_isExpert) {
       return _ScaleTap(
@@ -1381,7 +1381,7 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
       );
     }
 
-    final missing = _previewLevels?.missingLabels ?? const <String>[];
+    final missing = _previewLevels?.missingLabelsForPreview ?? const <String>[];
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
