@@ -27,7 +27,7 @@ Endpoints (lib/main.dart):
 Price chain (analysis): Mobula → CoinGecko (aggressive) → Binance Spot/Futures
 Derivatives (/analyze): funding, OI, long/short ratio, liquidations (Binance Futures)
 Trade levels format (Oracle Citadel / Flutter parsing):
-  Entry at $X, TP1 at $X, TP2 at $X, SL at $X (R:R X.X:1)
+  Entry at $X, TP1 (40%) at $X, TP2 (60%) at $X, SL at $X (R:R X.X:1)
 """
 
 from __future__ import annotations
@@ -1126,16 +1126,16 @@ _LEVEL_LABELS = {
 # Canonical one-liner from trade-setup prompts (order may vary slightly in text).
 _CANONICAL_TRADE_LEVELS_RE = re.compile(
     r"entry\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
-    r".{0,120}?tp\s*[-_]?\s*1\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
-    r".{0,120}?tp\s*[-_]?\s*2\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
+    r".{0,120}?tp\s*[-_]?\s*1\s*(?:\(\s*40\s*%?\s*(?:\s+of\s+position)?\s*\))?\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
+    r".{0,120}?tp\s*[-_]?\s*2\s*(?:\(\s*60\s*%?\s*(?:\s+of\s+position)?\s*\))?\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
     r".{0,120}?s(?:top\s*[-_]?\s*loss|l)\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
     re.IGNORECASE | re.DOTALL,
 )
 
 # Alternate ordering: SL before Entry, etc.
 _CANONICAL_TRADE_LEVELS_ALT_RE = re.compile(
-    r"tp\s*[-_]?\s*1\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
-    r".{0,120}?tp\s*[-_]?\s*2\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
+    r"tp\s*[-_]?\s*1\s*(?:\(\s*40\s*%?\s*(?:\s+of\s+position)?\s*\))?\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
+    r".{0,120}?tp\s*[-_]?\s*2\s*(?:\(\s*60\s*%?\s*(?:\s+of\s+position)?\s*\))?\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
     r".{0,120}?s(?:top\s*[-_]?\s*loss|l)\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
     r".{0,120}?entry\s+at\s+\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
     re.IGNORECASE | re.DOTALL,
@@ -1154,7 +1154,8 @@ _LEVEL_FIELD_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     ],
     "tp1": [
         re.compile(
-            r"tp\s*[-_]?\s*1\s*(?:at|@|:|is|=|-)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+            r"tp\s*[-_]?\s*1\s*(?:\(\s*40\s*%?\s*(?:\s+of\s+position)?\s*\))?\s*(?:at|@|:|is|=|-)?\s*\$?\s*"
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)",
             re.IGNORECASE,
         ),
         re.compile(
@@ -1169,7 +1170,8 @@ _LEVEL_FIELD_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     ],
     "tp2": [
         re.compile(
-            r"tp\s*[-_]?\s*2\s*(?:at|@|:|is|=|-)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+            r"tp\s*[-_]?\s*2\s*(?:\(\s*60\s*%?\s*(?:\s+of\s+position)?\s*\))?\s*(?:at|@|:|is|=|-)?\s*\$?\s*"
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)",
             re.IGNORECASE,
         ),
         re.compile(
@@ -1293,7 +1295,7 @@ def trade_levels_error_message(levels: dict[str, Optional[float]]) -> Optional[s
         return None
     return (
         f"Could not parse {', '.join(missing)} from this report. "
-        "Include a TRADE LEVELS line: Entry at $X, TP1 at $X, TP2 at $X, SL at $X (R:R X.X:1)."
+        "Include a TRADE LEVELS line: Entry at $X, TP1 (40%) at $X, TP2 (60%) at $X, SL at $X (R:R X.X:1)."
     )
 
 
@@ -2775,8 +2777,8 @@ SCALP DOCTRINE (mandatory when proposing a scalp):
   ride cascade. OI rising into breakout = real; OI flat on rip = suspect.
 • SL: Beyond sweep wick / micro structure / VWAP failure — majors ~0.12–0.55%. State invalidation in
   price AND time ("dead after 12× 5m bars").
-• TP1: Nearest liquidity pool / partial fill of FVG — ≥{MIN_RR_TP1:.1f}:1 R:R (target {TARGET_RR_TP1:.1f}:1+).
-  TP2: Extension into next HTF pool only.
+• TP1 (40% of position): Nearest liquidity pool / partial fill of FVG — ≥{MIN_RR_TP1:.1f}:1 R:R
+  (target {TARGET_RR_TP1:.1f}:1+). TP2 (60% of position): Extension into next HTF pool only.
 • PSYCH: Note FOMO trap, chase risk, or "no edge until X clears" when applicable.
 • LABEL: **If I Were to Trade Today...** → "[Long/Short] SCALP Setup:" — trigger, invalidation, time-box.
 """
@@ -2823,9 +2825,10 @@ RULE 1 — RISK:REWARD & LEVEL PRECISION (NON-NEGOTIABLE)
 ═══════════════════════════════════════
 • Minimum {MIN_RR_TP1:.1f}:1 R:R on TP1 vs |Entry − SL|. Target {TARGET_RR_TP1:.1f}:1+. Never ship <2.0:1.
 • TRADE LEVELS — exact parser format (Oracle Citadel / Flutter):
-  Entry at $XXXXX, TP1 at $XXXXX, TP2 at $XXXXX, SL at $XXXXX (R:R X.X:1)
+  Entry at $XXXXX, TP1 (40%) at $XXXXX, TP2 (60%) at $XXXXX, SL at $XXXXX (R:R X.X:1)
   Then inline: Reward = |TP1 − Entry| = $X | Risk = |Entry − SL| = $X | R:R = X.X:1
-• TP1 = first high-probability liquidity objective. TP2 = structural extension / runner.
+• TP1 (40% of position) = first high-probability liquidity objective (Citadel MARKET closes 40% here).
+• TP2 (60% of position) = structural extension / runner (Citadel closes remaining 60% here).
 • SL = invalidation beyond sweep, OB loss, or VWAP failure — not arbitrary %.
 • No valid ≥{MIN_RR_TP1:.1f}:1 → OMIT **TRADE LEVELS**. Capital preservation is the veteran flex.
 
@@ -2909,7 +2912,7 @@ REPORT STRUCTURE — EXACT HEADINGS (Flutter — DO NOT rename or reorder)
 - 2-3 bullet points max.
 
 **TRADE LEVELS** (when applicable):
-Entry at $XXXXX, TP1 at $XXXXX, TP2 at $XXXXX, SL at $XXXXX (R:R X.X:1)
+Entry at $XXXXX, TP1 (40%) at $XXXXX, TP2 (60%) at $XXXXX, SL at $XXXXX (R:R X.X:1)
 
 **Disclaimer**: (exact line above)
 """
@@ -2926,7 +2929,8 @@ MODE: TRADE SETUP — ONE SHOT, EXECUTION-READY
   with the exact trigger that would unlock the trade (price + structure + derivatives reset).
 • **If I Were to Trade Today...** must read like a desk ticket: executable trigger, not commentary.
 • Confluence bar: VWAP + order blocks/FVGs + structure + momentum + funding/OI/L-S/liqs.
-• TP1 ≥ {MIN_RR_TP1:.1f}:1 (target {TARGET_RR_TP1:.1f}:1+). TP2 = next liquidity pool / HTF objective.
+• TP1 (40% of position) ≥ {MIN_RR_TP1:.1f}:1 (target {TARGET_RR_TP1:.1f}:1+). TP2 (60% of position) =
+  next liquidity pool / HTF objective.
 • Include invalidation price, optional runner logic, and leverage-awareness (cascade/squeeze risk).
 • Scalp TF: full SCALP DOCTRINE — no weak entries.
 """
@@ -3066,8 +3070,9 @@ REQUIRED BEHAVIOR:
   order flow, stop runs, liquidity pools.
 • TECHNICAL DEPTH: VWAP stack (session/prior/week/month), order blocks, FVGs, BOS/CHoCH, premium/discount,
   equal highs/lows, HTF/LTF alignment, macro risk-on/off for alts.
-• LEVELS (when user wants a trade): Entry at $X, TP1 at $X, TP2 at $X, SL at $X (R:R X.X:1).
-  Min {MIN_RR_TP1:.1f}:1 on TP1 (target {TARGET_RR_TP1:.1f}:1+). SL = structural invalidation.
+• LEVELS (when user wants a trade): Entry at $X, TP1 (40%) at $X, TP2 (60%) at $X, SL at $X (R:R X.X:1).
+  TP1 = 40% of position (min {MIN_RR_TP1:.1f}:1 R:R, target {TARGET_RR_TP1:.1f}:1+). TP2 = 60% runner.
+  SL = structural invalidation.
 • RISK & PSYCH: size for invalidation, FOMO/chase/revenge, event risk, when to stand down.
 • PROACTIVE DESK SERVICE — end EVERY reply with:
   — 1–2 sharp follow-up questions (specific, not generic), AND
@@ -3106,15 +3111,17 @@ def report_structure_block(*, coin: str, price: float, change_pct: float, mode: 
     if mode == "tradesetup":
         trade_block = f"""
 **TRADE LEVELS** (MANDATORY unless truly no edge — exact format, min {MIN_RR_TP1:.1f}:1 R:R, target {TARGET_RR_TP1:.1f}:1+):
-Entry at $XXXXX, TP1 at $XXXXX, TP2 at $XXXXX, SL at $XXXXX (R:R X.X:1)
+Entry at $XXXXX, TP1 (40%) at $XXXXX, TP2 (60%) at $XXXXX, SL at $XXXXX (R:R X.X:1)
 Reward = |TP1 − Entry| = $X | Risk = |Entry − SL| = $X | R:R = X.X:1
-TP1 = first liquidity pool / partial FVG fill. TP2 = HTF extension. SL = structural invalidation.
+TP1 (40% of position) = first liquidity pool / partial FVG fill. TP2 (60% of position) = HTF extension.
+SL = structural invalidation.
 """
     else:
         trade_block = f"""
 **TRADE LEVELS** (only if ≥{MIN_RR_TP1:.1f}:1 R:R edge exists — otherwise OMIT this section entirely):
-Entry at $XXXXX, TP1 at $XXXXX, TP2 at $XXXXX, SL at $XXXXX (R:R X.X:1)
+Entry at $XXXXX, TP1 (40%) at $XXXXX, TP2 (60%) at $XXXXX, SL at $XXXXX (R:R X.X:1)
 Reward = |TP1 − Entry| = $X | Risk = |Entry − SL| = $X | R:R = X.X:1
+TP1 (40% of position) = first target. TP2 (60% of position) = runner / HTF extension.
 """
 
     return f"""
@@ -3242,7 +3249,8 @@ CURRENT LIVE PRICE: {price_str} (raw: {price_raw} USD)
 SOURCE: {market.get('source', 'unknown')}
 {freshness_line}MANDATORY:
 • **Asset** line EXACTLY: {coin.upper()} | {price_str} | {change_pct:+.2f}%
-• Every Entry / TP1 / TP2 / SL vs {price_str} NOW — limits must name structure (OB, FVG, VWAP, pool).
+• Every Entry / TP1 (40%) / TP2 (60%) / SL vs {price_str} NOW — limits must name structure (OB, FVG, VWAP, pool).
+• **TRADE LEVELS** one-liner MUST use: Entry at $X, TP1 (40%) at $X, TP2 (60%) at $X, SL at $X (R:R X.X:1)
 • Entry within ~{max_entry_drift} of live for {'scalp' if scalp_mode else 'active'} unless limit at level.
 • Long: SL < Entry < TP1 ≤ TP2. Short: TP2 ≤ TP1 < Entry < SL. Show R:R math inline.
 
