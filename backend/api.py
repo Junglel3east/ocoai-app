@@ -120,6 +120,9 @@ BLOFIN_MARGIN_MODE = os.getenv("BLOFIN_MARGIN_MODE", "cross")
 EXECUTE_TRADE_MAX_RISK_PERCENT = 2.0
 EXECUTE_TRADE_DEFAULT_RISK_PERCENT = 1.0
 BLOFIN_POST_ORDER_CONFIRM_DELAY_SEC = 1.5
+# MARKET fill confirmation — poll order-detail after placement (fills can lag API orderId).
+BLOFIN_MARKET_FILL_CONFIRM_MAX_POLLS = 5
+BLOFIN_MARKET_FILL_CONFIRM_POLL_SEC = 0.6
 # Passphrase is required by BloFin REST auth; set on Railway or save per-user later.
 BLOFIN_PASSPHRASE = (os.getenv("BLOFIN_PASSPHRASE") or os.getenv("CITADEL_BLOFIN_PASSPHRASE") or "").strip()
 
@@ -2051,6 +2054,35 @@ def _blofin_calculate_order_size(
     return _blofin_format_contract_size(contracts, lot_size), meta
 
 
+def _blofin_coerce_contract_qty(value: Any) -> float:
+    """Parse BloFin contract qty fields (filledSize, size, etc.)."""
+    if value is None:
+        return 0.0
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _blofin_market_fill_satisfied(
+    *,
+    filled_size: Any = None,
+    filled_amount: Any = None,
+    state: Any = None,
+) -> bool:
+    """
+    True when the MARKET entry actually filled contracts (position can exist).
+    BloFin may return orderId with state=live and filledSize=0 before fill completes — poll until qty > 0.
+    (state is logged; partially_canceled with filledSize>0 still counts as filled.)
+    """
+    _ = state  # retained for callers / logs; fill qty is the gate
+    filled_qty = max(
+        _blofin_coerce_contract_qty(filled_size),
+        _blofin_coerce_contract_qty(filled_amount),
+    )
+    return filled_qty > 0
+
+
 def _blofin_fetch_order_detail(
     *,
     base_url: str,
@@ -2077,16 +2109,105 @@ def _blofin_fetch_order_detail(
         return {"ok": False, "http_status": http_status}
     row = _blofin_first_data_row(parsed)
     ok = http_status == 200 and str(parsed.get("code")) == "0"
+    filled_size = row.get("filledSize")
+    filled_amount = row.get("filled_amount")
+    state = row.get("state")
     return {
         "ok": ok,
         "http_status": http_status,
-        "state": row.get("state"),
-        "filled_size": row.get("filledSize"),
+        "state": state,
+        "filled_size": filled_size,
+        "filled_amount": filled_amount,
         "size": row.get("size"),
         "average_price": row.get("averagePrice"),
         "order_type": row.get("orderType"),
+        "fill_ok": ok and _blofin_market_fill_satisfied(
+            filled_size=filled_size,
+            filled_amount=filled_amount,
+            state=state,
+        ),
         "response": _blofin_safe_response_log(parsed),
     }
+
+
+async def _blofin_confirm_market_fill(
+    *,
+    base_url: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    inst_id: str,
+    order_id: str,
+    placement: dict[str, Any],
+    request_id: str = "?",
+) -> dict[str, Any]:
+    """
+    Wait for a real MARKET fill before Citadel reports success.
+    Uses placement row first, then polls GET order-detail (fills can lag orderId).
+    """
+    if _blofin_market_fill_satisfied(
+        filled_size=placement.get("filled_size"),
+        state=placement.get("state"),
+    ):
+        logger.info(
+            "execute_trade_market_fill_confirmed request_id=%s order_id=%s source=placement "
+            "state=%s filled=%s",
+            request_id,
+            order_id,
+            placement.get("state"),
+            placement.get("filled_size"),
+        )
+        return {
+            "fill_ok": True,
+            "ok": True,
+            "state": placement.get("state"),
+            "filled_size": placement.get("filled_size"),
+            "size": None,
+            "average_price": None,
+            "poll_attempt": 0,
+            "source": "placement",
+        }
+
+    await asyncio.sleep(BLOFIN_POST_ORDER_CONFIRM_DELAY_SEC)
+
+    last: dict[str, Any] = {"fill_ok": False, "ok": False}
+    for attempt in range(1, BLOFIN_MARKET_FILL_CONFIRM_MAX_POLLS + 1):
+        detail = _blofin_fetch_order_detail(
+            base_url=base_url,
+            api_key=api_key,
+            api_secret=api_secret,
+            passphrase=passphrase,
+            inst_id=inst_id,
+            order_id=order_id,
+            request_id=request_id,
+        )
+        last = {**detail, "poll_attempt": attempt, "source": "order_detail"}
+        if detail.get("fill_ok"):
+            logger.info(
+                "execute_trade_market_fill_confirmed request_id=%s order_id=%s source=order_detail "
+                "poll=%s state=%s filled=%s avg=%s",
+                request_id,
+                order_id,
+                attempt,
+                detail.get("state"),
+                detail.get("filled_size"),
+                detail.get("average_price"),
+            )
+            return last
+        if attempt < BLOFIN_MARKET_FILL_CONFIRM_MAX_POLLS:
+            await asyncio.sleep(BLOFIN_MARKET_FILL_CONFIRM_POLL_SEC)
+
+    logger.warning(
+        "execute_trade_market_fill_unconfirmed request_id=%s order_id=%s polls=%s "
+        "last_state=%s last_filled=%s last_ok=%s",
+        request_id,
+        order_id,
+        BLOFIN_MARKET_FILL_CONFIRM_MAX_POLLS,
+        last.get("state"),
+        last.get("filled_size"),
+        last.get("ok"),
+    )
+    return last
 
 
 def _blofin_place_order(
@@ -4366,15 +4487,15 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
         order_params = blofin_result.get("order_params") or {}
 
         if blofin_result.get("ok") and blofin_order_id:
-            # Optional post-placement confirmation — verify fill state in BloFin UI/backend.
-            await asyncio.sleep(BLOFIN_POST_ORDER_CONFIRM_DELAY_SEC)
-            confirm = _blofin_fetch_order_detail(
+            # Fill confirmation — success only when contracts actually filled (not just orderId).
+            confirm = await _blofin_confirm_market_fill(
                 base_url=api_base_url,
                 api_key=exchange_api_key,
                 api_secret=exchange_secret,
                 passphrase=passphrase,
                 inst_id=inst_id,
                 order_id=blofin_order_id,
+                placement=blofin_result,
                 request_id=req_id,
             )
             logger.info(
@@ -4382,8 +4503,57 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
                 req_id,
                 trade_id,
                 blofin_order_id,
-                confirm,
+                {
+                    "fill_ok": confirm.get("fill_ok"),
+                    "state": confirm.get("state"),
+                    "filled_size": confirm.get("filled_size"),
+                    "average_price": confirm.get("average_price"),
+                    "poll_attempt": confirm.get("poll_attempt"),
+                    "source": confirm.get("source"),
+                },
             )
+
+            if not confirm.get("fill_ok"):
+                logger.warning(
+                    "execute_trade_market_unfilled request_id=%s trade_id=%s order_id=%s "
+                    "environment=%s base_url=%s state=%s filled=%s order_size=%s",
+                    req_id,
+                    trade_id,
+                    blofin_order_id,
+                    environment,
+                    api_base_url,
+                    confirm.get("state"),
+                    confirm.get("filled_size"),
+                    order_size,
+                )
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "success": False,
+                        "status": "failed",
+                        "order_type": "market",
+                        "trade_id": trade_id,
+                        "order_id": blofin_order_id,
+                        "detail": (
+                            "BloFin accepted the MARKET order but no contracts were filled. "
+                            f"state={confirm.get('state')!s} filledSize={confirm.get('filled_size')!s}"
+                        ),
+                        "user_message": (
+                            "MARKET order was submitted to BloFin but did not fill — no position opened. "
+                            "Check Demo margin, minimum size, and that Citadel Demo mode matches your BloFin "
+                            f"account ({environment}). Order ID {blofin_order_id} may appear in order history only."
+                        ),
+                        "blofin_confirm": {
+                            "state": confirm.get("state"),
+                            "filled_size": confirm.get("filled_size"),
+                            "average_price": confirm.get("average_price"),
+                        },
+                        "api_base_url": api_base_url,
+                        "request_id": req_id,
+                    },
+                    headers={"X-Request-ID": req_id},
+                )
+
             logger.info(
                 "execute_trade_market_outcome request_id=%s trade_id=%s "
                 "Order placed successfully - Order ID: %s state=%s filled=%s avg=%s",
@@ -4395,7 +4565,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
                 confirm.get("average_price"),
             )
 
-            # Dual TP (40% / 60%) — separate order-tpsl legs after MARKET entry + SL on entry.
+            # Dual TP (40% / 60%) — separate order-tpsl legs after confirmed MARKET fill + SL on entry.
             position_size = (
                 confirm.get("filled_size")
                 or confirm.get("size")
