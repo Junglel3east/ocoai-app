@@ -1569,22 +1569,13 @@ def resolve_citadel_exchange_profile(
     use_demo_mode: bool,
 ) -> dict[str, Any]:
     """
-    BloFin Demo: only when exchange name contains 'blofin' AND use_demo_mode is True.
-    Coinbase, Kraken, Binance, etc. are unchanged (no demo base URL forced).
+    Oracle Citadel MARKET execution is BloFin-only. Empty/unspecified exchange defaults to BloFin
+    (demo host when use_demo_mode is True, live host otherwise).
     """
     raw = (exchange or "").strip().lower()
-    is_blofin = "blofin" in raw
+    is_blofin = "blofin" in raw or raw in ("", "unspecified")
 
-    if use_demo_mode and not is_blofin:
-        return {
-            "exchange": raw or "unspecified",
-            "environment": "live",
-            "api_base_url": None,
-            "blofin_demo": False,
-            "demo_rejected": True,
-        }
-
-    if is_blofin and use_demo_mode:
+    if use_demo_mode and is_blofin:
         return {
             "exchange": "blofin",
             "environment": "demo",
@@ -1602,6 +1593,15 @@ def resolve_citadel_exchange_profile(
             "demo_rejected": False,
         }
 
+    if use_demo_mode:
+        return {
+            "exchange": raw or "unspecified",
+            "environment": "live",
+            "api_base_url": None,
+            "blofin_demo": False,
+            "demo_rejected": True,
+        }
+
     return {
         "exchange": raw or "unspecified",
         "environment": "live",
@@ -1609,6 +1609,39 @@ def resolve_citadel_exchange_profile(
         "blofin_demo": False,
         "demo_rejected": False,
     }
+
+
+def _normalize_citadel_exchange_record(record: dict[str, Any]) -> dict[str, Any]:
+    """
+    Upgrade legacy Citadel rows saved with exchange='' / 'unspecified' to BloFin.
+    Citadel MARKET orders only execute on BloFin (demo or live).
+    """
+    exchange = str(record.get("exchange") or "").strip().lower()
+    api_base = str(record.get("api_base_url") or "").strip().lower()
+    use_demo = bool(record.get("use_demo_mode")) or "demo-trading-openapi.blofin.com" in api_base
+
+    if "blofin" in exchange and exchange not in ("", "unspecified"):
+        normalized = dict(record)
+        if use_demo:
+            normalized["exchange"] = "blofin"
+            normalized["environment"] = "demo"
+            normalized["api_base_url"] = BLOFIN_DEMO_API_BASE_URL
+            normalized["use_demo_mode"] = True
+        return normalized
+
+    if exchange in ("", "unspecified") or use_demo or "blofin" in api_base:
+        normalized = dict(record)
+        normalized["exchange"] = "blofin"
+        if use_demo:
+            normalized["environment"] = "demo"
+            normalized["api_base_url"] = BLOFIN_DEMO_API_BASE_URL
+            normalized["use_demo_mode"] = True
+        else:
+            normalized["environment"] = record.get("environment") or "live"
+            normalized["api_base_url"] = record.get("api_base_url") or BLOFIN_LIVE_API_BASE_URL
+        return normalized
+
+    return record
 
 
 def _normalize_exchange_keys_payload(raw: dict[str, Any]) -> dict[str, Any]:
@@ -1687,7 +1720,9 @@ def get_citadel_user_record(user_id: str) -> Optional[dict[str, Any]]:
     """Load saved Oracle Citadel credentials for [user_id] (no secrets returned in API)."""
     store = _load_citadel_key_store()
     record = store.get(user_id)
-    return record if isinstance(record, dict) else None
+    if not isinstance(record, dict):
+        return None
+    return _normalize_citadel_exchange_record(record)
 
 
 def _execute_trade_log_payload(body: dict[str, Any]) -> dict[str, Any]:

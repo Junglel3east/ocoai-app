@@ -1043,12 +1043,11 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
       if (exchangeKey.isNotEmpty && exchangeSecret.isNotEmpty) {
         await _persistCitadelUiPrefs();
         if (!mounted) return;
-        final exchangeForApi = _useDemoMode ? _kCitadelBlofinExchangeId : '';
         await _citadelLinkExchangeKeys(
           userId: OracleCitadelStore.userId,
           exchangeApiKey: exchangeKey,
           exchangeApiSecret: exchangeSecret,
-          exchange: exchangeForApi,
+          exchange: _kCitadelBlofinExchangeId,
           useDemoMode: _useDemoMode,
           riskPercent: risk,
         );
