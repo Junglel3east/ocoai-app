@@ -989,6 +989,7 @@ Future<void> _sendMarketOrder(
   required double riskPercent,
 }) async {
   if (!context.mounted) return;
+  final rootContext = Navigator.of(context, rootNavigator: true).context;
 
   ScaffoldMessenger.of(context).showSnackBar(
     SnackBar(
@@ -1011,13 +1012,14 @@ Future<void> _sendMarketOrder(
       leverage: leverage,
     );
 
-    if (!context.mounted) return;
     _showCitadelPostExecutionReviewDialog(
-      context,
+      rootContext,
       reportText: reportText,
       plannedEntry: plannedEntry,
       originalStopLoss: stopLoss,
       marketResult: result,
+      coin: coin,
+      direction: direction,
     );
   } on OracleCitadelException catch (e) {
     if (!context.mounted) return;
@@ -1184,8 +1186,10 @@ void _showCitadelPostExecutionReviewDialog(
   required double plannedEntry,
   required double originalStopLoss,
   required Map<String, dynamic> marketResult,
+  required String coin,
+  required String direction,
 }) {
-  WidgetsBinding.instance.addPostFrameCallback((_) {
+  Future.delayed(const Duration(milliseconds: 400), () {
     if (!context.mounted) return;
 
     final analysis = parseCitadelAnalysisSnapshot(reportText);
@@ -1208,8 +1212,9 @@ void _showCitadelPostExecutionReviewDialog(
     final originalSl = parseNum(reviewMap['original_stop_loss'] ?? originalStopLoss);
     final suggestedSl = parseNum(reviewMap['suggested_stop_loss'] ?? originalSl);
     final orderId = marketResult['order_id']?.toString();
-    final coin = marketResult['coin']?.toString() ?? '';
-    final direction = marketResult['direction']?.toString().toUpperCase() ?? '';
+    final displayCoin = marketResult['coin']?.toString() ?? coin;
+    final displayDirection =
+        (marketResult['direction']?.toString() ?? direction).toUpperCase();
 
     final confidence = analysis.confidencePercent;
     final grade = analysis.confluenceGrade;
@@ -1256,9 +1261,9 @@ void _showCitadelPostExecutionReviewDialog(
                                 color: Colors.white,
                               ),
                             ),
-                            if (coin.isNotEmpty)
+                            if (displayCoin.isNotEmpty)
                               Text(
-                                '$coin $direction · BloFin',
+                                '$displayCoin $displayDirection · BloFin',
                                 style: TextStyle(fontSize: 12.5, color: Colors.grey[400]),
                               ),
                           ],

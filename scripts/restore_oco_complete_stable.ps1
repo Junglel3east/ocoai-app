@@ -1,6 +1,7 @@
 # Restore On-Chain Oracle AI to the oco-complete-stable snapshot.
 # Use when you need to revert to the last known-good full build:
-#   Oracle Vision, Oracle Desk, Citadel leverage (setup + market dialog), BloFin live price.
+#   Oracle Vision, Oracle Desk, Citadel leverage + position size (setup + market dialog),
+#   post-fill success screen, BloFin live price, margin-safe order sizing.
 #
 # Usage (from repo root or scripts folder):
 #   .\scripts\restore_oco_complete_stable.ps1
