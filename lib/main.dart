@@ -683,6 +683,11 @@ abstract final class OracleCitadelStore {
     return prefs.getBool('citadel_exchange_linked') ?? false;
   }
 
+  static Future<void> clearExchangeLinked() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('citadel_exchange_linked', false);
+  }
+
   static Future<void> save({
     required String userId,
     required String apiKey,
@@ -858,6 +863,7 @@ abstract final class OracleCitadelService {
           headers: _authHeaders(),
           body: jsonEncode({
             'user_id': userId,
+            'app_api_key': OracleCitadelStore.apiKey,
             'api_key': exchangeApiKey,
             'api_secret': exchangeApiSecret,
           }),
@@ -869,6 +875,25 @@ abstract final class OracleCitadelService {
     final friendly = _parseUserMessage(response) ??
         'Could not save exchange keys (${response.statusCode}).';
     throw OracleCitadelException(friendly);
+  }
+
+  /// Confirms exchange keys exist on the Railway server (not just local prefs).
+  static Future<bool> verifyServerLinked() async {
+    if (!OracleCitadelStore.isConfigured) return false;
+    final uri = Uri.parse('$kCitadelBaseUrl/exchange_keys/status').replace(
+      queryParameters: {'user_id': OracleCitadelStore.userId},
+    );
+    try {
+      final response = await http
+          .get(uri, headers: _authHeaders())
+          .timeout(const Duration(seconds: 15));
+      if (response.statusCode == 200) return true;
+      debugPrint('[Citadel] server link check failed status=${response.statusCode}');
+      return false;
+    } catch (e) {
+      debugPrint('[Citadel] server link check error: $e');
+      return false;
+    }
   }
 
   /// MARKET-only Citadel execution — order_type + protective levels.
@@ -994,11 +1019,22 @@ Future<void> _sendMarketOrder(
     );
   } on OracleCitadelException catch (e) {
     if (!context.mounted) return;
+    if (e.errorCode == 'credentials_missing' || e.errorCode == 'credentials_mismatch') {
+      await OracleCitadelStore.clearExchangeLinked();
+    }
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(e.userMessage),
         backgroundColor: const Color(0xFFB71C1C),
         behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 8),
+        action: (e.errorCode == 'credentials_missing' || e.errorCode == 'credentials_mismatch')
+            ? SnackBarAction(
+                label: 'Setup',
+                textColor: Colors.white,
+                onPressed: () => showCitadelSetupDialog(context),
+              )
+            : null,
       ),
     );
   } catch (_) {
@@ -1572,6 +1608,29 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
       if (mounted) await showCitadelSetupDialog(context);
       await OracleCitadelStore.load();
       if (!OracleCitadelStore.isConfigured) return;
+    }
+
+    final serverLinked = await OracleCitadelService.verifyServerLinked();
+    if (!serverLinked) {
+      await OracleCitadelStore.clearExchangeLinked();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text(
+            'BloFin keys not found on server. Re-link in Oracle Citadel Setup (enter API Key + Secret, then Save).',
+          ),
+          backgroundColor: const Color(0xFFB71C1C),
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 8),
+          action: SnackBarAction(
+            label: 'Setup',
+            textColor: Colors.white,
+            onPressed: () => showCitadelSetupDialog(context),
+          ),
+        ),
+      );
+      if (mounted) await showCitadelSetupDialog(context);
+      return;
     }
 
     if (mounted) {

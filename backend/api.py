@@ -99,7 +99,8 @@ API_PORT = int(os.getenv("PORT", os.getenv("API_PORT", "8000")))
 
 # Oracle Citadel — exchange key storage (encrypted secrets on disk under backend/data/).
 CITADEL_ENCRYPTION_KEY = (os.getenv("CITADEL_ENCRYPTION_KEY") or "").strip()
-_CITADEL_DATA_DIR = _BACKEND_DIR / "data"
+# Mount a Railway volume at /data and set CITADEL_DATA_DIR=/data so keys survive redeploys.
+_CITADEL_DATA_DIR = Path(os.getenv("CITADEL_DATA_DIR", str(_BACKEND_DIR / "data")))
 _CITADEL_KEYS_FILE = _CITADEL_DATA_DIR / "exchange_keys.json"
 
 # BloFin Open API — demo/testnet uses a separate host from live production.
@@ -4422,7 +4423,95 @@ async def _handle_exchange_keys(http_request: Request) -> JSONResponse:
         )
 
 
+async def _handle_exchange_keys_status(http_request: Request) -> JSONResponse:
+    """GET /exchange_keys/status — verify server has linked keys for user_id (no secrets returned)."""
+    req_id = getattr(http_request.state, "request_id", "?")
+    header_app_key = (http_request.headers.get("X-API-Key") or http_request.headers.get("x-api-key") or "").strip()
+    user_id = (http_request.query_params.get("user_id") or "").strip()
+
+    if not user_id:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "linked": False,
+                "detail": "user_id query parameter is required.",
+                "user_message": "Citadel user id missing.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+    if not header_app_key:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "success": False,
+                "linked": False,
+                "detail": "X-API-Key header is required.",
+                "user_message": "App API Key is required. Open Oracle Citadel Setup and save your App API Key.",
+                "error_code": "credentials_missing",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    record = get_citadel_user_record(user_id)
+    if not record:
+        logger.info("exchange_keys_status_missing request_id=%s user_id=%s", req_id, user_id)
+        return JSONResponse(
+            status_code=404,
+            content={
+                "success": False,
+                "linked": False,
+                "detail": f"No exchange keys on file for user_id={user_id}.",
+                "user_message": "Exchange keys not found on server. Re-link BloFin keys in Oracle Citadel Setup.",
+                "error_code": "credentials_missing",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    stored_app_key = (record.get("app_api_key") or "").strip()
+    if not stored_app_key or stored_app_key != header_app_key:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "success": False,
+                "linked": False,
+                "detail": "X-API-Key does not match saved app_api_key for this user_id.",
+                "user_message": "App API Key mismatch. Re-save Oracle Citadel Setup with matching keys.",
+                "error_code": "credentials_mismatch",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": True,
+            "linked": True,
+            "user_id": user_id,
+            "exchange": record.get("exchange"),
+            "environment": record.get("environment"),
+            "use_demo_mode": bool(record.get("use_demo_mode")),
+            "api_base_url": record.get("api_base_url"),
+            "updated_at": record.get("updated_at"),
+            "request_id": req_id,
+        },
+        headers={"X-Request-ID": req_id},
+    )
+
+
 # Fixed Citadel key-save routes — /api/* aliases prevent 404 when clients prefix /api
+@app.get("/exchange_keys/status")
+@app.get("/exchange_keys/status/")
+@app.get("/api/exchange_keys/status")
+@app.get("/api/exchange_keys/status/")
+async def exchange_keys_status(http_request: Request) -> JSONResponse:
+    return await _handle_exchange_keys_status(http_request)
+
+
 @app.post("/exchange_keys")
 @app.post("/exchange_keys/")
 @app.post("/api/exchange_keys")
@@ -4529,7 +4618,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             content={
                 "success": False,
                 "detail": f"No exchange keys on file for user_id={user_id}.",
-                "user_message": "Exchange keys not found. Open Oracle Citadel Setup and link your exchange API keys.",
+                "user_message": "Exchange keys not found on server. Re-link BloFin keys in Oracle Citadel Setup (Save with API Key + Secret).",
                 "error_code": "credentials_missing",
                 "request_id": req_id,
             },

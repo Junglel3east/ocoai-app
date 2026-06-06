@@ -74,6 +74,7 @@ Future<void> _citadelLinkExchangeKeys({
         },
         body: jsonEncode({
           'user_id': userId,
+          'app_api_key': OracleCitadelStore.apiKey,
           'api_key': exchangeApiKey,
           'api_secret': exchangeApiSecret,
           'exchange': exchange,
