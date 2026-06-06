@@ -264,16 +264,141 @@ class _CitadelLegalDisclaimerCard extends StatelessWidget {
   }
 }
 
+/// Premium leverage selector — 1x–100x, persisted locally.
+class _CitadelLeverageSelector extends StatelessWidget {
+  final double leverage;
+  final bool enabled;
+  final ValueChanged<double> onChanged;
+
+  static const _presets = [1, 5, 10, 25, 50, 100];
+
+  const _CitadelLeverageSelector({
+    required this.leverage,
+    required this.enabled,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final rounded = leverage.round();
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+      decoration: BoxDecoration(
+        color: _kCitadelCard,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.22)),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xFF00BFFF).withValues(alpha: 0.06),
+            blurRadius: 14,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.tune_rounded, color: Color(0xFF00BFFF), size: 18),
+              const SizedBox(width: 8),
+              const Text(
+                'Preferred leverage',
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
+              ),
+              const Spacer(),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF00BFFF).withValues(alpha: 0.14),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.4)),
+                ),
+                child: Text(
+                  '${rounded}x',
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w900,
+                    color: Color(0xFF00BFFF),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              activeTrackColor: const Color(0xFF00BFFF),
+              inactiveTrackColor: Colors.grey[800],
+              thumbColor: const Color(0xFF00BFFF),
+              overlayColor: const Color(0xFF00BFFF).withValues(alpha: 0.12),
+              trackHeight: 4,
+            ),
+            child: Slider(
+              value: leverage.clamp(1, 100),
+              min: 1,
+              max: 100,
+              divisions: 99,
+              label: '${rounded}x',
+              onChanged: enabled ? onChanged : null,
+            ),
+          ),
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: _presets.map((preset) {
+              final selected = rounded == preset;
+              return GestureDetector(
+                onTap: enabled ? () => onChanged(preset.toDouble()) : null,
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 180),
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(10),
+                    color: selected
+                        ? const Color(0xFF00BFFF).withValues(alpha: 0.2)
+                        : Colors.black.withValues(alpha: 0.25),
+                    border: Border.all(
+                      color: selected
+                          ? const Color(0xFF00BFFF).withValues(alpha: 0.55)
+                          : Colors.grey[800]!,
+                    ),
+                  ),
+                  child: Text(
+                    '${preset}x',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w800,
+                      color: selected ? const Color(0xFF00BFFF) : Colors.grey[500],
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'Applied on BloFin before each Citadel MARKET order.',
+            style: TextStyle(fontSize: 11.5, color: Colors.grey[600], height: 1.35),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 /// Green "Connected" status — shown after successful exchange key save.
 class _CitadelConnectionStatusCard extends StatelessWidget {
   final String exchangeLabel;
   final bool demoMode;
   final DateTime lastConnected;
+  final int leverage;
 
   const _CitadelConnectionStatusCard({
     required this.exchangeLabel,
     required this.demoMode,
     required this.lastConnected,
+    required this.leverage,
   });
 
   @override
@@ -379,6 +504,21 @@ class _CitadelConnectionStatusCard extends StatelessWidget {
               Text(
                 'Last connected ${_formatCitadelLastConnected(lastConnected)}',
                 style: TextStyle(fontSize: 12.5, color: Colors.grey[400], height: 1.3),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Icon(Icons.bolt_rounded, size: 15, color: Colors.orange[200]),
+              const SizedBox(width: 6),
+              Text(
+                'Leverage: ${leverage}x',
+                style: TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.orange[100],
+                ),
               ),
             ],
           ),
@@ -788,6 +928,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
   bool _saveJustCompleted = false;
   String _connectedExchangeLabel = 'Exchange';
   DateTime? _lastConnectedAt;
+  double _leverage = 5;
 
   @override
   void initState() {
@@ -799,10 +940,12 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
     _riskController = TextEditingController(
       text: OracleCitadelStore.defaultRiskPercent.toString(),
     );
+    _leverage = OracleCitadelStore.defaultLeverage;
     _loadCitadelUiPrefs();
   }
 
   Future<void> _loadCitadelUiPrefs() async {
+    await OracleCitadelStore.load();
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;
 
@@ -819,7 +962,14 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
       _isExchangeLinked = linked && OracleCitadelStore.isConfigured;
       _connectedExchangeLabel = label;
       _lastConnectedAt = lastConnected;
+      _leverage = OracleCitadelStore.defaultLeverage;
     });
+  }
+
+  Future<void> _onLeverageChanged(double value) async {
+    if (!mounted) return;
+    setState(() => _leverage = value);
+    await OracleCitadelStore.saveLeverage(value);
   }
 
   Future<void> _persistConnectionStatus({
@@ -879,6 +1029,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
     final risk = double.tryParse(_riskController.text.trim()) ?? 1.0;
 
     try {
+      await OracleCitadelStore.saveLeverage(_leverage);
       await OracleCitadelStore.save(
         userId: _userIdController.text,
         apiKey: _apiKeyController.text,
@@ -1022,6 +1173,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                           exchangeLabel: _displayExchangeLabel,
                           demoMode: _useDemoMode,
                           lastConnected: _lastConnectedAt!,
+                          leverage: _leverage.round(),
                         ),
                         const SizedBox(height: 18),
                       ],
@@ -1062,6 +1214,12 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                         label: 'Risk % per trade',
                         controller: _riskController,
                         enabled: !_saving,
+                      ),
+                      const SizedBox(height: 14),
+                      _CitadelLeverageSelector(
+                        leverage: _leverage,
+                        enabled: !_saving,
+                        onChanged: _onLeverageChanged,
                       ),
                       const SizedBox(height: 8),
                       Container(

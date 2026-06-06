@@ -5,11 +5,11 @@
 - Watchlist coin search screen (TradingView-style symbol picker)
 - UI polish: spacing, empty states, fade-ins, scale-on-tap, premium page transitions
 - Dynamic Watchlist with + button (session memory) → Charts navigation
-- Bottom nav: Home, Analyze, Trade Setup, Charts, Portfolio (Alerts via Home AppBar bell)
+- Bottom nav: Home, Oracle Vision, Trade Setup, Charts, Oracle Desk (Alerts via Home AppBar bell)
 - Expert-plan AI Chat FAB on Home + report screens
 - Expert-plan Oracle Citadel: MARKET execution via /execute_trade (BloFin)
 - App logo: splash screen, Home AppBar, Profile header (assets/images/app_logo.png)
-- Professional Portfolio screen with mock holdings data
+- Oracle Desk — personal trading command center (watchlist bias, performance, setups)
 */
 import 'dart:convert';
 import 'dart:async';
@@ -29,7 +29,8 @@ import 'services/daily_analysis_store.dart';
 import 'services/market_movers_service.dart';
 import 'services/watchlist_binance_ws_service.dart';
 import 'services/notification_service.dart';
-import 'services/portfolio_service.dart';
+import 'services/oracle_desk_service.dart';
+import 'services/oracle_vision_service.dart';
 import 'services/user_profile_store.dart';
 import 'screens/edit_profile_screen.dart';
 import 'screens/profile_screen.dart' show kProfileBackgroundOrbHeight, kProfileBackgroundOrbOpacity;
@@ -37,11 +38,13 @@ import 'widgets/ai_chat_entry.dart';
 import 'widgets/background_illustration.dart';
 
 part 'screens/quick_analyze_screen.dart';
+part 'screens/oracle_vision_screen.dart';
 part 'screens/trade_setup_screen.dart';
 part 'screens/trade_performance_screen.dart';
 part 'screens/market_movers_screen.dart';
 part 'screens/citadel_trade_levels.dart';
 part 'screens/citadel_setup_dialog.dart';
+part 'screens/oracle_desk_screen.dart';
 
 const String kNewsApiKey = String.fromEnvironment(
   'NEWS_API_KEY',
@@ -649,10 +652,12 @@ abstract final class OracleCitadelStore {
   static const _userIdKey = 'citadel_user_id';
   static const _apiKeyKey = 'citadel_api_key';
   static const _riskPercentKey = 'citadel_risk_percent';
+  static const _leverageKey = 'citadel_leverage';
 
   static String userId = 'demo_user';
   static String apiKey = '';
   static double defaultRiskPercent = 1.0;
+  static double defaultLeverage = 5.0;
 
   static bool get isConfigured => userId.trim().isNotEmpty && apiKey.trim().isNotEmpty;
 
@@ -661,6 +666,21 @@ abstract final class OracleCitadelStore {
     userId = prefs.getString(_userIdKey) ?? 'demo_user';
     apiKey = prefs.getString(_apiKeyKey) ?? '';
     defaultRiskPercent = prefs.getDouble(_riskPercentKey) ?? 1.0;
+    defaultLeverage = prefs.getDouble(_leverageKey) ?? 5.0;
+    if (defaultLeverage < 1) defaultLeverage = 1;
+    if (defaultLeverage > 100) defaultLeverage = 100;
+  }
+
+  static Future<void> saveLeverage(double leverage) async {
+    defaultLeverage = leverage.clamp(1.0, 100.0);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_leverageKey, defaultLeverage);
+  }
+
+  static Future<bool> isBlofinLinked() async {
+    if (!isConfigured) return false;
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool('citadel_exchange_linked') ?? false;
   }
 
   static Future<void> save({
@@ -675,6 +695,7 @@ abstract final class OracleCitadelStore {
     await prefs.setString(_userIdKey, OracleCitadelStore.userId);
     await prefs.setString(_apiKeyKey, OracleCitadelStore.apiKey);
     await prefs.setDouble(_riskPercentKey, defaultRiskPercent);
+    await prefs.setDouble(_leverageKey, defaultLeverage);
   }
 }
 
@@ -686,6 +707,119 @@ class OracleCitadelException implements Exception {
 
   @override
   String toString() => userMessage;
+}
+
+/// Optional Citadel user id for analyze/live_price — enables BloFin mark price when linked.
+Map<String, dynamic> _analyzeCitadelContext() {
+  if (!OracleCitadelStore.isConfigured) return const {};
+  return {'user_id': OracleCitadelStore.userId};
+}
+
+abstract final class OracleLivePriceService {
+  static Future<Map<String, dynamic>?> fetch(String coin) async {
+    final upper = coin.trim().toUpperCase();
+    if (upper.isEmpty) return null;
+    final params = <String, String>{'coin': upper};
+    if (OracleCitadelStore.isConfigured) {
+      params['user_id'] = OracleCitadelStore.userId;
+    }
+    final uri = Uri.parse('$kBackendBaseUrl/live_price').replace(queryParameters: params);
+    try {
+      final response = await http.get(uri).timeout(const Duration(seconds: 12));
+      if (response.statusCode != 200) return null;
+      final data = jsonDecode(response.body);
+      if (data is! Map<String, dynamic> || data['success'] != true) return null;
+      final price = (data['price'] as num?)?.toDouble();
+      if (price == null || price <= 0) return null;
+      return data;
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+/// Compact live price row — shows BloFin label when backend source is BloFin.
+class OracleLivePriceStrip extends StatefulWidget {
+  final String coin;
+
+  const OracleLivePriceStrip({super.key, required this.coin});
+
+  @override
+  State<OracleLivePriceStrip> createState() => _OracleLivePriceStripState();
+}
+
+class _OracleLivePriceStripState extends State<OracleLivePriceStrip> {
+  Map<String, dynamic>? _quote;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(covariant OracleLivePriceStrip oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.coin != widget.coin) _load();
+  }
+
+  Future<void> _load() async {
+    setState(() => _loading = true);
+    final data = await OracleLivePriceService.fetch(widget.coin);
+    if (!mounted) return;
+    setState(() {
+      _quote = data;
+      _loading = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading && _quote == null) {
+      return const SizedBox(height: 22);
+    }
+    final price = (_quote?['price'] as num?)?.toDouble();
+    if (price == null) return const SizedBox.shrink();
+
+    final source = (_quote?['source'] ?? '').toString();
+    final isBlofin = source == 'blofin' || source == 'blofin_demo';
+    final change = (_quote?['change_24h_pct'] as num?)?.toDouble();
+    final changeColor = (change ?? 0) >= 0 ? const Color(0xFF00E676) : const Color(0xFFFF5252);
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Row(
+        children: [
+          Text(
+            _formatOraclePrice(price),
+            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w800, letterSpacing: -0.2),
+          ),
+          if (change != null) ...[
+            const SizedBox(width: 8),
+            Text(
+              '${change >= 0 ? '+' : ''}${change.toStringAsFixed(2)}%',
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: changeColor),
+            ),
+          ],
+          const Spacer(),
+          if (isBlofin)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(10),
+                color: const Color(0xFF00BFFF).withValues(alpha: 0.14),
+                border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.45)),
+              ),
+              child: const Text(
+                'BloFin',
+                style: TextStyle(fontSize: 10, fontWeight: FontWeight.w800, color: Color(0xFF00BFFF)),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
 }
 
 abstract final class OracleCitadelService {
@@ -746,6 +880,7 @@ abstract final class OracleCitadelService {
     required double tp1,
     required double tp2,
     required double riskPercent,
+    required double leverage,
   }) async {
     final uri = Uri.parse('$kCitadelBaseUrl/execute_trade');
     final payload = {
@@ -754,6 +889,7 @@ abstract final class OracleCitadelService {
       'direction': direction,
       'order_type': 'market',
       'risk_percent': riskPercent,
+      'leverage': leverage.round(),
       'stop_loss': stopLoss,
       'tp1': tp1,
       'tp2': tp2,
@@ -761,7 +897,7 @@ abstract final class OracleCitadelService {
       'entry_price': (tp1 + stopLoss) / 2,
     };
 
-    debugPrint('[Citadel] POST $uri MARKET coin=$coin direction=$direction');
+    debugPrint('[Citadel] POST $uri MARKET coin=$coin direction=$direction leverage=${leverage.round()}x');
 
     final response = await http
         .post(uri, headers: _authHeaders(), body: jsonEncode(payload))
@@ -834,6 +970,7 @@ Future<void> _sendMarketOrder(
       tp1: tp1,
       tp2: tp2,
       riskPercent: OracleCitadelStore.defaultRiskPercent,
+      leverage: OracleCitadelStore.defaultLeverage,
     );
 
     if (!context.mounted) return;
@@ -3324,7 +3461,12 @@ class _MainScreenState extends State<MainScreen> {
             onClearDailyAnalyses: clearDailyAnalyses,
             onRefreshDailyAnalyses: _refreshDailyAnalysesForHome,
           ),
-          QuickAnalyzeScreen(addToHistory: addToHistory),
+          OracleVisionScreen(
+            watchlist: _watchlist,
+            trades: trades,
+            history: history,
+            onTradeSetupGenerated: addTradeSetupResult,
+          ),
           TradeSetupScreen(
             coin: 'BTC',
             onTradeSetupGenerated: addTradeSetupResult,
@@ -3334,9 +3476,11 @@ class _MainScreenState extends State<MainScreen> {
             initialSymbol: _chartsSymbol,
             isTabActive: _selectedIndex == _tabCharts,
           ),
-          PortfolioScreen(
+          OracleDeskScreen(
             watchlist: _watchlist,
-            defaultWatchlist: _defaultWatchlist,
+            trades: trades,
+            history: history,
+            onTradeSetupGenerated: addTradeSetupResult,
           ),
         ],
       ),
@@ -3352,10 +3496,10 @@ class _MainScreenState extends State<MainScreen> {
         type: BottomNavigationBarType.fixed,
         items: const [
           BottomNavigationBarItem(icon: Icon(Icons.home_outlined), activeIcon: Icon(Icons.home), label: 'Home'),
-          BottomNavigationBarItem(icon: Icon(Icons.insert_chart_outlined), activeIcon: Icon(Icons.insert_chart), label: 'Analyze'),
+          BottomNavigationBarItem(icon: Icon(Icons.visibility_outlined), activeIcon: Icon(Icons.visibility), label: 'Oracle Vision'),
           BottomNavigationBarItem(icon: Icon(Icons.gps_fixed), activeIcon: Icon(Icons.gps_fixed), label: 'Trade Setup'),
           BottomNavigationBarItem(icon: Icon(Icons.bar_chart_outlined), activeIcon: Icon(Icons.bar_chart), label: 'Charts'),
-          BottomNavigationBarItem(icon: Icon(Icons.pie_chart_outline), activeIcon: Icon(Icons.pie_chart), label: 'Portfolio'),
+          BottomNavigationBarItem(icon: Icon(Icons.dashboard_customize_outlined), activeIcon: Icon(Icons.dashboard_customize), label: 'Oracle Desk'),
         ],
       ),
     );
@@ -5894,7 +6038,7 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
               'Unlimited Trade Setups',
               'AI Chat (limited)',
               'Push Notifications',
-              'Full Portfolio Tracking',
+              'Oracle Desk Command Center',
               'Export reports',
             ],
             isCurrent: _currentPlan == 'Premium',
@@ -6625,6 +6769,7 @@ class _AnalysisReportScreenState extends State<AnalysisReportScreen> {
           "system_prompt": grokSystemPrompt(mode: "analysis"),
           "refresh_price": true,
           "request_ts": DateTime.now().millisecondsSinceEpoch,
+          ..._analyzeCitadelContext(),
         },
       );
       if (response.statusCode == 200) {
@@ -7127,6 +7272,8 @@ class TradeSetupResultScreen extends StatefulWidget {
   final String timeframe;
   final String direction;
   final Function(Map<String, dynamic>) onTradeSetupGenerated;
+  /// Oracle Vision prefill — passed to backend for confluence-aware levels.
+  final int? convictionPct;
 
   const TradeSetupResultScreen({
     super.key,
@@ -7134,6 +7281,7 @@ class TradeSetupResultScreen extends StatefulWidget {
     required this.timeframe,
     required this.direction,
     required this.onTradeSetupGenerated,
+    this.convictionPct,
   });
 
   @override
@@ -7174,6 +7322,10 @@ class _TradeSetupResultScreenState extends State<TradeSetupResultScreen> {
       errorMessage = null;
     });
     try {
+      final visionHint = widget.convictionPct != null
+          ? '\n\nOracle Vision signal: ${widget.convictionPct}% confluence on ${widget.timeframe} ${widget.direction}. '
+              'Honor this bias when grading confluence and setting Entry, SL, TP1 (40% position), TP2 (60% position).'
+          : '';
       final response = await _postAnalyzeWithRetry(
         payload: {
           "coin": resolvedCoin,
@@ -7181,9 +7333,11 @@ class _TradeSetupResultScreenState extends State<TradeSetupResultScreen> {
           "timeframe": widget.timeframe,
           "direction": widget.direction,
           "report_style": "professional",
-          "system_prompt": grokSystemPrompt(mode: "tradesetup"),
+          "system_prompt": grokSystemPrompt(mode: "tradesetup") + visionHint,
           "refresh_price": true,
           "request_ts": DateTime.now().millisecondsSinceEpoch,
+          if (widget.convictionPct != null) "vision_confluence_pct": widget.convictionPct,
+          ..._analyzeCitadelContext(),
         },
       );
       if (response.statusCode == 200) {
@@ -7509,371 +7663,6 @@ class _ChartsScreenState extends State<ChartsScreen> {
   String _getTradingViewHTML(String symbol) {
     final sym = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
     return buildTradingViewHTML(sym, tvSymbol: CoinAccessPolicy.resolveTradingViewSymbol(sym));
-  }
-}
-
-// Portfolio screen — live Binance quotes + persisted holdings
-class PortfolioScreen extends StatefulWidget {
-  final List<String> watchlist;
-  final Set<String> defaultWatchlist;
-
-  const PortfolioScreen({
-    super.key,
-    required this.watchlist,
-    required this.defaultWatchlist,
-  });
-
-  @override
-  State<PortfolioScreen> createState() => _PortfolioScreenState();
-}
-
-class _PortfolioScreenState extends State<PortfolioScreen> {
-  PortfolioSnapshot? _snapshot;
-  bool _loading = true;
-  String? _error;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadPortfolio();
-  }
-
-  Future<void> _loadPortfolio() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
-    try {
-      final snap = await PortfolioService.fetchSnapshot(
-        watchlist: widget.watchlist,
-        defaultWatchlist: widget.defaultWatchlist,
-      );
-      if (mounted) {
-        setState(() {
-          _snapshot = snap;
-          _loading = false;
-        });
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _error = 'Could not refresh portfolio';
-          _loading = false;
-        });
-      }
-    }
-  }
-
-  String _formatUsd(double value) {
-    if (value >= 1000000) return '\$${(value / 1000000).toStringAsFixed(2)}M';
-    if (value >= 1000) {
-      return '\$${value.toStringAsFixed(0).replaceAllMapped(RegExp(r'(\d{1,3})(?=(\d{3})+(?!\d))'), (m) => '${m[1]},')}';
-    }
-    return '\$${value.toStringAsFixed(2)}';
-  }
-
-  String _formatPortfolioTime(DateTime time) {
-    final diff = DateTime.now().difference(time);
-    if (diff.inSeconds < 60) return 'just now';
-    if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
-    return '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}';
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final snap = _snapshot;
-
-    return Scaffold(
-      backgroundColor: const Color(0xFF0F0F0F),
-      appBar: AppBar(
-        title: const Text('Portfolio'),
-        backgroundColor: const Color(0xFF0F0F0F),
-        actions: [
-          IconButton(
-            tooltip: 'Refresh',
-            icon: _loading
-                ? const SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.refresh),
-            onPressed: _loading ? null : _loadPortfolio,
-          ),
-        ],
-      ),
-      body: AppScreenBody(
-        includeBottomNav: true,
-        child: _loading && snap == null
-            ? const Center(child: CircularProgressIndicator(color: Color(0xFF00BFFF)))
-            : RefreshIndicator(
-                color: const Color(0xFF00BFFF),
-                onRefresh: _loadPortfolio,
-                child: ListView(
-                  physics: const AlwaysScrollableScrollPhysics(
-                    parent: BouncingScrollPhysics(),
-                  ),
-                  padding: EdgeInsets.zero,
-                  children: [
-                    if (_error != null) ...[
-                      Text(_error!, style: const TextStyle(color: Color(0xFFFF5252), fontSize: 13)),
-                      const SizedBox(height: 12),
-                    ],
-                    if (snap != null) ...[
-                      _FadeIn(
-                        child: Container(
-                          width: double.infinity,
-                          padding: const EdgeInsets.all(22),
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              begin: Alignment.topLeft,
-                              end: Alignment.bottomRight,
-                              colors: [
-                                const Color(0xFF1A1A1A),
-                                const Color(0xFF00BFFF).withValues(alpha: 0.1),
-                              ],
-                            ),
-                            borderRadius: BorderRadius.circular(16),
-                            border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  Text(
-                                    'Total Portfolio Value',
-                                    style: TextStyle(fontSize: 13, color: Colors.grey[500], letterSpacing: 0.2),
-                                  ),
-                                  const Spacer(),
-                                  Text(
-                                    snap.usedLivePrices ? 'Live · Binance' : 'Estimated',
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      color: snap.usedLivePrices
-                                          ? const Color(0xFF00BFFF)
-                                          : Colors.grey[600],
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 10),
-                              Text(
-                                _formatUsd(snap.totalValueUsd),
-                                style: const TextStyle(
-                                  fontSize: 34,
-                                  fontWeight: FontWeight.bold,
-                                  letterSpacing: -0.5,
-                                ),
-                              ),
-                              const SizedBox(height: 12),
-                              Row(
-                                children: [
-                                  Icon(
-                                    snap.change24hPct >= 0 ? Icons.trending_up : Icons.trending_down,
-                                    size: 18,
-                                    color: snap.change24hPct >= 0
-                                        ? const Color(0xFF00E676)
-                                        : const Color(0xFFFF5252),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Text(
-                                    '${snap.change24hPct >= 0 ? '+' : ''}${snap.change24hPct.toStringAsFixed(2)}% (24h)',
-                                    style: TextStyle(
-                                      color: snap.change24hPct >= 0
-                                          ? const Color(0xFF00E676)
-                                          : const Color(0xFFFF5252),
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 14),
-                                  Text(
-                                    '${snap.change24hUsd >= 0 ? '+' : ''}${_formatUsd(snap.change24hUsd.abs())}',
-                                    style: TextStyle(fontSize: 13, color: Colors.grey[500]),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 8),
-                              Text(
-                                'Updated ${_formatPortfolioTime(snap.fetchedAt)}',
-                                style: TextStyle(fontSize: 11, color: Colors.grey[600]),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: _AppSpacing.section),
-                      _FadeIn(
-                        delay: const Duration(milliseconds: 80),
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            const Text('Holdings', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
-                            Text(
-                              '${snap.holdings.length} assets',
-                              style: TextStyle(fontSize: 12, color: Colors.grey[600]),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: _AppSpacing.item),
-                      ...List.generate(snap.holdings.length, (index) {
-                        final h = snap.holdings[index];
-                        return TweenAnimationBuilder<double>(
-                          tween: Tween(begin: 0, end: 1),
-                          duration: Duration(milliseconds: 300 + (index * 45).clamp(0, 220)),
-                          curve: Curves.easeOutCubic,
-                          builder: (context, value, child) => Opacity(
-                            opacity: value,
-                            child: Transform.translate(
-                              offset: Offset(0, (1 - value) * 10),
-                              child: child,
-                            ),
-                          ),
-                          child: _PortfolioHoldingCard(
-                            holding: h,
-                            formatUsd: _formatUsd,
-                          ),
-                        );
-                      }),
-                    ],
-                  ],
-                ),
-              ),
-      ),
-    );
-  }
-}
-
-class _PortfolioHoldingCard extends StatelessWidget {
-  final PortfolioHolding holding;
-  final String Function(double) formatUsd;
-
-  const _PortfolioHoldingCard({required this.holding, required this.formatUsd});
-
-  static Color _accentFor(String symbol) {
-    switch (symbol) {
-      case 'BTC':
-        return const Color(0xFFF7931A);
-      case 'ETH':
-        return const Color(0xFF627EEA);
-      case 'SOL':
-        return const Color(0xFF14F195);
-      default:
-        return const Color(0xFF00BFFF);
-    }
-  }
-
-  String _formatPrice(double price) {
-    if (price >= 1000) return '\$${price.toStringAsFixed(0)}';
-    if (price >= 1) return '\$${price.toStringAsFixed(2)}';
-    return '\$${price.toStringAsFixed(4)}';
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final isUp = holding.change24hPct >= 0;
-    final changeColor = isUp ? const Color(0xFF00E676) : const Color(0xFFFF5252);
-    final accent = _accentFor(holding.symbol);
-    final pnlPrefix = holding.pnl24hUsd >= 0 ? '+' : '';
-
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
-      child: _ScaleTap(
-        child: Card(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    CircleAvatar(
-                      backgroundColor: accent.withValues(alpha: 0.18),
-                      child: Text(
-                        holding.symbol.length >= 2
-                            ? holding.symbol.substring(0, 2)
-                            : holding.symbol,
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 11,
-                          color: accent,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 14),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            children: [
-                              Text(
-                                holding.symbol,
-                                style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
-                              ),
-                              const SizedBox(width: 8),
-                              Text(
-                                '${holding.allocationPct.toStringAsFixed(1)}%',
-                                style: TextStyle(fontSize: 11, color: Colors.grey[600]),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            '${holding.amount >= 1 ? holding.amount.toStringAsFixed(2) : holding.amount.toStringAsFixed(4)} · ${_formatPrice(holding.priceUsd)}',
-                            style: TextStyle(fontSize: 12, color: Colors.grey[500]),
-                          ),
-                        ],
-                      ),
-                    ),
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: [
-                        Text(
-                          formatUsd(holding.valueUsd),
-                          style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          '${isUp ? '+' : ''}${holding.change24hPct.toStringAsFixed(2)}%',
-                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: changeColor),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Text('24h P&L', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
-                    const Spacer(),
-                    Text(
-                      '$pnlPrefix${formatUsd(holding.pnl24hUsd.abs())}',
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                        color: changeColor,
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(3),
-                  child: LinearProgressIndicator(
-                    value: (holding.allocationPct / 100).clamp(0.02, 1.0),
-                    minHeight: 3,
-                    backgroundColor: Colors.white.withValues(alpha: 0.06),
-                    color: accent.withValues(alpha: 0.85),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
   }
 }
 

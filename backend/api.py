@@ -116,6 +116,8 @@ BLOFIN_ACCOUNT_BALANCE_PATH = "/api/v1/account/balance"
 BLOFIN_MARKET_INSTRUMENTS_PATH = "/api/v1/market/instruments"
 BLOFIN_MARKET_MARK_PRICE_PATH = "/api/v1/market/mark-price"
 BLOFIN_MARKET_TICKERS_PATH = "/api/v1/market/tickers"
+BLOFIN_SET_LEVERAGE_PATH = "/api/v1/account/set-leverage"
+BLOFIN_DEFAULT_LEVERAGE = 5
 BLOFIN_ORDER_SIZE = os.getenv("BLOFIN_ORDER_SIZE", "0.1")
 BLOFIN_MARGIN_MODE = os.getenv("BLOFIN_MARGIN_MODE", "cross")
 # Oracle Citadel execute_trade — demo risk guardrails (Flutter risk_percent capped here)
@@ -319,6 +321,7 @@ class ExecuteTradeRequest(BaseModel):
     tp1: float = Field(..., gt=0)
     tp2: float = Field(..., gt=0)
     risk_percent: float = Field(1.0, ge=0.1, le=100.0)
+    leverage: float = Field(float(BLOFIN_DEFAULT_LEVERAGE), ge=1.0, le=100.0)
     order_type: str = Field("market", max_length=16)
 
     @field_validator("user_id", "coin", "direction", mode="before")
@@ -1698,6 +1701,7 @@ def _execute_trade_log_payload(body: dict[str, Any]) -> dict[str, Any]:
         "tp1": body.get("tp1"),
         "tp2": body.get("tp2"),
         "risk_percent": body.get("risk_percent"),
+        "leverage": body.get("leverage"),
     }
 
 
@@ -2347,6 +2351,62 @@ async def _blofin_confirm_market_fill(
         last.get("ok"),
     )
     return last
+
+
+def _normalize_citadel_leverage(value: Any) -> int:
+    """Clamp Citadel leverage to BloFin-safe 1x–100x (default 5x)."""
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        parsed = BLOFIN_DEFAULT_LEVERAGE
+    return max(1, min(100, parsed))
+
+
+def _blofin_set_leverage(
+    *,
+    base_url: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    coin: str,
+    leverage: int,
+    request_id: str = "?",
+) -> dict[str, Any]:
+    """Set BloFin account leverage before MARKET placement (net / cross)."""
+    inst_id = _blofin_inst_id(coin)
+    body = {
+        "instId": inst_id,
+        "leverage": str(leverage),
+        "marginMode": BLOFIN_MARGIN_MODE,
+        "positionSide": "net",
+    }
+    http_status, raw_text, parsed = _blofin_private_request(
+        base_url=base_url,
+        api_key=api_key,
+        api_secret=api_secret,
+        passphrase=passphrase,
+        method="POST",
+        path=BLOFIN_SET_LEVERAGE_PATH,
+        body=body,
+        request_id=request_id,
+        log_tag="blofin_set_leverage",
+    )
+    ok = False
+    code: Any = None
+    msg: Optional[str] = None
+    if isinstance(parsed, dict):
+        code = parsed.get("code")
+        msg = parsed.get("msg")
+        ok = str(code) == "0"
+    return {
+        "ok": ok,
+        "http_status": http_status,
+        "code": code,
+        "msg": msg,
+        "leverage": leverage,
+        "inst_id": inst_id,
+        "response": _blofin_safe_response_log(parsed) if isinstance(parsed, dict) else (raw_text or "")[:500],
+    }
 
 
 def _blofin_place_order(
@@ -4644,15 +4704,47 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
         request_id=req_id,
     )
 
+    effective_leverage = _normalize_citadel_leverage(trade.leverage)
+
+    lev_result = _blofin_set_leverage(
+        base_url=api_base_url,
+        api_key=exchange_api_key,
+        api_secret=exchange_secret,
+        passphrase=passphrase,
+        coin=trade.coin,
+        leverage=effective_leverage,
+        request_id=req_id,
+    )
+    if lev_result.get("ok"):
+        logger.info("Leverage set to %sx on BloFin", effective_leverage)
+        logger.info(
+            "blofin_set_leverage_ok request_id=%s inst=%s margin=%s",
+            req_id,
+            inst_id,
+            BLOFIN_MARGIN_MODE,
+        )
+    else:
+        logger.warning(
+            "blofin_set_leverage_failed request_id=%s inst=%s leverage=%sx http=%s code=%s msg=%s "
+            "— continuing with MARKET order (exchange may use prior leverage)",
+            req_id,
+            inst_id,
+            effective_leverage,
+            lev_result.get("http_status"),
+            lev_result.get("code"),
+            lev_result.get("msg"),
+        )
+
     logger.info(
         "execute_trade_market_dispatch request_id=%s trade_id=%s blofin_base=%s inst=%s "
-        "reference_price=%.6f order_size=%s size_meta=%s",
+        "reference_price=%.6f order_size=%s leverage=%sx size_meta=%s",
         req_id,
         trade_id,
         api_base_url,
         inst_id,
         reference_price,
         order_size,
+        effective_leverage,
         size_meta,
     )
 
