@@ -2159,6 +2159,7 @@ def _blofin_calculate_order_size(
     entry_price: float,
     stop_loss: float,
     risk_percent: float,
+    leverage: float,
     base_url: str,
     api_key: str,
     api_secret: str,
@@ -2166,7 +2167,8 @@ def _blofin_calculate_order_size(
     request_id: str = "?",
 ) -> tuple[str, dict[str, Any]]:
     """
-    Risk-based contract count: risk_usdt = available * risk%; size from SL distance.
+    Position-size % of account → margin budget → notional (× leverage) → contracts.
+    Capped by available balance so BloFin never gets an impossible margin request.
     Falls back to env BLOFIN_ORDER_SIZE if balance unavailable (logged).
     """
     inst_id = _blofin_inst_id(coin)
@@ -2175,8 +2177,10 @@ def _blofin_calculate_order_size(
     min_size = float(spec["minSize"])
     lot_size = float(spec["lotSize"])
     max_market = float(spec["maxMarketSize"])
+    entry = float(entry_price)
+    sl_distance = abs(entry - float(stop_loss))
+    lev = max(1.0, float(leverage))
 
-    sl_distance = abs(float(entry_price) - float(stop_loss))
     meta: dict[str, Any] = {
         "inst_id": inst_id,
         "contract_value": contract_value,
@@ -2184,12 +2188,8 @@ def _blofin_calculate_order_size(
         "lot_size": lot_size,
         "sl_distance": sl_distance,
         "risk_percent": risk_percent,
+        "leverage": lev,
     }
-
-    if sl_distance <= 0:
-        size_str = _blofin_format_contract_size(min_size, lot_size)
-        meta["fallback"] = "invalid_sl_distance"
-        return size_str, meta
 
     available = _blofin_fetch_available_usdt(
         base_url=base_url,
@@ -2211,23 +2211,41 @@ def _blofin_calculate_order_size(
         )
         return _blofin_format_contract_size(fallback, lot_size), meta
 
-    risk_usdt = available * (risk_percent / 100.0)
-    loss_per_contract = sl_distance * contract_value
-    if loss_per_contract <= 0:
+    # Position size slider = % of available USDT deployed as margin (not SL-risk math).
+    margin_budget = available * (float(risk_percent) / 100.0)
+    margin_budget = min(margin_budget, available * 0.98)
+    notional_per_contract = entry * contract_value
+
+    if notional_per_contract <= 0:
         contracts = min_size
+        meta["fallback"] = "invalid_notional_per_contract"
     else:
-        contracts = risk_usdt / loss_per_contract
+        notional_target = margin_budget * lev
+        contracts = notional_target / notional_per_contract
+
+        # Hard cap: required margin must fit available balance (prevents 103003 insufficient margin).
+        max_margin = available * 0.98
+        max_contracts_by_balance = (max_margin * lev) / notional_per_contract
+        contracts = min(contracts, max_contracts_by_balance)
+
+        # Soft cap: if SL is very tight, don't oversize beyond loss implied by margin budget.
+        if sl_distance > 0:
+            loss_per_contract = sl_distance * contract_value
+            if loss_per_contract > 0:
+                max_by_sl = margin_budget / loss_per_contract
+                contracts = min(contracts, max_by_sl)
+                meta["loss_per_contract"] = loss_per_contract
 
     contracts = max(min_size, min(contracts, max_market))
-    steps = int(contracts / lot_size)
-    if steps < 1:
-        steps = 1
+    steps = max(1, int(contracts / lot_size))
     contracts = steps * lot_size
     meta.update(
         {
-            "risk_usdt": risk_usdt,
-            "loss_per_contract": loss_per_contract,
+            "margin_budget_usdt": margin_budget,
+            "notional_target_usdt": margin_budget * lev,
+            "notional_per_contract": notional_per_contract,
             "contracts": contracts,
+            "required_margin_usdt": (contracts * notional_per_contract) / lev if lev > 0 else None,
         }
     )
     return _blofin_format_contract_size(contracts, lot_size), meta
@@ -2700,6 +2718,11 @@ def _blofin_user_friendly_error(code: Any, msg: Optional[str]) -> str:
         return (
             "IP whitelist error - add your Railway server IP to BloFin Demo API settings "
             "(see whitelist_ip in the error response or Railway logs)."
+        )
+    if code_str == "103003" or "insufficient margin" in lower:
+        return (
+            "Insufficient margin on BloFin for this position size. "
+            "Lower position size % or leverage and try again."
         )
     return text or "BloFin could not place the MARKET order. Try again."
 
@@ -4824,18 +4847,6 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
         )
         reference_price = float(trade.entry_price)
 
-    order_size, size_meta = _blofin_calculate_order_size(
-        coin=trade.coin,
-        entry_price=reference_price,
-        stop_loss=trade.stop_loss,
-        risk_percent=effective_risk,
-        base_url=api_base_url,
-        api_key=exchange_api_key,
-        api_secret=exchange_secret,
-        passphrase=passphrase,
-        request_id=req_id,
-    )
-
     effective_leverage = _normalize_citadel_leverage(trade.leverage)
 
     lev_result = _blofin_set_leverage(
@@ -4866,6 +4877,19 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             lev_result.get("code"),
             lev_result.get("msg"),
         )
+
+    order_size, size_meta = _blofin_calculate_order_size(
+        coin=trade.coin,
+        entry_price=reference_price,
+        stop_loss=trade.stop_loss,
+        risk_percent=effective_risk,
+        leverage=effective_leverage,
+        base_url=api_base_url,
+        api_key=exchange_api_key,
+        api_secret=exchange_secret,
+        passphrase=passphrase,
+        request_id=req_id,
+    )
 
     logger.info(
         "execute_trade_market_dispatch request_id=%s trade_id=%s blofin_base=%s inst=%s "
