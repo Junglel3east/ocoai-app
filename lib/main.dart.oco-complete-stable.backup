@@ -5,11 +5,11 @@
 - Watchlist coin search screen (TradingView-style symbol picker)
 - UI polish: spacing, empty states, fade-ins, scale-on-tap, premium page transitions
 - Dynamic Watchlist with + button (session memory) → Charts navigation
-- Bottom nav: Home, Analyze, Trade Setup, Charts, Portfolio (Alerts via Home AppBar bell)
+- Bottom nav: Home, Oracle Vision, Trade Setup, Charts, Oracle Desk (Alerts via Home AppBar bell)
 - Expert-plan AI Chat FAB on Home + report screens
-- Expert-plan Oracle Citadel: Send trade setups to secure /execute_trade backend
+- Expert-plan Oracle Citadel: MARKET execution via /execute_trade (BloFin)
 - App logo: splash screen, Home AppBar, Profile header (assets/images/app_logo.png)
-- Professional Portfolio screen with mock holdings data
+- Oracle Desk — personal trading command center (watchlist bias, performance, setups)
 */
 import 'dart:convert';
 import 'dart:async';
@@ -25,10 +25,12 @@ import 'package:webview_flutter_android/webview_flutter_android.dart';
 import 'package:webview_flutter_wkwebview/webview_flutter_wkwebview.dart';
 
 import 'services/analysis_history_store.dart';
+import 'services/daily_analysis_store.dart';
 import 'services/market_movers_service.dart';
 import 'services/watchlist_binance_ws_service.dart';
 import 'services/notification_service.dart';
-import 'services/portfolio_service.dart';
+import 'services/oracle_desk_service.dart';
+import 'services/oracle_vision_service.dart';
 import 'services/user_profile_store.dart';
 import 'screens/edit_profile_screen.dart';
 import 'screens/profile_screen.dart' show kProfileBackgroundOrbHeight, kProfileBackgroundOrbOpacity;
@@ -36,11 +38,13 @@ import 'widgets/ai_chat_entry.dart';
 import 'widgets/background_illustration.dart';
 
 part 'screens/quick_analyze_screen.dart';
+part 'screens/oracle_vision_screen.dart';
 part 'screens/trade_setup_screen.dart';
 part 'screens/trade_performance_screen.dart';
 part 'screens/market_movers_screen.dart';
 part 'screens/citadel_trade_levels.dart';
 part 'screens/citadel_setup_dialog.dart';
+part 'screens/oracle_desk_screen.dart';
 
 const String kNewsApiKey = String.fromEnvironment(
   'NEWS_API_KEY',
@@ -648,10 +652,12 @@ abstract final class OracleCitadelStore {
   static const _userIdKey = 'citadel_user_id';
   static const _apiKeyKey = 'citadel_api_key';
   static const _riskPercentKey = 'citadel_risk_percent';
+  static const _leverageKey = 'citadel_leverage';
 
   static String userId = 'demo_user';
   static String apiKey = '';
   static double defaultRiskPercent = 1.0;
+  static double defaultLeverage = 5.0;
 
   static bool get isConfigured => userId.trim().isNotEmpty && apiKey.trim().isNotEmpty;
 
@@ -660,6 +666,21 @@ abstract final class OracleCitadelStore {
     userId = prefs.getString(_userIdKey) ?? 'demo_user';
     apiKey = prefs.getString(_apiKeyKey) ?? '';
     defaultRiskPercent = prefs.getDouble(_riskPercentKey) ?? 1.0;
+    defaultLeverage = prefs.getDouble(_leverageKey) ?? 5.0;
+    if (defaultLeverage < 1) defaultLeverage = 1;
+    if (defaultLeverage > 100) defaultLeverage = 100;
+  }
+
+  static Future<void> saveLeverage(double leverage) async {
+    defaultLeverage = leverage.clamp(1.0, 100.0);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_leverageKey, defaultLeverage);
+  }
+
+  static Future<bool> isBlofinLinked() async {
+    if (!isConfigured) return false;
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool('citadel_exchange_linked') ?? false;
   }
 
   static Future<void> save({
@@ -674,6 +695,7 @@ abstract final class OracleCitadelStore {
     await prefs.setString(_userIdKey, OracleCitadelStore.userId);
     await prefs.setString(_apiKeyKey, OracleCitadelStore.apiKey);
     await prefs.setDouble(_riskPercentKey, defaultRiskPercent);
+    await prefs.setDouble(_leverageKey, defaultLeverage);
   }
 }
 
@@ -685,6 +707,119 @@ class OracleCitadelException implements Exception {
 
   @override
   String toString() => userMessage;
+}
+
+/// Optional Citadel user id for analyze/live_price — enables BloFin mark price when linked.
+Map<String, dynamic> _analyzeCitadelContext() {
+  if (!OracleCitadelStore.isConfigured) return const {};
+  return {'user_id': OracleCitadelStore.userId};
+}
+
+abstract final class OracleLivePriceService {
+  static Future<Map<String, dynamic>?> fetch(String coin) async {
+    final upper = coin.trim().toUpperCase();
+    if (upper.isEmpty) return null;
+    final params = <String, String>{'coin': upper};
+    if (OracleCitadelStore.isConfigured) {
+      params['user_id'] = OracleCitadelStore.userId;
+    }
+    final uri = Uri.parse('$kBackendBaseUrl/live_price').replace(queryParameters: params);
+    try {
+      final response = await http.get(uri).timeout(const Duration(seconds: 12));
+      if (response.statusCode != 200) return null;
+      final data = jsonDecode(response.body);
+      if (data is! Map<String, dynamic> || data['success'] != true) return null;
+      final price = (data['price'] as num?)?.toDouble();
+      if (price == null || price <= 0) return null;
+      return data;
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+/// Compact live price row — shows BloFin label when backend source is BloFin.
+class OracleLivePriceStrip extends StatefulWidget {
+  final String coin;
+
+  const OracleLivePriceStrip({super.key, required this.coin});
+
+  @override
+  State<OracleLivePriceStrip> createState() => _OracleLivePriceStripState();
+}
+
+class _OracleLivePriceStripState extends State<OracleLivePriceStrip> {
+  Map<String, dynamic>? _quote;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(covariant OracleLivePriceStrip oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.coin != widget.coin) _load();
+  }
+
+  Future<void> _load() async {
+    setState(() => _loading = true);
+    final data = await OracleLivePriceService.fetch(widget.coin);
+    if (!mounted) return;
+    setState(() {
+      _quote = data;
+      _loading = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading && _quote == null) {
+      return const SizedBox(height: 22);
+    }
+    final price = (_quote?['price'] as num?)?.toDouble();
+    if (price == null) return const SizedBox.shrink();
+
+    final source = (_quote?['source'] ?? '').toString();
+    final isBlofin = source == 'blofin' || source == 'blofin_demo';
+    final change = (_quote?['change_24h_pct'] as num?)?.toDouble();
+    final changeColor = (change ?? 0) >= 0 ? const Color(0xFF00E676) : const Color(0xFFFF5252);
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Row(
+        children: [
+          Text(
+            _formatOraclePrice(price),
+            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w800, letterSpacing: -0.2),
+          ),
+          if (change != null) ...[
+            const SizedBox(width: 8),
+            Text(
+              '${change >= 0 ? '+' : ''}${change.toStringAsFixed(2)}%',
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: changeColor),
+            ),
+          ],
+          const Spacer(),
+          if (isBlofin)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(10),
+                color: const Color(0xFF00BFFF).withValues(alpha: 0.14),
+                border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.45)),
+              ),
+              child: const Text(
+                'BloFin',
+                style: TextStyle(fontSize: 10, fontWeight: FontWeight.w800, color: Color(0xFF00BFFF)),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
 }
 
 abstract final class OracleCitadelService {
@@ -736,56 +871,7 @@ abstract final class OracleCitadelService {
     throw OracleCitadelException(friendly);
   }
 
-  static Future<Map<String, dynamic>> executeTrade({
-    required String userId,
-    required String coin,
-    required String direction,
-    required double entryPrice,
-    required double stopLoss,
-    required double tp1,
-    required double tp2,
-    required double riskPercent,
-  }) async {
-    final uri = Uri.parse('$kCitadelBaseUrl/execute_trade');
-    final payload = {
-      'user_id': userId,
-      'coin': coin.toUpperCase(),
-      'direction': direction,
-      'entry_price': entryPrice,
-      'stop_loss': stopLoss,
-      'tp1': tp1,
-      'tp2': tp2,
-      'risk_percent': riskPercent,
-    };
-
-    debugPrint('[Citadel] POST $uri coin=$coin direction=$direction');
-
-    final response = await http
-        .post(uri, headers: _authHeaders(), body: jsonEncode(payload))
-        .timeout(const Duration(seconds: 90));
-
-    Map<String, dynamic> body = {};
-    try {
-      final decoded = jsonDecode(response.body);
-      if (decoded is Map<String, dynamic>) body = decoded;
-    } catch (_) {}
-
-    if (response.statusCode == 200) return body;
-
-    var friendly = _parseUserMessage(response) ??
-        body['user_message']?.toString() ??
-        'Trade could not be sent (${response.statusCode}).';
-    final whitelistIp = body['whitelist_ip']?.toString().trim();
-    if (whitelistIp != null && whitelistIp.isNotEmpty) {
-      friendly = '$friendly\n\nWhitelist this IP in BloFin Demo → API Management: $whitelistIp';
-    }
-    throw OracleCitadelException(
-      friendly,
-      errorCode: body['error_code']?.toString(),
-    );
-  }
-
-  /// Simplified MARKET payload — order_type + protective levels only (no limit entry).
+  /// MARKET-only Citadel execution — order_type + protective levels.
   static Future<Map<String, dynamic>> executeMarketOrder({
     required String userId,
     required String coin,
@@ -794,6 +880,7 @@ abstract final class OracleCitadelService {
     required double tp1,
     required double tp2,
     required double riskPercent,
+    required double leverage,
   }) async {
     final uri = Uri.parse('$kCitadelBaseUrl/execute_trade');
     final payload = {
@@ -802,6 +889,7 @@ abstract final class OracleCitadelService {
       'direction': direction,
       'order_type': 'market',
       'risk_percent': riskPercent,
+      'leverage': leverage.round(),
       'stop_loss': stopLoss,
       'tp1': tp1,
       'tp2': tp2,
@@ -809,7 +897,7 @@ abstract final class OracleCitadelService {
       'entry_price': (tp1 + stopLoss) / 2,
     };
 
-    debugPrint('[Citadel] POST $uri MARKET coin=$coin direction=$direction');
+    debugPrint('[Citadel] POST $uri MARKET coin=$coin direction=$direction leverage=${leverage.round()}x');
 
     final response = await http
         .post(uri, headers: _authHeaders(), body: jsonEncode(payload))
@@ -844,14 +932,24 @@ String citadelDirectionFromSetup(String selectedDirection, double entry, double 
   return sl < entry ? 'long' : 'short';
 }
 
-/// MARKET entry — separate simplified POST after user confirms in execution dialog.
+String _formatCitadelPrice(double value) {
+  if (value >= 1000) {
+    return '\$${value.toStringAsFixed(value >= 10000 ? 0 : 2)}';
+  }
+  return '\$${value.toStringAsFixed(4).replaceAll(RegExp(r'\.?0+$'), '')}';
+}
+
+/// MARKET entry — BloFin execution after user confirms in Citadel dialog.
 Future<void> _sendMarketOrder(
   BuildContext context,
   String coin,
   String direction, {
+  required String reportText,
+  required double plannedEntry,
   required double stopLoss,
   required double tp1,
   required double tp2,
+  required double leverage,
 }) async {
   if (!context.mounted) return;
 
@@ -873,6 +971,7 @@ Future<void> _sendMarketOrder(
       tp1: tp1,
       tp2: tp2,
       riskPercent: OracleCitadelStore.defaultRiskPercent,
+      leverage: leverage,
     );
 
     if (!context.mounted) return;
@@ -885,6 +984,13 @@ Future<void> _sendMarketOrder(
         behavior: SnackBarBehavior.floating,
         duration: const Duration(seconds: 5),
       ),
+    );
+    _showCitadelPostExecutionReviewDialog(
+      context,
+      reportText: reportText,
+      plannedEntry: plannedEntry,
+      originalStopLoss: stopLoss,
+      marketResult: result,
     );
   } on OracleCitadelException catch (e) {
     if (!context.mounted) return;
@@ -907,22 +1013,28 @@ Future<void> _sendMarketOrder(
   }
 }
 
-/// Premium execution choice — shown after green success banner (~800ms).
-void _showCitadelExecuteChoiceDialog(
+/// Oracle Citadel — MARKET execution confirmation (no limit orders).
+Future<void> _showCitadelExecuteChoiceDialog(
   BuildContext context, {
+  required String reportText,
   required String coin,
   required String direction,
+  required double plannedEntry,
   required double stopLoss,
   required double tp1,
   required double tp2,
-}) {
-  Future.delayed(const Duration(milliseconds: 800), () {
-    if (!context.mounted) return;
-    showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      barrierColor: Colors.black.withValues(alpha: 0.72),
-      builder: (dialogContext) => Dialog(
+}) async {
+  await OracleCitadelStore.load();
+  if (!context.mounted) return;
+
+  var leverage = OracleCitadelStore.defaultLeverage;
+
+  showDialog<void>(
+    context: context,
+    barrierDismissible: true,
+    barrierColor: Colors.black.withValues(alpha: 0.72),
+    builder: (dialogContext) => StatefulBuilder(
+      builder: (context, setDialogState) => Dialog(
         backgroundColor: const Color(0xFF141414),
         insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 28),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
@@ -939,10 +1051,10 @@ void _showCitadelExecuteChoiceDialog(
                     Container(
                       padding: const EdgeInsets.all(10),
                       decoration: BoxDecoration(
-                        color: Colors.amber.withValues(alpha: 0.12),
+                        color: const Color(0xFF43A047).withValues(alpha: 0.15),
                         borderRadius: BorderRadius.circular(12),
                       ),
-                      child: const Icon(Icons.bolt_rounded, color: Colors.amber, size: 24),
+                      child: const Icon(Icons.rocket_launch_rounded, color: Color(0xFF43A047), size: 24),
                     ),
                     const SizedBox(width: 14),
                     const Expanded(
@@ -950,7 +1062,7 @@ void _showCitadelExecuteChoiceDialog(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'How to Enter',
+                            'Oracle Citadel',
                             style: TextStyle(
                               fontSize: 20,
                               fontWeight: FontWeight.w800,
@@ -960,43 +1072,49 @@ void _showCitadelExecuteChoiceDialog(
                           ),
                           SizedBox(height: 4),
                           Text(
-                            'Your setup was sent · choose execution',
+                            'Market execution only · BloFin Demo',
                             style: TextStyle(fontSize: 13, color: Colors.grey),
                           ),
                         ],
                       ),
                     ),
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.grey),
+                      onPressed: () => Navigator.pop(dialogContext),
+                    ),
                   ],
                 ),
-                const SizedBox(height: 20),
-                _CitadelExecutionOptionTile(
-                  icon: Icons.tune_rounded,
-                  iconColor: const Color(0xFF00BFFF),
-                  title: 'Use AI Limit Order',
-                  subtitle:
-                      'Place at the exact Entry, TP1, TP2, and SL from your analysis. '
-                      'Best when you want precision and are willing to wait for fill.',
-                  badge: 'Default',
-                  onTap: () => Navigator.pop(dialogContext),
+                const SizedBox(height: 16),
+                Text(
+                  'Entry ${_formatCitadelPrice(plannedEntry)} · SL ${_formatCitadelPrice(stopLoss)}',
+                  style: TextStyle(fontSize: 13, color: Colors.grey[400], height: 1.4),
                 ),
-                const SizedBox(height: 12),
+                const SizedBox(height: 20),
                 _CitadelExecutionOptionTile(
                   icon: Icons.rocket_launch_rounded,
                   iconColor: const Color(0xFF43A047),
                   title: 'Execute as MARKET Order NOW',
                   subtitle:
-                      'Enter immediately at the current market price. '
-                      'Recommended if you do not want to miss the move — SL and targets still apply.',
+                      'Enter immediately at the current market price on BloFin. '
+                      'Stop loss is placed on entry; TP1 (40%) and TP2 (60%) legs follow fill.',
                   highlighted: true,
-                  onTap: () {
+                  leverage: leverage,
+                  onLeverageChanged: (value) => setDialogState(() => leverage = value),
+                  onTap: () async {
+                    final selectedLeverage = leverage.clamp(1.0, 100.0);
+                    await OracleCitadelStore.saveLeverage(selectedLeverage);
+                    if (!dialogContext.mounted) return;
                     Navigator.pop(dialogContext);
                     _sendMarketOrder(
                       context,
                       coin,
                       direction,
+                      reportText: reportText,
+                      plannedEntry: plannedEntry,
                       stopLoss: stopLoss,
                       tp1: tp1,
                       tp2: tp2,
+                      leverage: selectedLeverage,
                     );
                   },
                 ),
@@ -1005,6 +1123,183 @@ void _showCitadelExecuteChoiceDialog(
                   '$coin · ${direction.toUpperCase()}',
                   textAlign: TextAlign.center,
                   style: TextStyle(fontSize: 12, color: Colors.grey[600], letterSpacing: 0.3),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+/// Post-fill desk review — confluence + stop-loss guidance after MARKET success.
+void _showCitadelPostExecutionReviewDialog(
+  BuildContext context, {
+  required String reportText,
+  required double plannedEntry,
+  required double originalStopLoss,
+  required Map<String, dynamic> marketResult,
+}) {
+  Future.delayed(const Duration(milliseconds: 500), () {
+    if (!context.mounted) return;
+    final analysis = parseCitadelAnalysisSnapshot(reportText);
+    final review = marketResult['post_trade_review'];
+    final reviewMap = review is Map<String, dynamic> ? review : marketResult;
+
+    double parseNum(dynamic v) {
+      if (v is num) return v.toDouble();
+      return double.tryParse(v?.toString() ?? '') ?? 0;
+    }
+
+    final fillEntry = parseNum(
+      reviewMap['fill_entry_price'] ??
+          (marketResult['blofin_confirm'] is Map
+              ? (marketResult['blofin_confirm'] as Map)['average_price']
+              : null),
+    );
+    final planned = parseNum(reviewMap['planned_entry_price'] ?? plannedEntry);
+    final originalSl = parseNum(reviewMap['original_stop_loss'] ?? originalStopLoss);
+    final suggestedSl = parseNum(reviewMap['suggested_stop_loss'] ?? originalSl);
+
+    final confidence = analysis.confidencePercent;
+    final grade = analysis.confluenceGrade;
+    final slDrift = (suggestedSl - originalSl).abs() > 0.0001;
+    final entryDrift = fillEntry > 0 && (fillEntry - planned).abs() / planned > 0.002;
+
+    showDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      barrierColor: Colors.black.withValues(alpha: 0.75),
+      builder: (dialogContext) => Dialog(
+        backgroundColor: const Color(0xFF141414),
+        insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 28),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 400),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(22, 22, 22, 18),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text(
+                  'Position Live — Desk Review',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w800,
+                    color: Colors.white,
+                    letterSpacing: -0.3,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Your MARKET order filled on BloFin. Review confluence and stop placement.',
+                  style: TextStyle(fontSize: 13, color: Colors.grey[400], height: 1.45),
+                ),
+                const SizedBox(height: 18),
+                if (confidence != null || grade != null)
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1E2A1E),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: const Color(0xFF43A047).withValues(alpha: 0.35)),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Confluence (from your analysis)',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.green[200],
+                            letterSpacing: 0.2,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        if (confidence != null)
+                          Text(
+                            'Confidence: $confidence%',
+                            style: const TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.white,
+                            ),
+                          ),
+                        if (grade != null) ...[
+                          const SizedBox(height: 4),
+                          Text(
+                            'Grade: $grade',
+                            style: TextStyle(fontSize: 14, color: Colors.grey[300]),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                const SizedBox(height: 14),
+                Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1A1A2E),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.white12),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Stop loss reference',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.blue[200],
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      if (fillEntry > 0)
+                        Text(
+                          'Market fill (entry): ${_formatCitadelPrice(fillEntry)}'
+                          '${entryDrift ? ' — vs planned ${_formatCitadelPrice(planned)}' : ''}',
+                          style: const TextStyle(fontSize: 14, color: Colors.white, height: 1.4),
+                        ),
+                      const SizedBox(height: 6),
+                      Text(
+                        'Original SL (from setup): ${_formatCitadelPrice(originalSl)}',
+                        style: TextStyle(fontSize: 14, color: Colors.grey[300], height: 1.4),
+                      ),
+                      if (slDrift) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          'Suggested SL (same risk distance from fill): ${_formatCitadelPrice(suggestedSl)}',
+                          style: const TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700,
+                            color: Color(0xFFFFB74D),
+                            height: 1.4,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          'Adjust in BloFin if fill diverged from your planned entry.',
+                          style: TextStyle(fontSize: 12, color: Colors.grey[500], height: 1.35),
+                        ),
+                      ] else
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Text(
+                            'Stop distance matches your setup relative to fill.',
+                            style: TextStyle(fontSize: 12, color: Colors.grey[500]),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 18),
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('Done', style: TextStyle(fontWeight: FontWeight.w700)),
                 ),
               ],
             ),
@@ -1023,6 +1318,8 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
   final String subtitle;
   final String? badge;
   final bool highlighted;
+  final double? leverage;
+  final ValueChanged<double>? onLeverageChanged;
   final VoidCallback onTap;
 
   const _CitadelExecutionOptionTile({
@@ -1033,6 +1330,8 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
     required this.onTap,
     this.badge,
     this.highlighted = false,
+    this.leverage,
+    this.onLeverageChanged,
   });
 
   @override
@@ -1041,6 +1340,7 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
         ? const Color(0xFF43A047).withValues(alpha: 0.55)
         : Colors.grey[800]!;
     final bg = highlighted ? const Color(0xFF1B3320) : const Color(0xFF1E1E1E);
+    final roundedLeverage = leverage?.round() ?? 5;
 
     return Material(
       color: bg,
@@ -1092,6 +1392,53 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
                 subtitle,
                 style: TextStyle(fontSize: 13, height: 1.45, color: Colors.grey[500]),
               ),
+              if (highlighted && leverage != null && onLeverageChanged != null) ...[
+                const SizedBox(height: 14),
+                Container(
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.22),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: const Color(0xFF43A047).withValues(alpha: 0.25)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        children: [
+                          Icon(Icons.bolt_rounded, size: 16, color: Colors.orange[200]),
+                          const SizedBox(width: 6),
+                          Text(
+                            'Leverage: ${roundedLeverage}x',
+                            style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ],
+                      ),
+                      SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          activeTrackColor: const Color(0xFF43A047),
+                          inactiveTrackColor: Colors.grey[800],
+                          thumbColor: const Color(0xFF43A047),
+                          overlayColor: const Color(0xFF43A047).withValues(alpha: 0.12),
+                          trackHeight: 3,
+                        ),
+                        child: Slider(
+                          value: leverage!.clamp(1, 100),
+                          min: 1,
+                          max: 100,
+                          divisions: 99,
+                          label: '${roundedLeverage}x',
+                          onChanged: onLeverageChanged,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               if (highlighted) ...[
                 const SizedBox(height: 14),
                 SizedBox(
@@ -1176,7 +1523,6 @@ class SendToCitadelButton extends StatefulWidget {
 }
 
 class _SendToCitadelButtonState extends State<SendToCitadelButton> {
-  bool _sending = false;
   bool _validating = false;
   bool _isExpert = false;
   CitadelParsedLevels? _previewLevels;
@@ -1265,80 +1611,18 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
       return;
     }
 
-    setState(() {
-      _sending = true;
-      _sendErrorMessage = null;
-    });
-
-    try {
-      final direction = citadelDirectionFromSetup(widget.directionLabel, entry, sl);
-      final result = await OracleCitadelService.executeTrade(
-        userId: OracleCitadelStore.userId,
-        coin: widget.coin,
-        direction: direction,
-        entryPrice: entry,
-        stopLoss: sl,
-        tp1: tp1,
-        tp2: tp2,
-        riskPercent: OracleCitadelStore.defaultRiskPercent,
-      );
-
-      final status = result['status']?.toString() ?? '';
-
-      if (mounted) {
-        final isSuccess = status == 'success';
-        if (isSuccess) {
-          setState(() => _sendErrorMessage = null);
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('✅ Trade sent to Oracle Citadel'),
-              backgroundColor: Colors.green,
-              duration: Duration(seconds: 5),
-              behavior: SnackBarBehavior.floating,
-            ),
-          );
-          _showCitadelExecuteChoiceDialog(
-            context,
-            coin: widget.coin,
-            direction: direction,
-            stopLoss: sl,
-            tp1: tp1,
-            tp2: tp2,
-          );
-        } else {
-          final userMessage = result['user_message']?.toString() ??
-              result['message']?.toString() ??
-              'Trade could not be sent to Oracle Citadel.';
-          setState(() => _sendErrorMessage = userMessage);
-        }
-      }
-    } on OracleCitadelException catch (e) {
-      if (mounted) {
-        setState(() => _sendErrorMessage = e.userMessage);
-        if (e.errorCode == 'credentials_missing') {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(e.userMessage),
-              backgroundColor: const Color(0xFFB71C1C),
-              duration: const Duration(seconds: 5),
-              behavior: SnackBarBehavior.floating,
-              action: SnackBarAction(
-                label: 'Setup',
-                textColor: Colors.white,
-                onPressed: () => showCitadelSetupDialog(context),
-              ),
-            ),
-          );
-        }
-      }
-    } catch (_) {
-      if (mounted) {
-        setState(() => _sendErrorMessage =
-            'Cannot reach Oracle Citadel. Check your connection and try again.');
-      }
-    } finally {
-      if (mounted) setState(() => _sending = false);
-    }
+    final direction = citadelDirectionFromSetup(widget.directionLabel, entry, sl);
+    if (!mounted) return;
+    _showCitadelExecuteChoiceDialog(
+      context,
+      reportText: widget.reportText,
+      coin: widget.coin,
+      direction: direction,
+      plannedEntry: entry,
+      stopLoss: sl,
+      tp1: tp1,
+      tp2: tp2,
+    );
   }
 
   @override
@@ -1450,8 +1734,8 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
         SizedBox(
           width: double.infinity,
           child: ElevatedButton.icon(
-            onPressed: (_sending || _validating) ? null : _onPressed,
-            icon: (_sending || _validating)
+            onPressed: _validating ? null : _onPressed,
+            icon: _validating
                 ? const SizedBox(
                     width: 20,
                     height: 20,
@@ -1459,11 +1743,7 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
                   )
                 : const Icon(Icons.shield_outlined, size: 22),
             label: Text(
-              _validating
-                  ? 'Validating trade levels…'
-                  : _sending
-                      ? 'Sending to Citadel…'
-                      : 'Send to Oracle Citadel',
+              _validating ? 'Validating trade levels…' : 'Send to Oracle Citadel',
               style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
             ),
             style: ElevatedButton.styleFrom(
@@ -1792,15 +2072,19 @@ void _showExpertCoinUpgradePrompt(BuildContext context, String coin) {
   );
 }
 
-/// TradingView-style symbol search for adding coins to the Home watchlist.
+/// TradingView-style symbol search — watchlist add or pick-only (Trade Setup / Analyze).
 class WatchlistCoinSearchScreen extends StatefulWidget {
   final List<String> existingWatchlist;
   final ValueChanged<String> onCoinSelected;
+  final bool pickOnly;
+  final String title;
 
   const WatchlistCoinSearchScreen({
     super.key,
     required this.existingWatchlist,
     required this.onCoinSelected,
+    this.pickOnly = false,
+    this.title = 'Add Symbol',
   });
 
   @override
@@ -1854,14 +2138,14 @@ class _WatchlistCoinSearchScreenState extends State<WatchlistCoinSearchScreen> {
   Future<void> _selectCoin(String raw) async {
     final coin = await resolveCoinForCurrentPlan(context, raw);
     if (coin == null || !mounted) return;
-    if (widget.existingWatchlist.contains(coin)) {
+    if (!widget.pickOnly && widget.existingWatchlist.contains(coin)) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('$coin is already in your watchlist')),
       );
       return;
     }
     widget.onCoinSelected(coin);
-    Navigator.pop(context);
+    Navigator.pop(context, widget.pickOnly ? coin : null);
   }
 
   @override
@@ -1873,7 +2157,7 @@ class _WatchlistCoinSearchScreenState extends State<WatchlistCoinSearchScreen> {
       backgroundColor: const Color(0xFF0F0F0F),
       appBar: AppBar(
         backgroundColor: const Color(0xFF0F0F0F),
-        title: const Text('Add Symbol'),
+        title: Text(widget.title),
         leading: IconButton(
           icon: const Icon(Icons.close),
           onPressed: () => Navigator.pop(context),
@@ -1947,7 +2231,7 @@ class _WatchlistCoinSearchScreenState extends State<WatchlistCoinSearchScreen> {
                       color: inList ? Colors.grey[600] : const Color(0xFF00BFFF),
                       fontWeight: FontWeight.w600,
                     ),
-                    onPressed: inList ? null : () => _selectCoin(symbol),
+                    onPressed: (!widget.pickOnly && inList) ? null : () => _selectCoin(symbol),
                   );
                 },
               ),
@@ -2029,7 +2313,7 @@ class _WatchlistCoinSearchScreenState extends State<WatchlistCoinSearchScreen> {
                             trailing: inList
                                 ? Icon(Icons.check_circle, color: Colors.grey[600], size: 22)
                                 : const Icon(Icons.add, color: Color(0xFF00BFFF)),
-                            onTap: inList ? null : () => _selectCoin(symbol),
+                            onTap: (!widget.pickOnly && inList) ? null : () => _selectCoin(symbol),
                           ),
                         ),
                       );
@@ -2040,6 +2324,24 @@ class _WatchlistCoinSearchScreenState extends State<WatchlistCoinSearchScreen> {
       ),
     );
   }
+}
+
+/// Full symbol search modal — same UI as watchlist Add Symbol; returns chosen ticker.
+Future<String?> showCoinSymbolSearchModal(BuildContext context, {String? currentSymbol}) {
+  final normalized = currentSymbol != null && currentSymbol.trim().isNotEmpty
+      ? (CoinAccessPolicy.normalizeCoinSymbol(currentSymbol) ?? currentSymbol.trim().toUpperCase())
+      : null;
+  return Navigator.push<String>(
+    context,
+    _premiumPageRoute(
+      (_) => WatchlistCoinSearchScreen(
+        existingWatchlist: normalized != null ? [normalized] : const [],
+        pickOnly: true,
+        title: 'Select Symbol',
+        onCoinSelected: (_) {},
+      ),
+    ),
+  );
 }
 
 Future<void> openAiChat(BuildContext context) async {
@@ -2717,6 +3019,7 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   // Hive — Recent Analyses / trade setup history survives app restarts.
   await AnalysisHistoryStore.init();
+  await DailyAnalysisStore.init();
   await NotificationService.instance.initialize();
   pingBackendHealth();
   runApp(const OnChainOracleAI());
@@ -2792,20 +3095,44 @@ class _MainScreenState extends State<MainScreen> {
     OracleCitadelStore.load();
     UserProfileStore.load();
     NotificationService.instance.registerDailyAnalysesNavigator(_openDailyAnalysesFromNotification);
+    NotificationService.instance.onDailyAnalysisPayload = _ingestDailyAnalysisFromPush;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       NotificationService.instance.dispatchPendingDailyAnalysesNavigation();
+      _refreshDailyAnalysesForHome();
     });
   }
 
   @override
   void dispose() {
     NotificationService.instance.registerDailyAnalysesNavigator(null);
+    NotificationService.instance.onDailyAnalysisPayload = null;
     super.dispose();
+  }
+
+  Future<void> _ingestDailyAnalysisFromPush(Map<String, dynamic> data) async {
+    await DailyAnalysisStore.ingestNotificationPayload(data);
+    await _applyDailyAnalysesToHistory();
+  }
+
+  Future<void> _refreshDailyAnalysesForHome() async {
+    await DailyAnalysisStore.fetchAndPersistFromBackend(kBackendBaseUrl);
+    await _applyDailyAnalysesToHistory();
+  }
+
+  Future<void> _applyDailyAnalysesToHistory() async {
+    final merged = DailyAnalysisStore.mergeIntoHistory(history);
+    if (!mounted) return;
+    setState(() => history
+      ..clear()
+      ..addAll(merged));
+    await AnalysisHistoryStore.saveHistory(history);
+    _homeKey.currentState?.reloadDailyAnalysesFromParent();
   }
 
   /// Push notification → Home tab → Daily Analyses section.
   void _openDailyAnalysesFromNotification() {
     if (!mounted) return;
+    unawaited(_refreshDailyAnalysesForHome());
     setState(() => _selectedIndex = _tabHome);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _homeKey.currentState?.scrollToDailyAnalysesSection();
@@ -2858,9 +3185,17 @@ class _MainScreenState extends State<MainScreen> {
     _migrateAndPruneDailyAnalyses();
     _repairTradeHistoryLinks();
     await _refreshOpenTrades();
+    await DailyAnalysisStore.init();
+    final merged = DailyAnalysisStore.mergeIntoHistory(history);
+    if (mounted) {
+      history
+        ..clear()
+        ..addAll(merged);
+    }
     if (mounted) {
       await AnalysisHistoryStore.saveHistory(history);
       await AnalysisHistoryStore.saveTrades(trades);
+      _homeKey.currentState?.reloadDailyAnalysesFromParent();
     }
   }
 
@@ -2918,6 +3253,12 @@ class _MainScreenState extends State<MainScreen> {
   void addToHistory(String coin, String report) {
     final now = DateTime.now();
     final dayKey = _analysisDayKey(now);
+    unawaited(DailyAnalysisStore.upsert(
+      coin: coin,
+      report: report,
+      ingestSource: 'quick_analyze',
+      at: now,
+    ));
     setState(() {
       // New daily analyses replace yesterday's Quick Analyze rows only.
       _pruneAnalysisHistoryBeforeDay(dayKey);
@@ -2931,6 +3272,7 @@ class _MainScreenState extends State<MainScreen> {
       });
     });
     _persistHistory();
+    _homeKey.currentState?.reloadDailyAnalysesFromParent();
   }
 
   void addTradeSetupResult(Map<String, dynamic> payload) {
@@ -2977,6 +3319,9 @@ class _MainScreenState extends State<MainScreen> {
       final removed = history.where((item) => _historyIdsMatch(item['id'], id)).toList();
       history.removeWhere((item) => _historyIdsMatch(item['id'], id));
       for (final item in removed) {
+        if (item['source'] == 'analysis') {
+          unawaited(DailyAnalysisStore.removeCoin(item['coin']?.toString() ?? ''));
+        }
         if (item['source'] == 'trade_setup' && item['tradeId'] != null) {
           trades.removeWhere((t) => _historyIdsMatch(t['id'], item['tradeId']));
         }
@@ -2984,6 +3329,7 @@ class _MainScreenState extends State<MainScreen> {
     });
     _persistHistory();
     _persistTrades();
+    _homeKey.currentState?.reloadDailyAnalysesFromParent();
   }
 
   /// Trade Performance trash — removes trade and any linked history row.
@@ -3000,10 +3346,12 @@ class _MainScreenState extends State<MainScreen> {
 
   /// Clears only Quick Analyze rows — trade setups stay for Trade Performance.
   void clearDailyAnalyses() {
+    unawaited(DailyAnalysisStore.clearToday());
     setState(() {
       history.removeWhere((item) => item['source'] == 'analysis');
     });
     _persistHistory();
+    _homeKey.currentState?.reloadDailyAnalysesFromParent();
   }
 
   int get _winCount => trades.where((t) => t["status"] == "Win").length;
@@ -3177,8 +3525,14 @@ class _MainScreenState extends State<MainScreen> {
             resolveTradeHistory: _resolveHistoryForTrade,
             repairTradeHistoryLinks: _repairTradeHistoryLinks,
             onClearDailyAnalyses: clearDailyAnalyses,
+            onRefreshDailyAnalyses: _refreshDailyAnalysesForHome,
           ),
-          QuickAnalyzeScreen(addToHistory: addToHistory),
+          OracleVisionScreen(
+            watchlist: _watchlist,
+            trades: trades,
+            history: history,
+            onTradeSetupGenerated: addTradeSetupResult,
+          ),
           TradeSetupScreen(
             coin: 'BTC',
             onTradeSetupGenerated: addTradeSetupResult,
@@ -3188,9 +3542,11 @@ class _MainScreenState extends State<MainScreen> {
             initialSymbol: _chartsSymbol,
             isTabActive: _selectedIndex == _tabCharts,
           ),
-          PortfolioScreen(
+          OracleDeskScreen(
             watchlist: _watchlist,
-            defaultWatchlist: _defaultWatchlist,
+            trades: trades,
+            history: history,
+            onTradeSetupGenerated: addTradeSetupResult,
           ),
         ],
       ),
@@ -3206,10 +3562,10 @@ class _MainScreenState extends State<MainScreen> {
         type: BottomNavigationBarType.fixed,
         items: const [
           BottomNavigationBarItem(icon: Icon(Icons.home_outlined), activeIcon: Icon(Icons.home), label: 'Home'),
-          BottomNavigationBarItem(icon: Icon(Icons.insert_chart_outlined), activeIcon: Icon(Icons.insert_chart), label: 'Analyze'),
+          BottomNavigationBarItem(icon: Icon(Icons.visibility_outlined), activeIcon: Icon(Icons.visibility), label: 'Oracle Vision'),
           BottomNavigationBarItem(icon: Icon(Icons.gps_fixed), activeIcon: Icon(Icons.gps_fixed), label: 'Trade Setup'),
           BottomNavigationBarItem(icon: Icon(Icons.bar_chart_outlined), activeIcon: Icon(Icons.bar_chart), label: 'Charts'),
-          BottomNavigationBarItem(icon: Icon(Icons.pie_chart_outline), activeIcon: Icon(Icons.pie_chart), label: 'Portfolio'),
+          BottomNavigationBarItem(icon: Icon(Icons.dashboard_customize_outlined), activeIcon: Icon(Icons.dashboard_customize), label: 'Oracle Desk'),
         ],
       ),
     );
@@ -4138,6 +4494,7 @@ class HomeScreen extends StatefulWidget {
   final Map<String, dynamic>? Function(Map<String, dynamic> trade) resolveTradeHistory;
   final VoidCallback repairTradeHistoryLinks;
   final VoidCallback onClearDailyAnalyses;
+  final Future<void> Function() onRefreshDailyAnalyses;
 
   const HomeScreen({
     super.key,
@@ -4154,6 +4511,7 @@ class HomeScreen extends StatefulWidget {
     required this.resolveTradeHistory,
     required this.repairTradeHistoryLinks,
     required this.onClearDailyAnalyses,
+    required this.onRefreshDailyAnalyses,
   });
 
   @override
@@ -4162,6 +4520,7 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   bool _chatFabHidden = false;
+  List<Map<String, dynamic>> _dailyAnalysisItems = [];
 
   final GlobalKey<_DailyOracleBiasBlockState> _dailyBiasKey = GlobalKey<_DailyOracleBiasBlockState>();
   final GlobalKey<_HomeWatchlistSectionState> _watchlistKey = GlobalKey<_HomeWatchlistSectionState>();
@@ -4170,9 +4529,15 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Push notifications scroll target — Daily Analysis section on Home.
   final GlobalKey _dailyAnalysesSectionKey = GlobalKey();
 
-  /// Quick Analyze rows only (trade setups live on Trade Performance).
-  List<Map<String, dynamic>> get _dailyAnalysisItems =>
-      widget.history.where((item) => item['source'] == 'analysis').toList();
+  /// Reload today's BTC / ETH / SOL cards from local store (after push, pull-refresh, Quick Analyze).
+  void reloadDailyAnalysesFromParent() {
+    if (!mounted) return;
+    _reloadDailyAnalysisItems();
+  }
+
+  void _reloadDailyAnalysisItems() {
+    setState(() => _dailyAnalysisItems = DailyAnalysisStore.loadTodayOrdered());
+  }
 
   /// Called from MainScreen when user opens a daily-analysis notification.
   void scrollToDailyAnalysesSection() {
@@ -4189,12 +4554,21 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    _reloadDailyAnalysisItems();
     _loadChatFabPreference();
   }
 
-  /// Pull-to-refresh — bias, watchlist quotes, and news (no manual refresh buttons on bias).
+  @override
+  void didUpdateWidget(covariant HomeScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!listEquals(oldWidget.history, widget.history)) {
+      _reloadDailyAnalysisItems();
+    }
+  }
+
+  /// Pull-to-refresh — bias, watchlist, news, and persisted daily analyses.
   Future<void> _refreshHome() async {
-    final tasks = <Future<void>>[];
+    final tasks = <Future<void>>[widget.onRefreshDailyAnalyses()];
     final bias = _dailyBiasKey.currentState;
     if (bias != null) tasks.add(bias.reload());
     final watchlist = _watchlistKey.currentState;
@@ -4202,6 +4576,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final news = _homeNewsKey.currentState;
     if (news != null) tasks.add(news.refreshFromPull());
     await Future.wait(tasks);
+    if (mounted) _reloadDailyAnalysisItems();
   }
 
   Future<void> _loadChatFabPreference() async {
@@ -5458,7 +5833,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   _ProfileMenuTile(
                     icon: Icons.info_outline,
                     title: 'About',
-                    subtitle: 'On-Chain Oracle AI v1.0.0',
+                    subtitle: 'On-Chain Oracle AI v1.0.1',
                     onTap: () => _open(context, const AboutScreen()),
                   ),
                 ],
@@ -5556,6 +5931,7 @@ class _AccountScreenState extends State<AccountScreen> {
           OracleOrbHeroCard(
             displayName: UserProfileStore.displayName,
             subtitle: UserProfileStore.email,
+            profileImagePath: UserProfileStore.avatarPath,
           ),
           const SizedBox(height: _AppSpacing.section),
           const _SectionHeader(title: 'Profile Details'),
@@ -5728,7 +6104,7 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
               'Unlimited Trade Setups',
               'AI Chat (limited)',
               'Push Notifications',
-              'Full Portfolio Tracking',
+              'Oracle Desk Command Center',
               'Export reports',
             ],
             isCurrent: _currentPlan == 'Premium',
@@ -6295,8 +6671,8 @@ class HelpSupportScreen extends StatelessWidget {
 class AboutScreen extends StatelessWidget {
   const AboutScreen({super.key});
 
-  static const _appVersion = '1.0.0';
-  static const _buildNumber = '1';
+  static const _appVersion = '1.0.1';
+  static const _buildNumber = '2';
 
   @override
   Widget build(BuildContext context) {
@@ -6324,7 +6700,22 @@ class AboutScreen extends StatelessWidget {
                       borderRadius: BorderRadius.circular(20),
                       border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.3)),
                     ),
-                    child: const Icon(Icons.auto_graph, size: 42, color: Color(0xFF00BFFF)),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(20),
+                      child: Image.asset(
+                        kAppLogoAsset,
+                        width: 80,
+                        height: 80,
+                        fit: BoxFit.cover,
+                        filterQuality: FilterQuality.high,
+                        errorBuilder: (_, __, ___) => Image.asset(
+                          'assets/images/app_icon.png',
+                          width: 80,
+                          height: 80,
+                          fit: BoxFit.cover,
+                        ),
+                      ),
+                    ),
                   ),
                   const SizedBox(height: 16),
                   const Text(
@@ -6444,6 +6835,7 @@ class _AnalysisReportScreenState extends State<AnalysisReportScreen> {
           "system_prompt": grokSystemPrompt(mode: "analysis"),
           "refresh_price": true,
           "request_ts": DateTime.now().millisecondsSinceEpoch,
+          ..._analyzeCitadelContext(),
         },
       );
       if (response.statusCode == 200) {
@@ -6946,6 +7338,8 @@ class TradeSetupResultScreen extends StatefulWidget {
   final String timeframe;
   final String direction;
   final Function(Map<String, dynamic>) onTradeSetupGenerated;
+  /// Oracle Vision prefill — passed to backend for confluence-aware levels.
+  final int? convictionPct;
 
   const TradeSetupResultScreen({
     super.key,
@@ -6953,6 +7347,7 @@ class TradeSetupResultScreen extends StatefulWidget {
     required this.timeframe,
     required this.direction,
     required this.onTradeSetupGenerated,
+    this.convictionPct,
   });
 
   @override
@@ -6993,6 +7388,10 @@ class _TradeSetupResultScreenState extends State<TradeSetupResultScreen> {
       errorMessage = null;
     });
     try {
+      final visionHint = widget.convictionPct != null
+          ? '\n\nOracle Vision signal: ${widget.convictionPct}% confluence on ${widget.timeframe} ${widget.direction}. '
+              'Honor this bias when grading confluence and setting Entry, SL, TP1 (40% position), TP2 (60% position).'
+          : '';
       final response = await _postAnalyzeWithRetry(
         payload: {
           "coin": resolvedCoin,
@@ -7000,9 +7399,11 @@ class _TradeSetupResultScreenState extends State<TradeSetupResultScreen> {
           "timeframe": widget.timeframe,
           "direction": widget.direction,
           "report_style": "professional",
-          "system_prompt": grokSystemPrompt(mode: "tradesetup"),
+          "system_prompt": grokSystemPrompt(mode: "tradesetup") + visionHint,
           "refresh_price": true,
           "request_ts": DateTime.now().millisecondsSinceEpoch,
+          if (widget.convictionPct != null) "vision_confluence_pct": widget.convictionPct,
+          ..._analyzeCitadelContext(),
         },
       );
       if (response.statusCode == 200) {
@@ -7328,371 +7729,6 @@ class _ChartsScreenState extends State<ChartsScreen> {
   String _getTradingViewHTML(String symbol) {
     final sym = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
     return buildTradingViewHTML(sym, tvSymbol: CoinAccessPolicy.resolveTradingViewSymbol(sym));
-  }
-}
-
-// Portfolio screen — live Binance quotes + persisted holdings
-class PortfolioScreen extends StatefulWidget {
-  final List<String> watchlist;
-  final Set<String> defaultWatchlist;
-
-  const PortfolioScreen({
-    super.key,
-    required this.watchlist,
-    required this.defaultWatchlist,
-  });
-
-  @override
-  State<PortfolioScreen> createState() => _PortfolioScreenState();
-}
-
-class _PortfolioScreenState extends State<PortfolioScreen> {
-  PortfolioSnapshot? _snapshot;
-  bool _loading = true;
-  String? _error;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadPortfolio();
-  }
-
-  Future<void> _loadPortfolio() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
-    try {
-      final snap = await PortfolioService.fetchSnapshot(
-        watchlist: widget.watchlist,
-        defaultWatchlist: widget.defaultWatchlist,
-      );
-      if (mounted) {
-        setState(() {
-          _snapshot = snap;
-          _loading = false;
-        });
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _error = 'Could not refresh portfolio';
-          _loading = false;
-        });
-      }
-    }
-  }
-
-  String _formatUsd(double value) {
-    if (value >= 1000000) return '\$${(value / 1000000).toStringAsFixed(2)}M';
-    if (value >= 1000) {
-      return '\$${value.toStringAsFixed(0).replaceAllMapped(RegExp(r'(\d{1,3})(?=(\d{3})+(?!\d))'), (m) => '${m[1]},')}';
-    }
-    return '\$${value.toStringAsFixed(2)}';
-  }
-
-  String _formatPortfolioTime(DateTime time) {
-    final diff = DateTime.now().difference(time);
-    if (diff.inSeconds < 60) return 'just now';
-    if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
-    return '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}';
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final snap = _snapshot;
-
-    return Scaffold(
-      backgroundColor: const Color(0xFF0F0F0F),
-      appBar: AppBar(
-        title: const Text('Portfolio'),
-        backgroundColor: const Color(0xFF0F0F0F),
-        actions: [
-          IconButton(
-            tooltip: 'Refresh',
-            icon: _loading
-                ? const SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.refresh),
-            onPressed: _loading ? null : _loadPortfolio,
-          ),
-        ],
-      ),
-      body: AppScreenBody(
-        includeBottomNav: true,
-        child: _loading && snap == null
-            ? const Center(child: CircularProgressIndicator(color: Color(0xFF00BFFF)))
-            : RefreshIndicator(
-                color: const Color(0xFF00BFFF),
-                onRefresh: _loadPortfolio,
-                child: ListView(
-                  physics: const AlwaysScrollableScrollPhysics(
-                    parent: BouncingScrollPhysics(),
-                  ),
-                  padding: EdgeInsets.zero,
-                  children: [
-                    if (_error != null) ...[
-                      Text(_error!, style: const TextStyle(color: Color(0xFFFF5252), fontSize: 13)),
-                      const SizedBox(height: 12),
-                    ],
-                    if (snap != null) ...[
-                      _FadeIn(
-                        child: Container(
-                          width: double.infinity,
-                          padding: const EdgeInsets.all(22),
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              begin: Alignment.topLeft,
-                              end: Alignment.bottomRight,
-                              colors: [
-                                const Color(0xFF1A1A1A),
-                                const Color(0xFF00BFFF).withValues(alpha: 0.1),
-                              ],
-                            ),
-                            borderRadius: BorderRadius.circular(16),
-                            border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  Text(
-                                    'Total Portfolio Value',
-                                    style: TextStyle(fontSize: 13, color: Colors.grey[500], letterSpacing: 0.2),
-                                  ),
-                                  const Spacer(),
-                                  Text(
-                                    snap.usedLivePrices ? 'Live · Binance' : 'Estimated',
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      color: snap.usedLivePrices
-                                          ? const Color(0xFF00BFFF)
-                                          : Colors.grey[600],
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 10),
-                              Text(
-                                _formatUsd(snap.totalValueUsd),
-                                style: const TextStyle(
-                                  fontSize: 34,
-                                  fontWeight: FontWeight.bold,
-                                  letterSpacing: -0.5,
-                                ),
-                              ),
-                              const SizedBox(height: 12),
-                              Row(
-                                children: [
-                                  Icon(
-                                    snap.change24hPct >= 0 ? Icons.trending_up : Icons.trending_down,
-                                    size: 18,
-                                    color: snap.change24hPct >= 0
-                                        ? const Color(0xFF00E676)
-                                        : const Color(0xFFFF5252),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Text(
-                                    '${snap.change24hPct >= 0 ? '+' : ''}${snap.change24hPct.toStringAsFixed(2)}% (24h)',
-                                    style: TextStyle(
-                                      color: snap.change24hPct >= 0
-                                          ? const Color(0xFF00E676)
-                                          : const Color(0xFFFF5252),
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 14),
-                                  Text(
-                                    '${snap.change24hUsd >= 0 ? '+' : ''}${_formatUsd(snap.change24hUsd.abs())}',
-                                    style: TextStyle(fontSize: 13, color: Colors.grey[500]),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 8),
-                              Text(
-                                'Updated ${_formatPortfolioTime(snap.fetchedAt)}',
-                                style: TextStyle(fontSize: 11, color: Colors.grey[600]),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: _AppSpacing.section),
-                      _FadeIn(
-                        delay: const Duration(milliseconds: 80),
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            const Text('Holdings', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
-                            Text(
-                              '${snap.holdings.length} assets',
-                              style: TextStyle(fontSize: 12, color: Colors.grey[600]),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: _AppSpacing.item),
-                      ...List.generate(snap.holdings.length, (index) {
-                        final h = snap.holdings[index];
-                        return TweenAnimationBuilder<double>(
-                          tween: Tween(begin: 0, end: 1),
-                          duration: Duration(milliseconds: 300 + (index * 45).clamp(0, 220)),
-                          curve: Curves.easeOutCubic,
-                          builder: (context, value, child) => Opacity(
-                            opacity: value,
-                            child: Transform.translate(
-                              offset: Offset(0, (1 - value) * 10),
-                              child: child,
-                            ),
-                          ),
-                          child: _PortfolioHoldingCard(
-                            holding: h,
-                            formatUsd: _formatUsd,
-                          ),
-                        );
-                      }),
-                    ],
-                  ],
-                ),
-              ),
-      ),
-    );
-  }
-}
-
-class _PortfolioHoldingCard extends StatelessWidget {
-  final PortfolioHolding holding;
-  final String Function(double) formatUsd;
-
-  const _PortfolioHoldingCard({required this.holding, required this.formatUsd});
-
-  static Color _accentFor(String symbol) {
-    switch (symbol) {
-      case 'BTC':
-        return const Color(0xFFF7931A);
-      case 'ETH':
-        return const Color(0xFF627EEA);
-      case 'SOL':
-        return const Color(0xFF14F195);
-      default:
-        return const Color(0xFF00BFFF);
-    }
-  }
-
-  String _formatPrice(double price) {
-    if (price >= 1000) return '\$${price.toStringAsFixed(0)}';
-    if (price >= 1) return '\$${price.toStringAsFixed(2)}';
-    return '\$${price.toStringAsFixed(4)}';
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final isUp = holding.change24hPct >= 0;
-    final changeColor = isUp ? const Color(0xFF00E676) : const Color(0xFFFF5252);
-    final accent = _accentFor(holding.symbol);
-    final pnlPrefix = holding.pnl24hUsd >= 0 ? '+' : '';
-
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
-      child: _ScaleTap(
-        child: Card(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    CircleAvatar(
-                      backgroundColor: accent.withValues(alpha: 0.18),
-                      child: Text(
-                        holding.symbol.length >= 2
-                            ? holding.symbol.substring(0, 2)
-                            : holding.symbol,
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 11,
-                          color: accent,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 14),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            children: [
-                              Text(
-                                holding.symbol,
-                                style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
-                              ),
-                              const SizedBox(width: 8),
-                              Text(
-                                '${holding.allocationPct.toStringAsFixed(1)}%',
-                                style: TextStyle(fontSize: 11, color: Colors.grey[600]),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            '${holding.amount >= 1 ? holding.amount.toStringAsFixed(2) : holding.amount.toStringAsFixed(4)} · ${_formatPrice(holding.priceUsd)}',
-                            style: TextStyle(fontSize: 12, color: Colors.grey[500]),
-                          ),
-                        ],
-                      ),
-                    ),
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: [
-                        Text(
-                          formatUsd(holding.valueUsd),
-                          style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          '${isUp ? '+' : ''}${holding.change24hPct.toStringAsFixed(2)}%',
-                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: changeColor),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Text('24h P&L', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
-                    const Spacer(),
-                    Text(
-                      '$pnlPrefix${formatUsd(holding.pnl24hUsd.abs())}',
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                        color: changeColor,
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(3),
-                  child: LinearProgressIndicator(
-                    value: (holding.allocationPct / 100).clamp(0.02, 1.0),
-                    minHeight: 3,
-                    backgroundColor: Colors.white.withValues(alpha: 0.06),
-                    color: accent.withValues(alpha: 0.85),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
   }
 }
 

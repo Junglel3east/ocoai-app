@@ -949,6 +949,7 @@ Future<void> _sendMarketOrder(
   required double stopLoss,
   required double tp1,
   required double tp2,
+  required double leverage,
 }) async {
   if (!context.mounted) return;
 
@@ -970,7 +971,7 @@ Future<void> _sendMarketOrder(
       tp1: tp1,
       tp2: tp2,
       riskPercent: OracleCitadelStore.defaultRiskPercent,
-      leverage: OracleCitadelStore.defaultLeverage,
+      leverage: leverage,
     );
 
     if (!context.mounted) return;
@@ -1013,7 +1014,7 @@ Future<void> _sendMarketOrder(
 }
 
 /// Oracle Citadel — MARKET execution confirmation (no limit orders).
-void _showCitadelExecuteChoiceDialog(
+Future<void> _showCitadelExecuteChoiceDialog(
   BuildContext context, {
   required String reportText,
   required String coin,
@@ -1022,96 +1023,109 @@ void _showCitadelExecuteChoiceDialog(
   required double stopLoss,
   required double tp1,
   required double tp2,
-}) {
+}) async {
+  await OracleCitadelStore.load();
+  if (!context.mounted) return;
+
+  var leverage = OracleCitadelStore.defaultLeverage;
+
   showDialog<void>(
     context: context,
     barrierDismissible: true,
     barrierColor: Colors.black.withValues(alpha: 0.72),
-    builder: (dialogContext) => Dialog(
-      backgroundColor: const Color(0xFF141414),
-      insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 28),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 400),
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(22, 22, 22, 18),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(10),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF43A047).withValues(alpha: 0.15),
-                      borderRadius: BorderRadius.circular(12),
+    builder: (dialogContext) => StatefulBuilder(
+      builder: (context, setDialogState) => Dialog(
+        backgroundColor: const Color(0xFF141414),
+        insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 28),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 400),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(22, 22, 22, 18),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF43A047).withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: const Icon(Icons.rocket_launch_rounded, color: Color(0xFF43A047), size: 24),
                     ),
-                    child: const Icon(Icons.rocket_launch_rounded, color: Color(0xFF43A047), size: 24),
-                  ),
-                  const SizedBox(width: 14),
-                  const Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'Oracle Citadel',
-                          style: TextStyle(
-                            fontSize: 20,
-                            fontWeight: FontWeight.w800,
-                            color: Colors.white,
-                            letterSpacing: -0.3,
+                    const SizedBox(width: 14),
+                    const Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Oracle Citadel',
+                            style: TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.white,
+                              letterSpacing: -0.3,
+                            ),
                           ),
-                        ),
-                        SizedBox(height: 4),
-                        Text(
-                          'Market execution only · BloFin Demo',
-                          style: TextStyle(fontSize: 13, color: Colors.grey),
-                        ),
-                      ],
+                          SizedBox(height: 4),
+                          Text(
+                            'Market execution only · BloFin Demo',
+                            style: TextStyle(fontSize: 13, color: Colors.grey),
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.close, color: Colors.grey),
-                    onPressed: () => Navigator.pop(dialogContext),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'Entry ${_formatCitadelPrice(plannedEntry)} · SL ${_formatCitadelPrice(stopLoss)}',
-                style: TextStyle(fontSize: 13, color: Colors.grey[400], height: 1.4),
-              ),
-              const SizedBox(height: 20),
-              _CitadelExecutionOptionTile(
-                icon: Icons.rocket_launch_rounded,
-                iconColor: const Color(0xFF43A047),
-                title: 'Execute as MARKET Order NOW',
-                subtitle:
-                    'Enter immediately at the current market price on BloFin. '
-                    'Stop loss is placed on entry; TP1 (40%) and TP2 (60%) legs follow fill.',
-                highlighted: true,
-                onTap: () {
-                  Navigator.pop(dialogContext);
-                  _sendMarketOrder(
-                    context,
-                    coin,
-                    direction,
-                    reportText: reportText,
-                    plannedEntry: plannedEntry,
-                    stopLoss: stopLoss,
-                    tp1: tp1,
-                    tp2: tp2,
-                  );
-                },
-              ),
-              const SizedBox(height: 8),
-              Text(
-                '$coin · ${direction.toUpperCase()}',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 12, color: Colors.grey[600], letterSpacing: 0.3),
-              ),
-            ],
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.grey),
+                      onPressed: () => Navigator.pop(dialogContext),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'Entry ${_formatCitadelPrice(plannedEntry)} · SL ${_formatCitadelPrice(stopLoss)}',
+                  style: TextStyle(fontSize: 13, color: Colors.grey[400], height: 1.4),
+                ),
+                const SizedBox(height: 20),
+                _CitadelExecutionOptionTile(
+                  icon: Icons.rocket_launch_rounded,
+                  iconColor: const Color(0xFF43A047),
+                  title: 'Execute as MARKET Order NOW',
+                  subtitle:
+                      'Enter immediately at the current market price on BloFin. '
+                      'Stop loss is placed on entry; TP1 (40%) and TP2 (60%) legs follow fill.',
+                  highlighted: true,
+                  leverage: leverage,
+                  onLeverageChanged: (value) => setDialogState(() => leverage = value),
+                  onTap: () async {
+                    final selectedLeverage = leverage.clamp(1.0, 100.0);
+                    await OracleCitadelStore.saveLeverage(selectedLeverage);
+                    if (!dialogContext.mounted) return;
+                    Navigator.pop(dialogContext);
+                    _sendMarketOrder(
+                      context,
+                      coin,
+                      direction,
+                      reportText: reportText,
+                      plannedEntry: plannedEntry,
+                      stopLoss: stopLoss,
+                      tp1: tp1,
+                      tp2: tp2,
+                      leverage: selectedLeverage,
+                    );
+                  },
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '$coin · ${direction.toUpperCase()}',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 12, color: Colors.grey[600], letterSpacing: 0.3),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -1304,6 +1318,8 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
   final String subtitle;
   final String? badge;
   final bool highlighted;
+  final double? leverage;
+  final ValueChanged<double>? onLeverageChanged;
   final VoidCallback onTap;
 
   const _CitadelExecutionOptionTile({
@@ -1314,6 +1330,8 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
     required this.onTap,
     this.badge,
     this.highlighted = false,
+    this.leverage,
+    this.onLeverageChanged,
   });
 
   @override
@@ -1322,6 +1340,7 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
         ? const Color(0xFF43A047).withValues(alpha: 0.55)
         : Colors.grey[800]!;
     final bg = highlighted ? const Color(0xFF1B3320) : const Color(0xFF1E1E1E);
+    final roundedLeverage = leverage?.round() ?? 5;
 
     return Material(
       color: bg,
@@ -1373,6 +1392,53 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
                 subtitle,
                 style: TextStyle(fontSize: 13, height: 1.45, color: Colors.grey[500]),
               ),
+              if (highlighted && leverage != null && onLeverageChanged != null) ...[
+                const SizedBox(height: 14),
+                Container(
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.22),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: const Color(0xFF43A047).withValues(alpha: 0.25)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        children: [
+                          Icon(Icons.bolt_rounded, size: 16, color: Colors.orange[200]),
+                          const SizedBox(width: 6),
+                          Text(
+                            'Leverage: ${roundedLeverage}x',
+                            style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ],
+                      ),
+                      SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          activeTrackColor: const Color(0xFF43A047),
+                          inactiveTrackColor: Colors.grey[800],
+                          thumbColor: const Color(0xFF43A047),
+                          overlayColor: const Color(0xFF43A047).withValues(alpha: 0.12),
+                          trackHeight: 3,
+                        ),
+                        child: Slider(
+                          value: leverage!.clamp(1, 100),
+                          min: 1,
+                          max: 100,
+                          divisions: 99,
+                          label: '${roundedLeverage}x',
+                          onChanged: onLeverageChanged,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               if (highlighted) ...[
                 const SizedBox(height: 14),
                 SizedBox(

@@ -165,6 +165,9 @@ class _TradeSetupScreenState extends State<TradeSetupScreen> {
                           'Configure your setup',
                           style: TextStyle(fontSize: 14, height: 1.45, color: Colors.grey[500]),
                         ),
+                        OracleLivePriceStrip(
+                          coin: useCustomCoin ? _coinController.text.trim().toUpperCase() : selectedCoin,
+                        ),
                         const SizedBox(height: _AppSpacing.section),
                         _formSection(
                           label: 'Coin Symbol',

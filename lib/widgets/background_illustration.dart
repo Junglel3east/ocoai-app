@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'profile_avatar.dart';
 
-/// Bottom clearance above main tab bar (Home, Analyze, Trade Setup, Charts, Portfolio).
+/// Bottom clearance above main tab bar (Home, Analyze, Trade Setup, Charts, Oracle Desk).
 const double kMainTabBottomClearance = 80;
 
 /// Full-screen crystal ball / oracle branding behind Profile & Account.

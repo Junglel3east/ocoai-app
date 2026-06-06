@@ -1,1 +1,1 @@
-// PortfolioScreen — see lib/main.dart (uses PortfolioService for live Binance quotes).
+// Portfolio tab replaced by Oracle Desk — see lib/screens/oracle_desk_screen.dart (part of main.dart).
