@@ -121,8 +121,8 @@ BLOFIN_SET_LEVERAGE_PATH = "/api/v1/account/set-leverage"
 BLOFIN_DEFAULT_LEVERAGE = 5
 BLOFIN_ORDER_SIZE = os.getenv("BLOFIN_ORDER_SIZE", "0.1")
 BLOFIN_MARGIN_MODE = os.getenv("BLOFIN_MARGIN_MODE", "cross")
-# Oracle Citadel execute_trade — demo risk guardrails (Flutter risk_percent capped here)
-EXECUTE_TRADE_MAX_RISK_PERCENT = 2.0
+# Oracle Citadel execute_trade — position size ceiling (% of account risked per trade)
+EXECUTE_TRADE_MAX_RISK_PERCENT = 100.0
 EXECUTE_TRADE_DEFAULT_RISK_PERCENT = 1.0
 BLOFIN_POST_ORDER_CONFIRM_DELAY_SEC = 1.5
 # MARKET fill confirmation — poll order-detail after placement (fills can lag API orderId).
@@ -1821,7 +1821,7 @@ def _citadel_egress_ip_for_whitelist() -> str:
 
 def _resolve_effective_risk_percent(risk_percent: Optional[float]) -> tuple[float, float]:
     """
-    Respect Flutter risk_percent; default 1.0%; hard-cap at 2.0% for demo safety.
+    Respect Flutter risk_percent; default 1.0%; clamp to 100% max position size.
     Returns (effective_percent, raw_requested_percent).
     """
     try:

@@ -666,6 +666,8 @@ abstract final class OracleCitadelStore {
     userId = prefs.getString(_userIdKey) ?? 'demo_user';
     apiKey = prefs.getString(_apiKeyKey) ?? '';
     defaultRiskPercent = prefs.getDouble(_riskPercentKey) ?? 1.0;
+    if (defaultRiskPercent < 1.0) defaultRiskPercent = 1.0;
+    if (defaultRiskPercent > 100.0) defaultRiskPercent = 100.0;
     defaultLeverage = prefs.getDouble(_leverageKey) ?? 5.0;
     if (defaultLeverage < 1) defaultLeverage = 1;
     if (defaultLeverage > 100) defaultLeverage = 100;
@@ -675,6 +677,12 @@ abstract final class OracleCitadelStore {
     defaultLeverage = leverage.clamp(1.0, 100.0);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble(_leverageKey, defaultLeverage);
+  }
+
+  static Future<void> saveRiskPercent(double riskPercent) async {
+    defaultRiskPercent = riskPercent.clamp(1.0, 100.0);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_riskPercentKey, defaultRiskPercent);
   }
 
   static Future<bool> isBlofinLinked() async {
@@ -922,7 +930,10 @@ abstract final class OracleCitadelService {
       'entry_price': (tp1 + stopLoss) / 2,
     };
 
-    debugPrint('[Citadel] POST $uri MARKET coin=$coin direction=$direction leverage=${leverage.round()}x');
+    debugPrint(
+      '[Citadel] POST $uri MARKET coin=$coin direction=$direction '
+      'leverage=${leverage.round()}x risk=${riskPercent.toStringAsFixed(1)}%',
+    );
 
     final response = await http
         .post(uri, headers: _authHeaders(), body: jsonEncode(payload))
@@ -975,6 +986,7 @@ Future<void> _sendMarketOrder(
   required double tp1,
   required double tp2,
   required double leverage,
+  required double riskPercent,
 }) async {
   if (!context.mounted) return;
 
@@ -995,21 +1007,11 @@ Future<void> _sendMarketOrder(
       stopLoss: stopLoss,
       tp1: tp1,
       tp2: tp2,
-      riskPercent: OracleCitadelStore.defaultRiskPercent,
+      riskPercent: riskPercent,
       leverage: leverage,
     );
 
     if (!context.mounted) return;
-    final msg = result['user_message']?.toString() ??
-        'MARKET order submitted for $coin ${direction.toUpperCase()}.';
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(msg),
-        backgroundColor: Colors.green,
-        behavior: SnackBarBehavior.floating,
-        duration: const Duration(seconds: 5),
-      ),
-    );
     _showCitadelPostExecutionReviewDialog(
       context,
       reportText: reportText,
@@ -1064,6 +1066,7 @@ Future<void> _showCitadelExecuteChoiceDialog(
   if (!context.mounted) return;
 
   var leverage = OracleCitadelStore.defaultLeverage;
+  var riskPercent = OracleCitadelStore.defaultRiskPercent;
 
   showDialog<void>(
     context: context,
@@ -1136,9 +1139,13 @@ Future<void> _showCitadelExecuteChoiceDialog(
                   highlighted: true,
                   leverage: leverage,
                   onLeverageChanged: (value) => setDialogState(() => leverage = value),
+                  riskPercent: riskPercent,
+                  onRiskPercentChanged: (value) => setDialogState(() => riskPercent = value),
                   onTap: () async {
                     final selectedLeverage = leverage.clamp(1.0, 100.0);
+                    final selectedRisk = riskPercent.clamp(1.0, 100.0);
                     await OracleCitadelStore.saveLeverage(selectedLeverage);
+                    await OracleCitadelStore.saveRiskPercent(selectedRisk);
                     if (!dialogContext.mounted) return;
                     Navigator.pop(dialogContext);
                     _sendMarketOrder(
@@ -1151,6 +1158,7 @@ Future<void> _showCitadelExecuteChoiceDialog(
                       tp1: tp1,
                       tp2: tp2,
                       leverage: selectedLeverage,
+                      riskPercent: selectedRisk,
                     );
                   },
                 ),
@@ -1169,7 +1177,7 @@ Future<void> _showCitadelExecuteChoiceDialog(
   );
 }
 
-/// Post-fill desk review — confluence + stop-loss guidance after MARKET success.
+/// Post-fill success — confluence + suggested stop-loss after MARKET fill.
 void _showCitadelPostExecutionReviewDialog(
   BuildContext context, {
   required String reportText,
@@ -1177,8 +1185,9 @@ void _showCitadelPostExecutionReviewDialog(
   required double originalStopLoss,
   required Map<String, dynamic> marketResult,
 }) {
-  Future.delayed(const Duration(milliseconds: 500), () {
+  WidgetsBinding.instance.addPostFrameCallback((_) {
     if (!context.mounted) return;
+
     final analysis = parseCitadelAnalysisSnapshot(reportText);
     final review = marketResult['post_trade_review'];
     final reviewMap = review is Map<String, dynamic> ? review : marketResult;
@@ -1190,6 +1199,7 @@ void _showCitadelPostExecutionReviewDialog(
 
     final fillEntry = parseNum(
       reviewMap['fill_entry_price'] ??
+          marketResult['fill_entry_price'] ??
           (marketResult['blofin_confirm'] is Map
               ? (marketResult['blofin_confirm'] as Map)['average_price']
               : null),
@@ -1197,15 +1207,19 @@ void _showCitadelPostExecutionReviewDialog(
     final planned = parseNum(reviewMap['planned_entry_price'] ?? plannedEntry);
     final originalSl = parseNum(reviewMap['original_stop_loss'] ?? originalStopLoss);
     final suggestedSl = parseNum(reviewMap['suggested_stop_loss'] ?? originalSl);
+    final orderId = marketResult['order_id']?.toString();
+    final coin = marketResult['coin']?.toString() ?? '';
+    final direction = marketResult['direction']?.toString().toUpperCase() ?? '';
 
     final confidence = analysis.confidencePercent;
     final grade = analysis.confluenceGrade;
     final slDrift = (suggestedSl - originalSl).abs() > 0.0001;
-    final entryDrift = fillEntry > 0 && (fillEntry - planned).abs() / planned > 0.002;
+    final entryDrift = fillEntry > 0 && planned > 0 && (fillEntry - planned).abs() / planned > 0.002;
 
     showDialog<void>(
       context: context,
       barrierDismissible: true,
+      useRootNavigator: true,
       barrierColor: Colors.black.withValues(alpha: 0.75),
       builder: (dialogContext) => Dialog(
         backgroundColor: const Color(0xFF141414),
@@ -1219,6 +1233,41 @@ void _showCitadelPostExecutionReviewDialog(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1B3320),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: const Color(0xFF43A047).withValues(alpha: 0.5)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.check_circle_rounded, color: Color(0xFF43A047), size: 22),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'MARKET Order Filled',
+                              style: TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w800,
+                                color: Colors.white,
+                              ),
+                            ),
+                            if (coin.isNotEmpty)
+                              Text(
+                                '$coin $direction · BloFin',
+                                style: TextStyle(fontSize: 12.5, color: Colors.grey[400]),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 14),
                 const Text(
                   'Position Live — Desk Review',
                   style: TextStyle(
@@ -1230,9 +1279,16 @@ void _showCitadelPostExecutionReviewDialog(
                 ),
                 const SizedBox(height: 6),
                 Text(
-                  'Your MARKET order filled on BloFin. Review confluence and stop placement.',
+                  'Review your fill and update stop loss in BloFin if needed.',
                   style: TextStyle(fontSize: 13, color: Colors.grey[400], height: 1.45),
                 ),
+                if (orderId != null && orderId.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    'Order ID: $orderId',
+                    style: TextStyle(fontSize: 11.5, color: Colors.grey[600]),
+                  ),
+                ],
                 const SizedBox(height: 18),
                 if (confidence != null || grade != null)
                   Container(
@@ -1305,37 +1361,59 @@ void _showCitadelPostExecutionReviewDialog(
                         'Original SL (from setup): ${_formatCitadelPrice(originalSl)}',
                         style: TextStyle(fontSize: 14, color: Colors.grey[300], height: 1.4),
                       ),
-                      if (slDrift) ...[
-                        const SizedBox(height: 8),
-                        Text(
-                          'Suggested SL (same risk distance from fill): ${_formatCitadelPrice(suggestedSl)}',
-                          style: const TextStyle(
-                            fontSize: 15,
-                            fontWeight: FontWeight.w700,
-                            color: Color(0xFFFFB74D),
-                            height: 1.4,
-                          ),
+                      const SizedBox(height: 10),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF2A2218),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: const Color(0xFFFFB74D).withValues(alpha: 0.45)),
                         ),
-                        const SizedBox(height: 6),
-                        Text(
-                          'Adjust in BloFin if fill diverged from your planned entry.',
-                          style: TextStyle(fontSize: 12, color: Colors.grey[500], height: 1.35),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Suggested SL (from fill)',
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                                color: Colors.orange[200],
+                                letterSpacing: 0.2,
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              _formatCitadelPrice(suggestedSl),
+                              style: const TextStyle(
+                                fontSize: 20,
+                                fontWeight: FontWeight.w800,
+                                color: Color(0xFFFFB74D),
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              slDrift
+                                  ? 'Same risk distance from your fill — adjust in BloFin.'
+                                  : 'Matches your setup distance from fill.',
+                              style: TextStyle(fontSize: 12, color: Colors.grey[500], height: 1.35),
+                            ),
+                          ],
                         ),
-                      ] else
-                        Padding(
-                          padding: const EdgeInsets.only(top: 6),
-                          child: Text(
-                            'Stop distance matches your setup relative to fill.',
-                            style: TextStyle(fontSize: 12, color: Colors.grey[500]),
-                          ),
-                        ),
+                      ),
                     ],
                   ),
                 ),
                 const SizedBox(height: 18),
-                TextButton(
+                FilledButton(
                   onPressed: () => Navigator.pop(dialogContext),
-                  child: const Text('Done', style: TextStyle(fontWeight: FontWeight.w700)),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFF43A047),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                  ),
+                  child: const Text('Done', style: TextStyle(fontWeight: FontWeight.w800)),
                 ),
               ],
             ),
@@ -1356,7 +1434,11 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
   final bool highlighted;
   final double? leverage;
   final ValueChanged<double>? onLeverageChanged;
+  final double? riskPercent;
+  final ValueChanged<double>? onRiskPercentChanged;
   final VoidCallback onTap;
+
+  static const _riskPresets = [1, 5, 10, 25, 50, 100];
 
   const _CitadelExecutionOptionTile({
     required this.icon,
@@ -1368,6 +1450,8 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
     this.highlighted = false,
     this.leverage,
     this.onLeverageChanged,
+    this.riskPercent,
+    this.onRiskPercentChanged,
   });
 
   @override
@@ -1377,6 +1461,10 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
         : Colors.grey[800]!;
     final bg = highlighted ? const Color(0xFF1B3320) : const Color(0xFF1E1E1E);
     final roundedLeverage = leverage?.round() ?? 5;
+    final riskValue = riskPercent ?? 1.0;
+    final riskLabel = riskValue == riskValue.roundToDouble()
+        ? riskValue.round().toString()
+        : riskValue.toStringAsFixed(1);
 
     return Material(
       color: bg,
@@ -1470,6 +1558,95 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
                           label: '${roundedLeverage}x',
                           onChanged: onLeverageChanged,
                         ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+              if (highlighted && riskPercent != null && onRiskPercentChanged != null) ...[
+                const SizedBox(height: 10),
+                Container(
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.22),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: const Color(0xFF43A047).withValues(alpha: 0.25)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Icon(Icons.pie_chart_outline_rounded, size: 16, color: Colors.blue[200]),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              'Position size: $riskLabel% of account'
+                              '${riskPercent! >= 25 ? ' (large size — elevated liquidation risk)' : ''}',
+                              style: const TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w800,
+                                color: Colors.white,
+                                height: 1.35,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        '(Larger position sizes increase liquidation and drawdown risk — size only what you can afford to lose.)',
+                        style: TextStyle(fontSize: 11, color: Colors.grey[600], height: 1.35),
+                      ),
+                      SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          activeTrackColor: const Color(0xFF43A047),
+                          inactiveTrackColor: Colors.grey[800],
+                          thumbColor: const Color(0xFF43A047),
+                          overlayColor: const Color(0xFF43A047).withValues(alpha: 0.12),
+                          trackHeight: 3,
+                        ),
+                        child: Slider(
+                          value: riskPercent!.clamp(1, 100),
+                          min: 1,
+                          max: 100,
+                          divisions: 99,
+                          label: '$riskLabel%',
+                          onChanged: onRiskPercentChanged,
+                        ),
+                      ),
+                      Wrap(
+                        spacing: 6,
+                        runSpacing: 6,
+                        children: _riskPresets.map((preset) {
+                          final selected = (riskPercent! - preset).abs() < 0.5;
+                          return GestureDetector(
+                            onTap: () => onRiskPercentChanged!(preset.toDouble()),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(8),
+                                color: selected
+                                    ? const Color(0xFF43A047).withValues(alpha: 0.2)
+                                    : Colors.black.withValues(alpha: 0.25),
+                                border: Border.all(
+                                  color: selected
+                                      ? const Color(0xFF43A047).withValues(alpha: 0.55)
+                                      : Colors.grey[800]!,
+                                ),
+                              ),
+                              child: Text(
+                                '$preset%',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                  color: selected ? const Color(0xFF43A047) : Colors.grey[500],
+                                ),
+                              ),
+                            ),
+                          );
+                        }).toList(),
                       ),
                     ],
                   ),
