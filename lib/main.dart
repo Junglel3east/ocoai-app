@@ -7,7 +7,7 @@
 - Dynamic Watchlist with + button (session memory) → Charts navigation
 - Bottom nav: Home, Oracle Vision, Trade Setup, Charts, Oracle Desk (Alerts via Home AppBar bell)
 - Expert-plan AI Chat FAB on Home + report screens
-- Expert-plan Oracle Citadel: MARKET execution via /execute_trade (BloFin)
+- Expert-plan Oracle Citadel: MARKET + LIMIT execution via /execute_trade (BloFin)
 - App logo: splash screen, Home AppBar, Profile header (assets/images/app_logo.png)
 - Oracle Desk — personal trading command center (watchlist bias, performance, setups)
 */
@@ -904,7 +904,7 @@ abstract final class OracleCitadelService {
     }
   }
 
-  /// MARKET-only Citadel execution — order_type + protective levels.
+  /// MARKET Citadel execution — order_type + protective levels.
   static Future<Map<String, dynamic>> executeMarketOrder({
     required String userId,
     required String coin,
@@ -950,6 +950,62 @@ abstract final class OracleCitadelService {
     var friendly = _parseUserMessage(response) ??
         body['user_message']?.toString() ??
         'MARKET order could not be sent (${response.statusCode}).';
+    final whitelistIp = body['whitelist_ip']?.toString().trim();
+    if (whitelistIp != null && whitelistIp.isNotEmpty) {
+      friendly = '$friendly\n\nWhitelist this IP in BloFin Demo → API Management: $whitelistIp';
+    }
+    throw OracleCitadelException(
+      friendly,
+      errorCode: body['error_code']?.toString(),
+    );
+  }
+
+  /// LIMIT Citadel execution — rests on BloFin Open Orders at planned entry.
+  static Future<Map<String, dynamic>> executeLimitOrder({
+    required String userId,
+    required String coin,
+    required String direction,
+    required double entryPrice,
+    required double stopLoss,
+    required double tp1,
+    required double tp2,
+    required double riskPercent,
+    required double leverage,
+  }) async {
+    final uri = Uri.parse('$kCitadelBaseUrl/execute_trade');
+    final payload = {
+      'user_id': userId,
+      'coin': coin.toUpperCase(),
+      'direction': direction,
+      'order_type': 'limit',
+      'entry_price': entryPrice,
+      'risk_percent': riskPercent,
+      'leverage': leverage.round(),
+      'stop_loss': stopLoss,
+      'tp1': tp1,
+      'tp2': tp2,
+    };
+
+    debugPrint(
+      '[Citadel] POST $uri LIMIT coin=$coin direction=$direction entry=$entryPrice '
+      'leverage=${leverage.round()}x risk=${riskPercent.toStringAsFixed(1)}%',
+    );
+
+    final response = await http
+        .post(uri, headers: _authHeaders(), body: jsonEncode(payload))
+        .timeout(const Duration(seconds: 90));
+
+    Map<String, dynamic> body = {};
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is Map<String, dynamic>) body = decoded;
+    } catch (_) {}
+
+    if (response.statusCode == 200) return body;
+
+    var friendly = _parseUserMessage(response) ??
+        body['user_message']?.toString() ??
+        'LIMIT order could not be sent (${response.statusCode}).';
     final whitelistIp = body['whitelist_ip']?.toString().trim();
     if (whitelistIp != null && whitelistIp.isNotEmpty) {
       friendly = '$friendly\n\nWhitelist this IP in BloFin Demo → API Management: $whitelistIp';
@@ -1053,7 +1109,88 @@ Future<void> _sendMarketOrder(
   }
 }
 
-/// Oracle Citadel — MARKET execution confirmation (no limit orders).
+/// LIMIT entry — BloFin resting order at planned entry price.
+Future<void> _sendLimitOrder(
+  BuildContext context,
+  String coin,
+  String direction, {
+  required String reportText,
+  required double plannedEntry,
+  required double stopLoss,
+  required double tp1,
+  required double tp2,
+  required double leverage,
+  required double riskPercent,
+}) async {
+  if (!context.mounted) return;
+  final rootContext = Navigator.of(context, rootNavigator: true).context;
+
+  ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(
+      content: Text(
+        'Placing LIMIT ${direction.toUpperCase()} on $coin at ${_formatCitadelPrice(plannedEntry)}…',
+      ),
+      behavior: SnackBarBehavior.floating,
+      duration: const Duration(seconds: 3),
+    ),
+  );
+
+  try {
+    await OracleCitadelStore.load();
+    final result = await OracleCitadelService.executeLimitOrder(
+      userId: OracleCitadelStore.userId,
+      coin: coin,
+      direction: direction,
+      entryPrice: plannedEntry,
+      stopLoss: stopLoss,
+      tp1: tp1,
+      tp2: tp2,
+      riskPercent: riskPercent,
+      leverage: leverage,
+    );
+
+    _showCitadelLimitPostPlacementDialog(
+      rootContext,
+      reportText: reportText,
+      plannedEntry: plannedEntry,
+      stopLoss: stopLoss,
+      limitResult: result,
+      coin: coin,
+      direction: direction,
+    );
+  } on OracleCitadelException catch (e) {
+    if (!context.mounted) return;
+    if (e.errorCode == 'credentials_missing' || e.errorCode == 'credentials_mismatch') {
+      await OracleCitadelStore.clearExchangeLinked();
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(e.userMessage),
+        backgroundColor: const Color(0xFFB71C1C),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 8),
+        action: (e.errorCode == 'credentials_missing' || e.errorCode == 'credentials_mismatch')
+            ? SnackBarAction(
+                label: 'Setup',
+                textColor: Colors.white,
+                onPressed: () => showCitadelSetupDialog(context),
+              )
+            : null,
+      ),
+    );
+  } catch (_) {
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('LIMIT order failed. Check connection and try again.'),
+        backgroundColor: Color(0xFFB71C1C),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+}
+
+/// Oracle Citadel — MARKET or LIMIT execution choice.
 Future<void> _showCitadelExecuteChoiceDialog(
   BuildContext context, {
   required String reportText,
@@ -1113,7 +1250,7 @@ Future<void> _showCitadelExecuteChoiceDialog(
                           ),
                           SizedBox(height: 4),
                           Text(
-                            'Market execution only · BloFin Demo',
+                            'Market or Limit · BloFin Demo',
                             style: TextStyle(fontSize: 13, color: Colors.grey),
                           ),
                         ],
@@ -1164,6 +1301,40 @@ Future<void> _showCitadelExecuteChoiceDialog(
                     );
                   },
                 ),
+                const SizedBox(height: 12),
+                _CitadelExecutionOptionTile(
+                  icon: Icons.schedule_rounded,
+                  iconColor: const Color(0xFF00BFFF),
+                  title: 'Place LIMIT Order at Entry',
+                  subtitle:
+                      'Rest on the BloFin order book at ${_formatCitadelPrice(plannedEntry)}. '
+                      'Stop loss attaches to the limit order. TP1/TP2 are set after the order fills.',
+                  highlighted: true,
+                  leverage: leverage,
+                  onLeverageChanged: (value) => setDialogState(() => leverage = value),
+                  riskPercent: riskPercent,
+                  onRiskPercentChanged: (value) => setDialogState(() => riskPercent = value),
+                  onTap: () async {
+                    final selectedLeverage = leverage.clamp(1.0, 100.0);
+                    final selectedRisk = riskPercent.clamp(1.0, 100.0);
+                    await OracleCitadelStore.saveLeverage(selectedLeverage);
+                    await OracleCitadelStore.saveRiskPercent(selectedRisk);
+                    if (!dialogContext.mounted) return;
+                    Navigator.pop(dialogContext);
+                    _sendLimitOrder(
+                      context,
+                      coin,
+                      direction,
+                      reportText: reportText,
+                      plannedEntry: plannedEntry,
+                      stopLoss: stopLoss,
+                      tp1: tp1,
+                      tp2: tp2,
+                      leverage: selectedLeverage,
+                      riskPercent: selectedRisk,
+                    );
+                  },
+                ),
                 const SizedBox(height: 8),
                 Text(
                   '$coin · ${direction.toUpperCase()}',
@@ -1177,6 +1348,161 @@ Future<void> _showCitadelExecuteChoiceDialog(
       ),
     ),
   );
+}
+
+/// Post-placement success — limit order resting on BloFin Open Orders.
+void _showCitadelLimitPostPlacementDialog(
+  BuildContext context, {
+  required String reportText,
+  required double plannedEntry,
+  required double stopLoss,
+  required Map<String, dynamic> limitResult,
+  required String coin,
+  required String direction,
+}) {
+  Future.delayed(const Duration(milliseconds: 400), () {
+    if (!context.mounted) return;
+
+    final analysis = parseCitadelAnalysisSnapshot(reportText);
+    final orderId = limitResult['order_id']?.toString();
+    final displayCoin = limitResult['coin']?.toString() ?? coin;
+    final displayDirection =
+        (limitResult['direction']?.toString() ?? direction).toUpperCase();
+    final entry = limitResult['entry_price'] is num
+        ? (limitResult['entry_price'] as num).toDouble()
+        : plannedEntry;
+    final confidence = analysis.confidencePercent;
+    final grade = analysis.confluenceGrade;
+
+    showDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      useRootNavigator: true,
+      barrierColor: Colors.black.withValues(alpha: 0.75),
+      builder: (dialogContext) => Dialog(
+        backgroundColor: const Color(0xFF141414),
+        insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 28),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 400),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(22, 22, 22, 18),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1A2533),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.5)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.schedule_rounded, color: Color(0xFF00BFFF), size: 22),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'LIMIT Order Placed',
+                              style: TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w800,
+                                color: Colors.white,
+                              ),
+                            ),
+                            if (displayCoin.isNotEmpty)
+                              Text(
+                                '$displayCoin $displayDirection · BloFin Open Orders',
+                                style: TextStyle(fontSize: 12.5, color: Colors.grey[400]),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 14),
+                Text(
+                  'Entry ${_formatCitadelPrice(entry)} · SL ${_formatCitadelPrice(stopLoss)}',
+                  style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Colors.white),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Your limit is on the book — no position until price hits entry. '
+                  'TP1 (40%) and TP2 (60%) will need to be managed after fill.',
+                  style: TextStyle(fontSize: 13, color: Colors.grey[400], height: 1.45),
+                ),
+                if (orderId != null && orderId.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    'Order ID: $orderId',
+                    style: TextStyle(fontSize: 11.5, color: Colors.grey[600]),
+                  ),
+                ],
+                if (confidence != null || grade != null) ...[
+                  const SizedBox(height: 16),
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1A2533),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.35)),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Confluence (from your analysis)',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.blue[200],
+                            letterSpacing: 0.2,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        if (confidence != null)
+                          Text(
+                            'Confidence: $confidence%',
+                            style: const TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.white,
+                            ),
+                          ),
+                        if (grade != null) ...[
+                          const SizedBox(height: 4),
+                          Text(
+                            'Grade: $grade',
+                            style: TextStyle(fontSize: 14, color: Colors.grey[300]),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 18),
+                FilledButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFF00BFFF),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                  ),
+                  child: const Text('Done', style: TextStyle(fontWeight: FontWeight.w800)),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  });
 }
 
 /// Post-fill success — confluence + suggested stop-loss after MARKET fill.

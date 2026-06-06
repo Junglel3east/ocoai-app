@@ -309,7 +309,7 @@ class ExchangeKeysRequest(BaseModel):
 
 class ExecuteTradeRequest(BaseModel):
     """
-    Oracle Citadel trade execution — MARKET only (BloFin).
+    Oracle Citadel trade execution — MARKET or LIMIT (BloFin).
     """
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
@@ -350,6 +350,11 @@ class ExecuteTradeRequest(BaseModel):
     @field_validator("order_type", mode="before")
     @classmethod
     def _normalize_order_type(cls, value: Any) -> str:
+        if value is None:
+            return "market"
+        token = str(value).strip().lower()
+        if token == "limit":
+            return "limit"
         return "market"
 
 
@@ -1750,21 +1755,35 @@ def _coerce_positive_float(value: Any) -> Optional[float]:
 
 
 def _normalize_execute_trade_payload(raw: dict[str, Any]) -> dict[str, Any]:
-    """Map Flutter payloads — Oracle Citadel accepts MARKET orders only."""
+    """Map Flutter payloads; MARKET when order_type=market or entry_price=\"market\"."""
     data = dict(raw)
-    data["order_type"] = "market"
+    order_token = str(data.get("order_type", "market")).strip().lower()
     entry_raw = data.get("entry_price", data.get("entry"))
     entry_is_market = isinstance(entry_raw, str) and entry_raw.strip().lower() == "market"
-    if entry_is_market:
-        sl = _coerce_positive_float(data.get("stop_loss") or data.get("sl"))
-        tp1 = _coerce_positive_float(data.get("tp1"))
-        ref = (tp1 + sl) / 2 if sl is not None and tp1 is not None else None
-        data["entry_price"] = ref if ref is not None else _coerce_positive_float(data.get("entry_price")) or 1.0
+    is_market = order_token == "market" or entry_is_market
+
+    if is_market:
+        data["order_type"] = "market"
+        if entry_is_market:
+            sl = _coerce_positive_float(data.get("stop_loss") or data.get("sl"))
+            tp1 = _coerce_positive_float(data.get("tp1"))
+            ref = (tp1 + sl) / 2 if sl is not None and tp1 is not None else None
+            data["entry_price"] = ref if ref is not None else _coerce_positive_float(data.get("entry_price")) or 1.0
+    else:
+        data["order_type"] = "limit"
     return data
 
 
+def _is_market_trade_request(trade: ExecuteTradeRequest, raw_body: dict[str, Any]) -> bool:
+    """True when client requests immediate market entry."""
+    if trade.order_type == "market":
+        return True
+    entry_raw = raw_body.get("entry_price", raw_body.get("entry"))
+    return isinstance(entry_raw, str) and entry_raw.strip().lower() == "market"
+
+
 def _parse_execute_trade_request(raw_body: dict[str, Any]) -> ExecuteTradeRequest:
-    """Validate execute_trade payload (MARKET-only Citadel)."""
+    """Validate execute_trade payload (MARKET + LIMIT)."""
     return ExecuteTradeRequest.model_validate(_normalize_execute_trade_payload(raw_body))
 
 
@@ -2407,6 +2426,85 @@ async def _blofin_confirm_market_fill(
     return last
 
 
+def _blofin_limit_order_live_satisfied(*, state: Any = None) -> bool:
+    """True when a LIMIT order is resting on the BloFin book (not filled yet)."""
+    token = str(state or "").strip().lower()
+    return token in {"live", "partially_filled"}
+
+
+async def _blofin_confirm_limit_live(
+    *,
+    base_url: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    inst_id: str,
+    order_id: str,
+    placement: dict[str, Any],
+    request_id: str = "?",
+) -> dict[str, Any]:
+    """
+    Confirm a LIMIT order is live on the book before Citadel reports success.
+    Unlike MARKET, filledSize=0 with state=live is expected.
+    """
+    if _blofin_limit_order_live_satisfied(state=placement.get("state")):
+        logger.info(
+            "execute_trade_limit_live_confirmed request_id=%s order_id=%s source=placement state=%s",
+            request_id,
+            order_id,
+            placement.get("state"),
+        )
+        return {
+            "live_ok": True,
+            "ok": True,
+            "state": placement.get("state"),
+            "filled_size": placement.get("filled_size"),
+            "size": placement.get("remaining_size"),
+            "poll_attempt": 0,
+            "source": "placement",
+        }
+
+    await asyncio.sleep(BLOFIN_POST_ORDER_CONFIRM_DELAY_SEC)
+
+    last: dict[str, Any] = {"live_ok": False, "ok": False}
+    for attempt in range(1, BLOFIN_MARKET_FILL_CONFIRM_MAX_POLLS + 1):
+        detail = _blofin_fetch_order_detail(
+            base_url=base_url,
+            api_key=api_key,
+            api_secret=api_secret,
+            passphrase=passphrase,
+            inst_id=inst_id,
+            order_id=order_id,
+            request_id=request_id,
+        )
+        live_ok = bool(detail.get("ok")) and _blofin_limit_order_live_satisfied(
+            state=detail.get("state"),
+        )
+        last = {**detail, "live_ok": live_ok, "poll_attempt": attempt, "source": "order_detail"}
+        if live_ok:
+            logger.info(
+                "execute_trade_limit_live_confirmed request_id=%s order_id=%s source=order_detail "
+                "poll=%s state=%s",
+                request_id,
+                order_id,
+                attempt,
+                detail.get("state"),
+            )
+            return last
+        if attempt < BLOFIN_MARKET_FILL_CONFIRM_MAX_POLLS:
+            await asyncio.sleep(BLOFIN_MARKET_FILL_CONFIRM_POLL_SEC)
+
+    logger.warning(
+        "execute_trade_limit_not_live request_id=%s order_id=%s polls=%s last_state=%s last_ok=%s",
+        request_id,
+        order_id,
+        BLOFIN_MARKET_FILL_CONFIRM_MAX_POLLS,
+        last.get("state"),
+        last.get("ok"),
+    )
+    return last
+
+
 def _normalize_citadel_leverage(value: Any) -> int:
     """Clamp Citadel leverage to BloFin-safe 1x–100x (default 5x)."""
     try:
@@ -2482,7 +2580,7 @@ def _blofin_place_order(
     """
     Place order on BloFin.
     MARKET: orderType=market — no price field (BloFin rejects price on market orders).
-    LIMIT: orderType=limit + price (not used by Citadel — MARKET-only).
+    LIMIT: orderType=limit + price (Citadel limit path).
     TP/SL: trigger prices + -1 market execution + triggerPriceType=last per BloFin docs.
     """
     inst_id = _blofin_inst_id(coin)
@@ -4580,10 +4678,11 @@ async def exchange_keys(http_request: Request) -> JSONResponse:
 
 async def _handle_execute_trade(http_request: Request) -> JSONResponse:
     """
-    POST /execute_trade — Oracle Citadel MARKET execution only (BloFin).
+    POST /execute_trade — Oracle Citadel MARKET or LIMIT execution (BloFin).
 
     Accepts JSON:
-      user_id, coin, direction, entry_price, stop_loss, tp1, tp2, risk_percent, order_type=market
+      user_id, coin, direction, entry_price, stop_loss, tp1, tp2, risk_percent,
+      order_type=market|limit, leverage
     Auth: X-API-Key header must match app_api_key saved via POST /exchange_keys.
     """
     req_id = getattr(http_request.state, "request_id", "?")
@@ -4735,7 +4834,8 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             headers={"X-Request-ID": req_id},
         )
 
-    order_type = "market"
+    is_market = _is_market_trade_request(trade, raw_body)
+    order_type = "market" if is_market else "limit"
     effective_risk, requested_risk = _resolve_effective_risk_percent(trade.risk_percent)
     exchange = record.get("exchange") or "unspecified"
     environment = record.get("environment") or "live"
@@ -4783,7 +4883,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             content={
                 "success": False,
                 "detail": f"Oracle Citadel requires BloFin (exchange={exchange}).",
-                "user_message": "Link BloFin keys in Oracle Citadel Setup to execute MARKET orders.",
+                "user_message": "Link BloFin keys in Oracle Citadel Setup to execute trades.",
                 "request_id": req_id,
             },
             headers={"X-Request-ID": req_id},
@@ -4833,6 +4933,210 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
 
     inst_id = _blofin_inst_id(trade.coin)
 
+    # ── LIMIT: BloFin resting entry + SL on order (TP legs deferred until fill) ──
+    if not is_market:
+        effective_leverage = _normalize_citadel_leverage(trade.leverage)
+
+        lev_result = _blofin_set_leverage(
+            base_url=api_base_url,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            passphrase=passphrase,
+            coin=trade.coin,
+            leverage=effective_leverage,
+            request_id=req_id,
+        )
+        if lev_result.get("ok"):
+            logger.info("Leverage set to %sx on BloFin (limit)", effective_leverage)
+        else:
+            logger.warning(
+                "blofin_set_leverage_failed request_id=%s inst=%s leverage=%sx http=%s code=%s msg=%s "
+                "— continuing with LIMIT order (exchange may use prior leverage)",
+                req_id,
+                inst_id,
+                effective_leverage,
+                lev_result.get("http_status"),
+                lev_result.get("code"),
+                lev_result.get("msg"),
+            )
+
+        limit_entry = float(trade.entry_price)
+        order_size, size_meta = _blofin_calculate_order_size(
+            coin=trade.coin,
+            entry_price=limit_entry,
+            stop_loss=trade.stop_loss,
+            risk_percent=effective_risk,
+            leverage=effective_leverage,
+            base_url=api_base_url,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            passphrase=passphrase,
+            request_id=req_id,
+        )
+
+        logger.info(
+            "execute_trade_limit_dispatch request_id=%s trade_id=%s blofin_base=%s inst=%s "
+            "limit_price=%.6f order_size=%s leverage=%sx size_meta=%s",
+            req_id,
+            trade_id,
+            api_base_url,
+            inst_id,
+            limit_entry,
+            order_size,
+            effective_leverage,
+            size_meta,
+        )
+
+        entry_result = _blofin_place_order(
+            base_url=api_base_url,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            passphrase=passphrase,
+            coin=trade.coin,
+            direction=trade.direction,
+            order_type="limit",
+            size=order_size,
+            price=str(limit_entry),
+            tp1=None,
+            sl=trade.stop_loss,
+            client_order_id=trade_id[:32],
+            request_id=req_id,
+        )
+
+        entry_order_id = entry_result.get("order_id")
+        if not entry_result.get("ok") or not entry_order_id:
+            friendly = _blofin_user_friendly_error(
+                entry_result.get("code"),
+                entry_result.get("msg"),
+            )
+            logger.warning(
+                "execute_trade_limit_failure request_id=%s trade_id=%s http=%s code=%s msg=%s",
+                req_id,
+                trade_id,
+                entry_result.get("http_status"),
+                entry_result.get("code"),
+                entry_result.get("msg"),
+            )
+            fail_body: dict[str, Any] = {
+                "success": False,
+                "status": "failed",
+                "order_type": "limit",
+                "trade_id": trade_id,
+                "detail": entry_result.get("msg") or "BloFin LIMIT order rejected.",
+                "user_message": friendly,
+                "blofin_code": entry_result.get("code"),
+                "request_id": req_id,
+            }
+            if _blofin_is_ip_whitelist_error(entry_result.get("code"), entry_result.get("msg")):
+                egress_ip = _citadel_egress_ip_for_whitelist()
+                if egress_ip:
+                    fail_body["whitelist_ip"] = egress_ip
+            return JSONResponse(
+                status_code=502,
+                content=fail_body,
+                headers={"X-Request-ID": req_id},
+            )
+
+        confirm = await _blofin_confirm_limit_live(
+            base_url=api_base_url,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            passphrase=passphrase,
+            inst_id=inst_id,
+            order_id=entry_order_id,
+            placement=entry_result,
+            request_id=req_id,
+        )
+
+        if not confirm.get("live_ok"):
+            logger.warning(
+                "execute_trade_limit_not_on_book request_id=%s trade_id=%s order_id=%s "
+                "environment=%s base_url=%s state=%s order_size=%s",
+                req_id,
+                trade_id,
+                entry_order_id,
+                environment,
+                api_base_url,
+                confirm.get("state"),
+                order_size,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "success": False,
+                    "status": "failed",
+                    "order_type": "limit",
+                    "trade_id": trade_id,
+                    "order_id": entry_order_id,
+                    "detail": (
+                        "BloFin accepted the LIMIT order but it is not live on the book. "
+                        f"state={confirm.get('state')!s}"
+                    ),
+                    "user_message": (
+                        "LIMIT order was submitted but is not resting on BloFin Open Orders. "
+                        f"Check Demo margin, minimum size, and that Citadel Demo mode matches your "
+                        f"BloFin account ({environment}). Order ID {entry_order_id} may appear in history only."
+                    ),
+                    "blofin_confirm": {
+                        "state": confirm.get("state"),
+                        "filled_size": confirm.get("filled_size"),
+                    },
+                    "api_base_url": api_base_url,
+                    "request_id": req_id,
+                },
+                headers={"X-Request-ID": req_id},
+            )
+
+        rr = compute_rr(limit_entry, trade.tp1, trade.stop_loss)
+        logger.info(
+            "execute_trade_limit_outcome request_id=%s trade_id=%s order_id=%s state=%s size=%s",
+            req_id,
+            trade_id,
+            entry_order_id,
+            confirm.get("state"),
+            order_size,
+        )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "status": "success",
+                "order_type": "limit",
+                "trade_id": trade_id,
+                "order_id": entry_order_id,
+                "user_id": user_id,
+                "coin": trade.coin,
+                "direction": trade.direction,
+                "entry_price": limit_entry,
+                "stop_loss": trade.stop_loss,
+                "tp1": trade.tp1,
+                "tp2": trade.tp2,
+                "risk_percent": effective_risk,
+                "risk_percent_requested": requested_risk,
+                "order_size": order_size,
+                "leverage": effective_leverage,
+                "rr": rr,
+                "exchange": exchange,
+                "environment": environment,
+                "api_base_url": api_base_url,
+                "message": f"LIMIT order placed for {trade.coin} {trade.direction.upper()}.",
+                "user_message": (
+                    f"Limit order resting on BloFin ({environment}). "
+                    f"{trade.coin} {trade.direction.upper()} · Entry {format_usd(limit_entry)} · "
+                    f"Order ID {entry_order_id}. Check Open Orders — TP legs apply after fill."
+                ),
+                "blofin_confirm": {
+                    "state": confirm.get("state"),
+                    "filled_size": confirm.get("filled_size"),
+                    "size": confirm.get("size"),
+                },
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    # ── MARKET: BloFin immediate entry (unchanged) ──
     # Reference price for sizing (live Mobula/CG/Binance — not sent as limit price on market).
     try:
         live = fetch_live_price_for_analysis(trade.coin)
