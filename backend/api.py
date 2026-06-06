@@ -114,6 +114,8 @@ BLOFIN_TRADE_ORDER_TPSL_PATH = "/api/v1/trade/order-tpsl"
 BLOFIN_ORDER_DETAIL_PATH = "/api/v1/trade/order-detail"
 BLOFIN_ACCOUNT_BALANCE_PATH = "/api/v1/account/balance"
 BLOFIN_MARKET_INSTRUMENTS_PATH = "/api/v1/market/instruments"
+BLOFIN_MARKET_MARK_PRICE_PATH = "/api/v1/market/mark-price"
+BLOFIN_MARKET_TICKERS_PATH = "/api/v1/market/tickers"
 BLOFIN_ORDER_SIZE = os.getenv("BLOFIN_ORDER_SIZE", "0.1")
 BLOFIN_MARGIN_MODE = os.getenv("BLOFIN_MARGIN_MODE", "cross")
 # Oracle Citadel execute_trade — demo risk guardrails (Flutter risk_percent capped here)
@@ -222,6 +224,7 @@ class AnalyzeRequest(BaseModel):
     system_prompt: Optional[str] = None
     refresh_price: bool = True
     request_ts: Optional[int] = None
+    user_id: Optional[str] = Field(None, max_length=128)
 
 
 class ReviewRequest(BaseModel):
@@ -616,7 +619,7 @@ def format_mobula_market_prompt_block(market: dict[str, Any]) -> str:
 
 def format_market_data_fallback_note(market: dict[str, Any]) -> str:
     """When Mobula misses, tell the model not to invent on-chain stats."""
-    if market.get("source") == "mobula":
+    if market.get("source") in {"mobula", "blofin", "blofin_demo"}:
         return ""
     return (
         "═══ ON-CHAIN / MOBULA ═══\n"
@@ -752,15 +755,145 @@ def fetch_coingecko_market_aggressive(symbol: str) -> Optional[dict[str, Any]]:
     return last
 
 
-def fetch_live_price_for_analysis(coin: str) -> dict[str, Any]:
+def _citadel_blofin_linked_record(user_id: Optional[str]) -> Optional[dict[str, Any]]:
+    """Return saved Citadel record when user has BloFin exchange keys linked."""
+    uid = (user_id or "").strip()
+    if not uid:
+        return None
+    record = get_citadel_user_record(uid)
+    if not record or not record.get("exchange_api_key"):
+        return None
+    exchange = str(record.get("exchange") or "").lower()
+    api_base = str(record.get("api_base_url") or "").lower()
+    if (
+        "blofin" in exchange
+        or bool(record.get("use_demo_mode"))
+        or "blofin" in api_base
+        or exchange in ("", "unspecified")
+    ):
+        return record
+    return None
+
+
+def fetch_blofin_live_price(
+    coin: str,
+    *,
+    api_base_url: Optional[str] = None,
+    demo: bool = False,
+) -> Optional[dict[str, Any]]:
     """
-    Fresh price for AI analysis/trade setup: Mobula first, then CoinGecko (aggressive), then Binance.
+    Public BloFin mark price (+ optional 24h change from tickers) for AI + UI.
+    No auth required — uses user's linked demo/live host when provided.
+    """
+    upper = (coin or "").strip().upper()
+    if not upper:
+        return None
+
+    inst_id = upper if "-" in upper else f"{upper}-USDT"
+    base = (api_base_url or BLOFIN_LIVE_API_BASE_URL).rstrip("/")
+    source = "blofin_demo" if demo else "blofin"
+
+    mark_price: Optional[float] = None
+    index_price: Optional[float] = None
+    change_24h_pct = 0.0
+
+    try:
+        mark_resp = requests.get(
+            f"{base}{BLOFIN_MARKET_MARK_PRICE_PATH}",
+            params={"instId": inst_id},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if mark_resp.status_code == 200:
+            payload = mark_resp.json()
+            rows = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                row = rows[0]
+                mark_price = _parse_blofin_price_token(row.get("markPrice"))
+                index_price = _parse_blofin_price_token(row.get("indexPrice"))
+    except Exception as exc:
+        logger.warning("blofin_mark_price_error coin=%s inst=%s err=%s", upper, inst_id, exc)
+
+    try:
+        tick_resp = requests.get(
+            f"{base}{BLOFIN_MARKET_TICKERS_PATH}",
+            params={"instId": inst_id},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if tick_resp.status_code == 200:
+            payload = tick_resp.json()
+            rows = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                row = rows[0]
+                if mark_price is None:
+                    mark_price = _parse_blofin_price_token(row.get("last"))
+                open_24h = _parse_blofin_price_token(row.get("open24h"))
+                last_px = _parse_blofin_price_token(row.get("last")) or mark_price
+                if open_24h and last_px:
+                    change_24h_pct = (last_px - open_24h) / open_24h * 100.0
+    except Exception as exc:
+        logger.warning("blofin_ticker_error coin=%s inst=%s err=%s", upper, inst_id, exc)
+
+    if mark_price is None or mark_price <= 0:
+        logger.warning("blofin_live_price_miss coin=%s inst=%s base=%s", upper, inst_id, base)
+        return None
+
+    logger.info(
+        "blofin_live_price_ok coin=%s inst=%s price=%.6f change_24h=%.2f source=%s base=%s",
+        upper,
+        inst_id,
+        mark_price,
+        change_24h_pct,
+        source,
+        base,
+    )
+    return {
+        "price": mark_price,
+        "change_24h_pct": change_24h_pct,
+        "volume_24h_usd": None,
+        "source": source,
+        "blofin_inst_id": inst_id,
+        "blofin_mark_price": mark_price,
+        "blofin_index_price": index_price,
+    }
+
+
+def fetch_live_price_for_analysis(coin: str, user_id: Optional[str] = None) -> dict[str, Any]:
+    """
+    Fresh price for AI analysis/trade setup: BloFin (when user linked), then Mobula,
+    CoinGecko (aggressive), then Binance.
     Does not change prompts or report section format — only enriches market context when Mobula hits.
     """
     upper = coin.upper()
     refresh_coingecko_symbol_index(force=True)
 
     fetched_at = time.time()
+
+    blofin_record = _citadel_blofin_linked_record(user_id)
+    if blofin_record:
+        blofin = fetch_blofin_live_price(
+            upper,
+            api_base_url=blofin_record.get("api_base_url"),
+            demo=bool(
+                blofin_record.get("use_demo_mode")
+                or blofin_record.get("environment") == "demo"
+            ),
+        )
+        if blofin:
+            age_ms = (time.time() - fetched_at) * 1000
+            logger.info(
+                "live_price_for_ai coin=%s source=%s price=%.6f age_ms=%.0f",
+                upper,
+                blofin["source"],
+                blofin["price"],
+                age_ms,
+            )
+            return {"coin": upper, "fetched_at": fetched_at, **blofin}
+
+        logger.warning(
+            "live_price_for_ai coin=%s blofin_miss user=%s — falling back to mobula/coingecko",
+            upper,
+            (user_id or "")[:16],
+        )
 
     mobula = fetch_mobula_price(upper)
     if mobula:
@@ -3318,6 +3451,7 @@ def build_analyze_user_prompt(
     mobula_block = format_mobula_market_prompt_block(market)
     market_fallback_note = format_market_data_fallback_note(market)
     has_mobula = market.get("source") == "mobula"
+    has_blofin = market.get("source") in {"blofin", "blofin_demo"}
 
     scalp_banner = ""
     if scalp_mode:
@@ -3344,6 +3478,8 @@ Weak edge → "NO SCALP — STAY FLAT" and OMIT **TRADE LEVELS**.
             "coingecko": "CoinGecko aggressive pull (cache-busted)",
             "binance_spot": "Binance spot 24h ticker",
             "binance_futures": "Binance futures 24h ticker",
+            "blofin": "BloFin live mark price (user-linked exchange)",
+            "blofin_demo": "BloFin Demo mark price (user-linked exchange)",
         }.get(price_source, price_source)
         freshness_line = (
             f"PRICE FETCHED AT: {ts} ({age_sec:.2f}s ago — {source_note})\n"
@@ -3355,7 +3491,12 @@ Weak edge → "NO SCALP — STAY FLAT" and OMIT **TRADE LEVELS**.
         "MOBULA DATA IS LIVE — liquidity, on-chain vs CEX volume, and pool depth MUST shape bias, "
         "Liquidity & Sentiment, and your trade card. Lead with on-chain/liquidity read when relevant."
         if has_mobula
-        else "No Mobula tick — do not fabricate on-chain stats; lean on derivatives + structure."
+        else (
+            "BLOFIN MARK PRICE IS LIVE — user-linked exchange tick; anchor Entry/TP/SL to this mark for "
+            "execution parity with Oracle Citadel. Cross-check structure + derivatives."
+            if has_blofin
+            else "No Mobula tick — do not fabricate on-chain stats; lean on derivatives + structure."
+        )
     )
     mode_close = (
         "TRADE SETUP MODE: One shot. **TRADE LEVELS** required unless flat — then execution card explains "
@@ -3648,6 +3789,30 @@ async def health() -> dict[str, Any]:
         return {"status": "ok", "version": "2.5.0", "degraded": True}
 
 
+@app.get("/live_price")
+async def get_live_price(coin: str, user_id: Optional[str] = None) -> dict[str, Any]:
+    """Lightweight live price for Oracle Vision / Trade Setup UI."""
+    upper = (coin or "").strip().upper()
+    if not upper:
+        raise HTTPException(status_code=400, detail="coin is required.")
+    uid = (user_id or "").strip() or None
+    try:
+        market = fetch_live_price_for_analysis(upper, user_id=uid)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("live_price_endpoint_fail coin=%s err=%s", upper, exc)
+        raise HTTPException(status_code=502, detail=f"Unable to fetch live price for {upper}.") from exc
+    return {
+        "success": True,
+        "coin": upper,
+        "price": market["price"],
+        "change_24h_pct": market.get("change_24h_pct"),
+        "source": market.get("source"),
+        "fetched_at": market.get("fetched_at"),
+    }
+
+
 @app.get("/coins")
 async def list_coins(limit: int = 150) -> dict[str, Any]:
     refresh_coingecko_symbol_index()
@@ -3681,8 +3846,9 @@ async def _handle_analyze(
     grok_fallback = False
 
     try:
-        # Mobula-first live market → default_system_prompt + build_analyze_user_prompt (both modes)
-        market = fetch_live_price_for_analysis(coin)
+        # Live market (BloFin when linked, else Mobula/CG/Binance) → prompts unchanged structurally
+        user_id = (request.user_id or "").strip() or None
+        market = fetch_live_price_for_analysis(coin, user_id=user_id)
 
         scalp_mode = is_scalp_context(
             timeframe=request.timeframe,
@@ -3777,6 +3943,7 @@ async def _handle_analyze(
             "success": True,
             "coin": coin,
             "current_price": market["price"],
+            "price_source": market.get("source"),
             "report": report,
             "grok_fallback": grok_fallback,
         }
