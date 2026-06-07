@@ -324,6 +324,10 @@ class ExecuteTradeRequest(BaseModel):
     risk_percent: float = Field(1.0, ge=0.1, le=100.0)
     leverage: float = Field(float(BLOFIN_DEFAULT_LEVERAGE), ge=1.0, le=100.0)
     order_type: str = Field("market", max_length=16)
+    use_demo_mode: Optional[bool] = Field(
+        None,
+        validation_alias=AliasChoices("use_demo_mode", "demo_mode"),
+    )
 
     @field_validator("user_id", "coin", "direction", mode="before")
     @classmethod
@@ -1730,6 +1734,96 @@ def get_citadel_user_record(user_id: str) -> Optional[dict[str, Any]]:
     return _normalize_citadel_exchange_record(record)
 
 
+def _coerce_demo_mode_flag(value: Any) -> Optional[bool]:
+    """Parse use_demo_mode / demo_mode from JSON (bool, 0/1, true/false strings)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"", "null", "none"}:
+        return None
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _record_prefers_blofin_demo(record: dict[str, Any]) -> bool:
+    return bool(record.get("use_demo_mode")) or (
+        "demo-trading-openapi.blofin.com"
+        in str(record.get("api_base_url") or "").lower()
+    )
+
+
+def _resolve_execute_trade_blofin_profile(
+    record: dict[str, Any],
+    raw_body: dict[str, Any],
+    *,
+    user_id: str,
+    req_id: str,
+) -> dict[str, Any]:
+    """
+    Pick BloFin demo vs live host for this trade.
+    Flutter's use_demo_mode wins over stale server rows (demo keys on live host → 152401).
+    """
+    client_demo = _coerce_demo_mode_flag(
+        raw_body.get("use_demo_mode", raw_body.get("demo_mode"))
+    )
+    record_demo = _record_prefers_blofin_demo(record)
+    use_demo = record_demo if client_demo is None else client_demo
+    profile = resolve_citadel_exchange_profile(record.get("exchange") or "blofin", use_demo)
+    api_base = profile.get("api_base_url") or BLOFIN_LIVE_API_BASE_URL
+
+    if client_demo is not None and client_demo != record_demo:
+        try:
+            store = _load_citadel_key_store()
+            row = store.get(user_id)
+            if isinstance(row, dict):
+                row["use_demo_mode"] = use_demo
+                row["environment"] = profile["environment"]
+                row["api_base_url"] = api_base
+                row["exchange"] = profile["exchange"]
+                row["updated_at"] = datetime.now(timezone.utc).isoformat()
+                store[user_id] = row
+                _save_citadel_key_store(store)
+                logger.info(
+                    "citadel_demo_profile_synced request_id=%s user_id=%s use_demo=%s base=%s",
+                    req_id,
+                    user_id,
+                    use_demo,
+                    api_base,
+                )
+        except Exception as exc:
+            logger.warning(
+                "citadel_demo_profile_sync_failed request_id=%s user_id=%s err=%s",
+                req_id,
+                user_id,
+                exc,
+            )
+
+    if client_demo is not None and client_demo != record_demo:
+        logger.info(
+            "execute_trade_demo_override request_id=%s user_id=%s record_demo=%s "
+            "client_demo=%s base=%s",
+            req_id,
+            user_id,
+            record_demo,
+            client_demo,
+            api_base,
+        )
+
+    return {
+        "exchange": profile["exchange"],
+        "environment": profile["environment"],
+        "api_base_url": api_base,
+        "use_demo_mode": use_demo,
+    }
+
+
 def _execute_trade_log_payload(body: dict[str, Any]) -> dict[str, Any]:
     """Log-safe view of execute_trade JSON — never includes API keys or secrets."""
     return {
@@ -1743,6 +1837,7 @@ def _execute_trade_log_payload(body: dict[str, Any]) -> dict[str, Any]:
         "tp2": body.get("tp2"),
         "risk_percent": body.get("risk_percent"),
         "leverage": body.get("leverage"),
+        "use_demo_mode": body.get("use_demo_mode", body.get("demo_mode")),
     }
 
 
@@ -2850,6 +2945,12 @@ def _blofin_user_friendly_error(code: Any, msg: Optional[str]) -> str:
     text = (msg or "").strip()
     code_str = str(code or "")
     lower = text.lower()
+    if code_str == "152401" or "access key does not exist" in lower:
+        return (
+            "BloFin rejected your API key for this environment. "
+            "BloFin Demo keys require 'Use Demo/Testnet Mode' ON in Oracle Citadel Setup. "
+            "Live keys require Demo OFF."
+        )
     if code_str == "152409" or "signature verification failed" in lower:
         return (
             "Signature verification failed - please double-check API Key, Secret, "
@@ -4880,9 +4981,15 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
     is_market = _is_market_trade_request(trade, raw_body)
     order_type = "market" if is_market else "limit"
     effective_risk, requested_risk = _resolve_effective_risk_percent(trade.risk_percent)
-    exchange = record.get("exchange") or "unspecified"
-    environment = record.get("environment") or "live"
-    api_base_url = record.get("api_base_url") or BLOFIN_LIVE_API_BASE_URL
+    blofin_profile = _resolve_execute_trade_blofin_profile(
+        record,
+        raw_body,
+        user_id=user_id,
+        req_id=req_id,
+    )
+    exchange = blofin_profile.get("exchange") or record.get("exchange") or "blofin"
+    environment = blofin_profile.get("environment") or "live"
+    api_base_url = blofin_profile.get("api_base_url") or BLOFIN_LIVE_API_BASE_URL
     trade_id = uuid.uuid4().hex[:16]
 
     if effective_risk < requested_risk:

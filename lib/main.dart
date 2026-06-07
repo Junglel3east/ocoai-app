@@ -653,11 +653,14 @@ abstract final class OracleCitadelStore {
   static const _apiKeyKey = 'citadel_api_key';
   static const _riskPercentKey = 'citadel_risk_percent';
   static const _leverageKey = 'citadel_leverage';
+  static const _demoModeKey = 'citadel_use_demo_mode';
 
   static String userId = 'demo_user';
   static String apiKey = '';
   static double defaultRiskPercent = 1.0;
   static double defaultLeverage = 5.0;
+  /// BloFin Demo is the default — demo API keys only work against the demo host.
+  static bool useDemoMode = true;
 
   static bool get isConfigured => userId.trim().isNotEmpty && apiKey.trim().isNotEmpty;
 
@@ -671,6 +674,13 @@ abstract final class OracleCitadelStore {
     defaultLeverage = prefs.getDouble(_leverageKey) ?? 5.0;
     if (defaultLeverage < 1) defaultLeverage = 1;
     if (defaultLeverage > 100) defaultLeverage = 100;
+    useDemoMode = prefs.getBool(_demoModeKey) ?? true;
+  }
+
+  static Future<void> saveDemoMode(bool enabled) async {
+    useDemoMode = enabled;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_demoModeKey, enabled);
   }
 
   static Future<void> saveLeverage(double leverage) async {
@@ -971,11 +981,14 @@ abstract final class OracleCitadelService {
     required double leverage,
   }) async {
     final uri = Uri.parse('$kCitadelBaseUrl/execute_trade');
+    await OracleCitadelStore.load();
     final payload = {
       'user_id': userId,
       'coin': coin.toUpperCase(),
       'direction': direction,
       'order_type': 'market',
+      'use_demo_mode': OracleCitadelStore.useDemoMode,
+      'demo_mode': OracleCitadelStore.useDemoMode,
       'risk_percent': riskPercent,
       'leverage': leverage.round(),
       'stop_loss': stopLoss,
@@ -987,6 +1000,7 @@ abstract final class OracleCitadelService {
 
     debugPrint(
       '[Citadel] POST $uri MARKET coin=$coin direction=$direction '
+      'demo=${OracleCitadelStore.useDemoMode} '
       'leverage=${leverage.round()}x risk=${riskPercent.toStringAsFixed(1)}%',
     );
 
@@ -1028,11 +1042,14 @@ abstract final class OracleCitadelService {
     required double leverage,
   }) async {
     final uri = Uri.parse('$kCitadelBaseUrl/execute_trade');
+    await OracleCitadelStore.load();
     final payload = {
       'user_id': userId,
       'coin': coin.toUpperCase(),
       'direction': direction,
       'order_type': 'limit',
+      'use_demo_mode': OracleCitadelStore.useDemoMode,
+      'demo_mode': OracleCitadelStore.useDemoMode,
       'entry_price': entryPrice,
       'risk_percent': riskPercent,
       'leverage': leverage.round(),
@@ -1043,6 +1060,7 @@ abstract final class OracleCitadelService {
 
     debugPrint(
       '[Citadel] POST $uri LIMIT coin=$coin direction=$direction entry=$entryPrice '
+      'demo=${OracleCitadelStore.useDemoMode} '
       'leverage=${leverage.round()}x risk=${riskPercent.toStringAsFixed(1)}%',
     );
 
@@ -1292,11 +1310,11 @@ Future<void> _showCitadelExecuteChoiceDialog(
                       child: const Icon(Icons.rocket_launch_rounded, color: Color(0xFF43A047), size: 24),
                     ),
                     const SizedBox(width: 14),
-                    const Expanded(
+                    Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(
+                          const Text(
                             'Oracle Citadel',
                             style: TextStyle(
                               fontSize: 20,
@@ -1305,10 +1323,12 @@ Future<void> _showCitadelExecuteChoiceDialog(
                               letterSpacing: -0.3,
                             ),
                           ),
-                          SizedBox(height: 4),
+                          const SizedBox(height: 4),
                           Text(
-                            'Market or Limit · BloFin Demo',
-                            style: TextStyle(fontSize: 13, color: Colors.grey),
+                            OracleCitadelStore.useDemoMode
+                                ? 'Market or Limit · BloFin Demo'
+                                : 'Market or Limit · BloFin LIVE',
+                            style: const TextStyle(fontSize: 13, color: Colors.grey),
                           ),
                         ],
                       ),
