@@ -2426,13 +2426,31 @@ async def _blofin_confirm_market_fill(
     return last
 
 
-def _blofin_limit_order_live_satisfied(*, state: Any = None) -> bool:
-    """True when a LIMIT order is resting on the BloFin book (not filled yet)."""
+def _blofin_limit_order_accepted(
+    *,
+    state: Any = None,
+    filled_size: Any = None,
+    filled_amount: Any = None,
+) -> tuple[bool, str]:
+    """
+    LIMIT success = resting on book (live) OR already filled (price traded through limit).
+    Returns (ok, limit_status) where limit_status is resting|filled.
+    """
     token = str(state or "").strip().lower()
-    return token in {"live", "partially_filled"}
+    if token in {"live", "partially_filled"}:
+        return True, "resting"
+    if _blofin_market_fill_satisfied(
+        filled_size=filled_size,
+        filled_amount=filled_amount,
+        state=state,
+    ):
+        return True, "filled"
+    if token == "filled":
+        return True, "filled"
+    return False, ""
 
 
-async def _blofin_confirm_limit_live(
+async def _blofin_confirm_limit_order(
     *,
     base_url: str,
     api_key: str,
@@ -2444,21 +2462,31 @@ async def _blofin_confirm_limit_live(
     request_id: str = "?",
 ) -> dict[str, Any]:
     """
-    Confirm a LIMIT order is live on the book before Citadel reports success.
-    Unlike MARKET, filledSize=0 with state=live is expected.
+    Confirm LIMIT placement succeeded — resting on book OR filled immediately.
     """
-    if _blofin_limit_order_live_satisfied(state=placement.get("state")):
+    ok, limit_status = _blofin_limit_order_accepted(
+        state=placement.get("state"),
+        filled_size=placement.get("filled_size"),
+        filled_amount=placement.get("filled_amount"),
+    )
+    if ok:
         logger.info(
-            "execute_trade_limit_live_confirmed request_id=%s order_id=%s source=placement state=%s",
+            "execute_trade_limit_confirmed request_id=%s order_id=%s source=placement "
+            "state=%s limit_status=%s filled=%s",
             request_id,
             order_id,
             placement.get("state"),
+            limit_status,
+            placement.get("filled_size"),
         )
         return {
-            "live_ok": True,
+            "limit_ok": True,
+            "live_ok": limit_status == "resting",
             "ok": True,
+            "limit_status": limit_status,
             "state": placement.get("state"),
             "filled_size": placement.get("filled_size"),
+            "average_price": placement.get("average_price"),
             "size": placement.get("remaining_size"),
             "poll_attempt": 0,
             "source": "placement",
@@ -2466,7 +2494,7 @@ async def _blofin_confirm_limit_live(
 
     await asyncio.sleep(BLOFIN_POST_ORDER_CONFIRM_DELAY_SEC)
 
-    last: dict[str, Any] = {"live_ok": False, "ok": False}
+    last: dict[str, Any] = {"limit_ok": False, "live_ok": False, "ok": False}
     for attempt in range(1, BLOFIN_MARKET_FILL_CONFIRM_MAX_POLLS + 1):
         detail = _blofin_fetch_order_detail(
             base_url=base_url,
@@ -2477,29 +2505,44 @@ async def _blofin_confirm_limit_live(
             order_id=order_id,
             request_id=request_id,
         )
-        live_ok = bool(detail.get("ok")) and _blofin_limit_order_live_satisfied(
+        ok, limit_status = _blofin_limit_order_accepted(
             state=detail.get("state"),
+            filled_size=detail.get("filled_size"),
+            filled_amount=detail.get("filled_amount"),
         )
-        last = {**detail, "live_ok": live_ok, "poll_attempt": attempt, "source": "order_detail"}
-        if live_ok:
+        limit_ok = bool(detail.get("ok")) and ok
+        last = {
+            **detail,
+            "limit_ok": limit_ok,
+            "live_ok": limit_ok and limit_status == "resting",
+            "limit_status": limit_status if limit_ok else "",
+            "poll_attempt": attempt,
+            "source": "order_detail",
+        }
+        if limit_ok:
             logger.info(
-                "execute_trade_limit_live_confirmed request_id=%s order_id=%s source=order_detail "
-                "poll=%s state=%s",
+                "execute_trade_limit_confirmed request_id=%s order_id=%s source=order_detail "
+                "poll=%s state=%s limit_status=%s filled=%s avg=%s",
                 request_id,
                 order_id,
                 attempt,
                 detail.get("state"),
+                limit_status,
+                detail.get("filled_size"),
+                detail.get("average_price"),
             )
             return last
         if attempt < BLOFIN_MARKET_FILL_CONFIRM_MAX_POLLS:
             await asyncio.sleep(BLOFIN_MARKET_FILL_CONFIRM_POLL_SEC)
 
     logger.warning(
-        "execute_trade_limit_not_live request_id=%s order_id=%s polls=%s last_state=%s last_ok=%s",
+        "execute_trade_limit_unconfirmed request_id=%s order_id=%s polls=%s "
+        "last_state=%s last_filled=%s last_ok=%s",
         request_id,
         order_id,
         BLOFIN_MARKET_FILL_CONFIRM_MAX_POLLS,
         last.get("state"),
+        last.get("filled_size"),
         last.get("ok"),
     )
     return last
@@ -5037,7 +5080,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
                 headers={"X-Request-ID": req_id},
             )
 
-        confirm = await _blofin_confirm_limit_live(
+        confirm = await _blofin_confirm_limit_order(
             base_url=api_base_url,
             api_key=exchange_api_key,
             api_secret=exchange_secret,
@@ -5048,9 +5091,9 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             request_id=req_id,
         )
 
-        if not confirm.get("live_ok"):
+        if not confirm.get("limit_ok"):
             logger.warning(
-                "execute_trade_limit_not_on_book request_id=%s trade_id=%s order_id=%s "
+                "execute_trade_limit_unconfirmed request_id=%s trade_id=%s order_id=%s "
                 "environment=%s base_url=%s state=%s order_size=%s",
                 req_id,
                 trade_id,
@@ -5069,13 +5112,12 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
                     "trade_id": trade_id,
                     "order_id": entry_order_id,
                     "detail": (
-                        "BloFin accepted the LIMIT order but it is not live on the book. "
-                        f"state={confirm.get('state')!s}"
+                        "BloFin accepted the LIMIT order but Citadel could not confirm it. "
+                        f"state={confirm.get('state')!s} filledSize={confirm.get('filled_size')!s}"
                     ),
                     "user_message": (
-                        "LIMIT order was submitted but is not resting on BloFin Open Orders. "
-                        f"Check Demo margin, minimum size, and that Citadel Demo mode matches your "
-                        f"BloFin account ({environment}). Order ID {entry_order_id} may appear in history only."
+                        "LIMIT order was submitted to BloFin but could not be confirmed. "
+                        f"Check order history on BloFin ({environment}). Order ID {entry_order_id}."
                     ),
                     "blofin_confirm": {
                         "state": confirm.get("state"),
@@ -5087,14 +5129,94 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
                 headers={"X-Request-ID": req_id},
             )
 
+        limit_status = confirm.get("limit_status") or (
+            "filled" if confirm.get("state") == "filled" else "resting"
+        )
         rr = compute_rr(limit_entry, trade.tp1, trade.stop_loss)
+
+        tp1_tpsl_id: Optional[str] = None
+        tp2_tpsl_id: Optional[str] = None
+        tp1_size: Optional[str] = None
+        tp2_size: Optional[str] = None
+        tp_warnings: list[str] = []
+
+        # Limit filled immediately — attach dual TP legs (same as MARKET post-fill).
+        if limit_status == "filled":
+            spec = _blofin_fetch_instrument_spec(
+                base_url=api_base_url,
+                inst_id=inst_id,
+                request_id=req_id,
+            )
+            position_size = (
+                confirm.get("filled_size")
+                or confirm.get("size")
+                or order_size
+            )
+            position_size_str = str(position_size)
+            tp1_size, tp2_size = _blofin_dual_tp_contract_sizes(
+                position_size_str,
+                lot_size=float(spec["lotSize"]),
+                min_size=float(spec["minSize"]),
+            )
+
+            tp1_result = _blofin_place_tpsl_take_profit(
+                base_url=api_base_url,
+                api_key=exchange_api_key,
+                api_secret=exchange_secret,
+                passphrase=passphrase,
+                coin=trade.coin,
+                direction=trade.direction,
+                tp_price=trade.tp1,
+                size=tp1_size,
+                client_order_id=f"{trade_id[:28]}l1",
+                request_id=req_id,
+            )
+            tp1_tpsl_id = tp1_result.get("tpsl_id")
+            if not tp1_result.get("ok"):
+                tp_warnings.append(f"TP1 (40%) not placed: {tp1_result.get('msg') or 'unknown'}")
+
+            tp2_result = _blofin_place_tpsl_take_profit(
+                base_url=api_base_url,
+                api_key=exchange_api_key,
+                api_secret=exchange_secret,
+                passphrase=passphrase,
+                coin=trade.coin,
+                direction=trade.direction,
+                tp_price=trade.tp2,
+                size=tp2_size,
+                client_order_id=f"{trade_id[:28]}l2",
+                request_id=req_id,
+            )
+            tp2_tpsl_id = tp2_result.get("tpsl_id")
+            if not tp2_result.get("ok"):
+                tp_warnings.append(f"TP2 (60%) not placed: {tp2_result.get('msg') or 'unknown'}")
+
+        fill_entry = _parse_blofin_price_token(confirm.get("average_price")) or limit_entry
+        if limit_status == "filled":
+            user_message = (
+                f"LIMIT order filled on BloFin ({environment}). "
+                f"{trade.coin} {trade.direction.upper()} · Fill {format_usd(fill_entry)} · "
+                f"Order ID {entry_order_id}"
+            )
+            message = f"LIMIT order filled for {trade.coin} {trade.direction.upper()}."
+        else:
+            user_message = (
+                f"Limit order resting on BloFin ({environment}). "
+                f"{trade.coin} {trade.direction.upper()} · Entry {format_usd(limit_entry)} · "
+                f"Order ID {entry_order_id}. Check Open Orders — TP legs apply after fill."
+            )
+            message = f"LIMIT order placed for {trade.coin} {trade.direction.upper()}."
+
         logger.info(
-            "execute_trade_limit_outcome request_id=%s trade_id=%s order_id=%s state=%s size=%s",
+            "execute_trade_limit_outcome request_id=%s trade_id=%s order_id=%s "
+            "limit_status=%s state=%s filled=%s avg=%s",
             req_id,
             trade_id,
             entry_order_id,
+            limit_status,
             confirm.get("state"),
-            order_size,
+            confirm.get("filled_size"),
+            confirm.get("average_price"),
         )
 
         return JSONResponse(
@@ -5103,12 +5225,19 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
                 "success": True,
                 "status": "success",
                 "order_type": "limit",
+                "limit_status": limit_status,
                 "trade_id": trade_id,
                 "order_id": entry_order_id,
+                "tp1_tpsl_id": tp1_tpsl_id,
+                "tp2_tpsl_id": tp2_tpsl_id,
+                "tp1_size": tp1_size,
+                "tp2_size": tp2_size,
+                "tp_warnings": tp_warnings,
                 "user_id": user_id,
                 "coin": trade.coin,
                 "direction": trade.direction,
                 "entry_price": limit_entry,
+                "fill_entry_price": fill_entry if limit_status == "filled" else None,
                 "stop_loss": trade.stop_loss,
                 "tp1": trade.tp1,
                 "tp2": trade.tp2,
@@ -5120,15 +5249,12 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
                 "exchange": exchange,
                 "environment": environment,
                 "api_base_url": api_base_url,
-                "message": f"LIMIT order placed for {trade.coin} {trade.direction.upper()}.",
-                "user_message": (
-                    f"Limit order resting on BloFin ({environment}). "
-                    f"{trade.coin} {trade.direction.upper()} · Entry {format_usd(limit_entry)} · "
-                    f"Order ID {entry_order_id}. Check Open Orders — TP legs apply after fill."
-                ),
+                "message": message,
+                "user_message": user_message,
                 "blofin_confirm": {
                     "state": confirm.get("state"),
                     "filled_size": confirm.get("filled_size"),
+                    "average_price": confirm.get("average_price"),
                     "size": confirm.get("size"),
                 },
                 "request_id": req_id,

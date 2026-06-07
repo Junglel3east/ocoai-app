@@ -696,6 +696,11 @@ abstract final class OracleCitadelStore {
     await prefs.setBool('citadel_exchange_linked', false);
   }
 
+  static Future<void> markExchangeLinked(bool linked) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('citadel_exchange_linked', linked);
+  }
+
   static Future<void> save({
     required String userId,
     required String apiKey,
@@ -720,6 +725,18 @@ class OracleCitadelException implements Exception {
 
   @override
   String toString() => userMessage;
+}
+
+class CitadelServerLinkStatus {
+  final bool linked;
+  final String? userMessage;
+  final String? errorCode;
+
+  const CitadelServerLinkStatus({
+    required this.linked,
+    this.userMessage,
+    this.errorCode,
+  });
 }
 
 /// Optional Citadel user id for analyze/live_price — enables BloFin mark price when linked.
@@ -886,8 +903,14 @@ abstract final class OracleCitadelService {
   }
 
   /// Confirms exchange keys exist on the Railway server (not just local prefs).
-  static Future<bool> verifyServerLinked() async {
-    if (!OracleCitadelStore.isConfigured) return false;
+  static Future<CitadelServerLinkStatus> checkServerLinked() async {
+    if (!OracleCitadelStore.isConfigured) {
+      return const CitadelServerLinkStatus(
+        linked: false,
+        userMessage: 'App API Key missing. Open Oracle Citadel Setup and save your credentials.',
+        errorCode: 'credentials_missing',
+      );
+    }
     final uri = Uri.parse('$kCitadelBaseUrl/exchange_keys/status').replace(
       queryParameters: {'user_id': OracleCitadelStore.userId},
     );
@@ -895,13 +918,45 @@ abstract final class OracleCitadelService {
       final response = await http
           .get(uri, headers: _authHeaders())
           .timeout(const Duration(seconds: 15));
-      if (response.statusCode == 200) return true;
-      debugPrint('[Citadel] server link check failed status=${response.statusCode}');
-      return false;
+
+      Map<String, dynamic> body = {};
+      try {
+        final decoded = jsonDecode(response.body);
+        if (decoded is Map<String, dynamic>) body = decoded;
+      } catch (_) {}
+
+      if (response.statusCode == 200 && body['linked'] == true) {
+        await OracleCitadelStore.markExchangeLinked(true);
+        return const CitadelServerLinkStatus(linked: true);
+      }
+
+      final message = body['user_message']?.toString() ??
+          _parseUserMessage(response) ??
+          'Exchange keys not found on server. Re-link BloFin keys in Oracle Citadel Setup.';
+      final errorCode = body['error_code']?.toString();
+      debugPrint(
+        '[Citadel] server link check failed status=${response.statusCode} '
+        'code=$errorCode msg=$message',
+      );
+      await OracleCitadelStore.clearExchangeLinked();
+      return CitadelServerLinkStatus(
+        linked: false,
+        userMessage: message,
+        errorCode: errorCode,
+      );
     } catch (e) {
       debugPrint('[Citadel] server link check error: $e');
-      return false;
+      await OracleCitadelStore.clearExchangeLinked();
+      return const CitadelServerLinkStatus(
+        linked: false,
+        userMessage: 'Could not reach Citadel server. Check connection and try again.',
+      );
     }
+  }
+
+  static Future<bool> verifyServerLinked() async {
+    final status = await checkServerLinked();
+    return status.linked;
   }
 
   /// MARKET Citadel execution — order_type + protective levels.
@@ -1212,13 +1267,15 @@ Future<void> _showCitadelExecuteChoiceDialog(
     barrierDismissible: true,
     barrierColor: Colors.black.withValues(alpha: 0.72),
     builder: (dialogContext) => StatefulBuilder(
-      builder: (context, setDialogState) => Dialog(
+      builder: (context, setDialogState) {
+        final maxDialogHeight = MediaQuery.sizeOf(context).height * 0.88;
+        return Dialog(
         backgroundColor: const Color(0xFF141414),
-        insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 28),
+        insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 20),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 400),
-          child: Padding(
+          constraints: BoxConstraints(maxWidth: 400, maxHeight: maxDialogHeight),
+          child: SingleChildScrollView(
             padding: const EdgeInsets.fromLTRB(22, 22, 22, 18),
             child: Column(
               mainAxisSize: MainAxisSize.min,
@@ -1267,7 +1324,14 @@ Future<void> _showCitadelExecuteChoiceDialog(
                   'Entry ${_formatCitadelPrice(plannedEntry)} · SL ${_formatCitadelPrice(stopLoss)}',
                   style: TextStyle(fontSize: 13, color: Colors.grey[400], height: 1.4),
                 ),
-                const SizedBox(height: 20),
+                const SizedBox(height: 16),
+                _CitadelLeverageRiskPanel(
+                  leverage: leverage,
+                  onLeverageChanged: (value) => setDialogState(() => leverage = value),
+                  riskPercent: riskPercent,
+                  onRiskPercentChanged: (value) => setDialogState(() => riskPercent = value),
+                ),
+                const SizedBox(height: 16),
                 _CitadelExecutionOptionTile(
                   icon: Icons.rocket_launch_rounded,
                   iconColor: const Color(0xFF43A047),
@@ -1276,10 +1340,9 @@ Future<void> _showCitadelExecuteChoiceDialog(
                       'Enter immediately at the current market price on BloFin. '
                       'Stop loss is placed on entry; TP1 (40%) and TP2 (60%) legs follow fill.',
                   highlighted: true,
-                  leverage: leverage,
-                  onLeverageChanged: (value) => setDialogState(() => leverage = value),
-                  riskPercent: riskPercent,
-                  onRiskPercentChanged: (value) => setDialogState(() => riskPercent = value),
+                  showSliders: false,
+                  actionLabel: 'Execute as MARKET Order NOW',
+                  actionColor: const Color(0xFF43A047),
                   onTap: () async {
                     final selectedLeverage = leverage.clamp(1.0, 100.0);
                     final selectedRisk = riskPercent.clamp(1.0, 100.0);
@@ -1310,10 +1373,10 @@ Future<void> _showCitadelExecuteChoiceDialog(
                       'Rest on the BloFin order book at ${_formatCitadelPrice(plannedEntry)}. '
                       'Stop loss attaches to the limit order. TP1/TP2 are set after the order fills.',
                   highlighted: true,
-                  leverage: leverage,
-                  onLeverageChanged: (value) => setDialogState(() => leverage = value),
-                  riskPercent: riskPercent,
-                  onRiskPercentChanged: (value) => setDialogState(() => riskPercent = value),
+                  showSliders: false,
+                  accentColor: const Color(0xFF00BFFF),
+                  actionLabel: 'Place LIMIT Order at Entry',
+                  actionColor: const Color(0xFF00BFFF),
                   onTap: () async {
                     final selectedLeverage = leverage.clamp(1.0, 100.0);
                     final selectedRisk = riskPercent.clamp(1.0, 100.0);
@@ -1345,7 +1408,8 @@ Future<void> _showCitadelExecuteChoiceDialog(
             ),
           ),
         ),
-      ),
+      );
+      },
     ),
   );
 }
@@ -1371,6 +1435,15 @@ void _showCitadelLimitPostPlacementDialog(
     final entry = limitResult['entry_price'] is num
         ? (limitResult['entry_price'] as num).toDouble()
         : plannedEntry;
+    final limitStatus = limitResult['limit_status']?.toString() ?? 'resting';
+    final filledImmediately = limitStatus == 'filled';
+    final fillEntry = limitResult['fill_entry_price'] is num
+        ? (limitResult['fill_entry_price'] as num).toDouble()
+        : (limitResult['blofin_confirm'] is Map
+            ? double.tryParse(
+                (limitResult['blofin_confirm'] as Map)['average_price']?.toString() ?? '',
+              )
+            : null);
     final confidence = analysis.confidencePercent;
     final grade = analysis.confluenceGrade;
 
@@ -1394,21 +1467,28 @@ void _showCitadelLimitPostPlacementDialog(
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF1A2533),
+                    color: filledImmediately ? const Color(0xFF1B3320) : const Color(0xFF1A2533),
                     borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.5)),
+                    border: Border.all(
+                      color: (filledImmediately ? const Color(0xFF43A047) : const Color(0xFF00BFFF))
+                          .withValues(alpha: 0.5),
+                    ),
                   ),
                   child: Row(
                     children: [
-                      const Icon(Icons.schedule_rounded, color: Color(0xFF00BFFF), size: 22),
+                      Icon(
+                        filledImmediately ? Icons.check_circle_rounded : Icons.schedule_rounded,
+                        color: filledImmediately ? const Color(0xFF43A047) : const Color(0xFF00BFFF),
+                        size: 22,
+                      ),
                       const SizedBox(width: 10),
                       Expanded(
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            const Text(
-                              'LIMIT Order Placed',
-                              style: TextStyle(
+                            Text(
+                              filledImmediately ? 'LIMIT Order Filled' : 'LIMIT Order Placed',
+                              style: const TextStyle(
                                 fontSize: 16,
                                 fontWeight: FontWeight.w800,
                                 color: Colors.white,
@@ -1416,7 +1496,9 @@ void _showCitadelLimitPostPlacementDialog(
                             ),
                             if (displayCoin.isNotEmpty)
                               Text(
-                                '$displayCoin $displayDirection · BloFin Open Orders',
+                                filledImmediately
+                                    ? '$displayCoin $displayDirection · BloFin Position'
+                                    : '$displayCoin $displayDirection · BloFin Open Orders',
                                 style: TextStyle(fontSize: 12.5, color: Colors.grey[400]),
                               ),
                           ],
@@ -1427,13 +1509,17 @@ void _showCitadelLimitPostPlacementDialog(
                 ),
                 const SizedBox(height: 14),
                 Text(
-                  'Entry ${_formatCitadelPrice(entry)} · SL ${_formatCitadelPrice(stopLoss)}',
+                  filledImmediately && fillEntry != null && fillEntry > 0
+                      ? 'Fill ${_formatCitadelPrice(fillEntry)} · SL ${_formatCitadelPrice(stopLoss)}'
+                      : 'Entry ${_formatCitadelPrice(entry)} · SL ${_formatCitadelPrice(stopLoss)}',
                   style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Colors.white),
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'Your limit is on the book — no position until price hits entry. '
-                  'TP1 (40%) and TP2 (60%) will need to be managed after fill.',
+                  filledImmediately
+                      ? 'Your limit filled immediately on BloFin. TP1 (40%) and TP2 (60%) legs were attached when possible.'
+                      : 'Your limit is on the book — no position until price hits entry. '
+                          'TP1 (40%) and TP2 (60%) will apply after fill.',
                   style: TextStyle(fontSize: 13, color: Colors.grey[400], height: 1.45),
                 ),
                 if (orderId != null && orderId.isNotEmpty) ...[
@@ -1755,6 +1841,150 @@ void _showCitadelPostExecutionReviewDialog(
   });
 }
 
+/// Shared leverage + position size controls for Citadel execute dialog.
+class _CitadelLeverageRiskPanel extends StatelessWidget {
+  final double leverage;
+  final ValueChanged<double> onLeverageChanged;
+  final double riskPercent;
+  final ValueChanged<double> onRiskPercentChanged;
+
+  static const _riskPresets = [1, 5, 10, 25, 50, 100];
+
+  const _CitadelLeverageRiskPanel({
+    required this.leverage,
+    required this.onLeverageChanged,
+    required this.riskPercent,
+    required this.onRiskPercentChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final roundedLeverage = leverage.round();
+    final riskLabel = riskPercent == riskPercent.roundToDouble()
+        ? riskPercent.round().toString()
+        : riskPercent.toStringAsFixed(1);
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 10),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.22),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFF43A047).withValues(alpha: 0.25)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.bolt_rounded, size: 16, color: Colors.orange[200]),
+              const SizedBox(width: 6),
+              Text(
+                'Leverage: ${roundedLeverage}x',
+                style: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w800,
+                  color: Colors.white,
+                ),
+              ),
+            ],
+          ),
+          SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              activeTrackColor: const Color(0xFF43A047),
+              inactiveTrackColor: Colors.grey[800],
+              thumbColor: const Color(0xFF43A047),
+              overlayColor: const Color(0xFF43A047).withValues(alpha: 0.12),
+              trackHeight: 3,
+            ),
+            child: Slider(
+              value: leverage.clamp(1, 100),
+              min: 1,
+              max: 100,
+              divisions: 99,
+              label: '${roundedLeverage}x',
+              onChanged: onLeverageChanged,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(Icons.pie_chart_outline_rounded, size: 16, color: Colors.blue[200]),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  'Position size: $riskLabel% of account'
+                  '${riskPercent >= 25 ? ' (large size — elevated liquidation risk)' : ''}',
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w800,
+                    color: Colors.white,
+                    height: 1.35,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '(Larger position sizes increase liquidation and drawdown risk — size only what you can afford to lose.)',
+            style: TextStyle(fontSize: 11, color: Colors.grey[600], height: 1.35),
+          ),
+          SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              activeTrackColor: const Color(0xFF43A047),
+              inactiveTrackColor: Colors.grey[800],
+              thumbColor: const Color(0xFF43A047),
+              overlayColor: const Color(0xFF43A047).withValues(alpha: 0.12),
+              trackHeight: 3,
+            ),
+            child: Slider(
+              value: riskPercent.clamp(1, 100),
+              min: 1,
+              max: 100,
+              divisions: 99,
+              label: '$riskLabel%',
+              onChanged: onRiskPercentChanged,
+            ),
+          ),
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: _riskPresets.map((preset) {
+              final selected = (riskPercent - preset).abs() < 0.5;
+              return GestureDetector(
+                onTap: () => onRiskPercentChanged(preset.toDouble()),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(8),
+                    color: selected
+                        ? const Color(0xFF43A047).withValues(alpha: 0.2)
+                        : Colors.black.withValues(alpha: 0.25),
+                    border: Border.all(
+                      color: selected
+                          ? const Color(0xFF43A047).withValues(alpha: 0.55)
+                          : Colors.grey[800]!,
+                    ),
+                  ),
+                  child: Text(
+                    '$preset%',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      color: selected ? const Color(0xFF43A047) : Colors.grey[500],
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 /// Single selectable row inside the Citadel execution choice dialog.
 class _CitadelExecutionOptionTile extends StatelessWidget {
   final IconData icon;
@@ -1763,6 +1993,10 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
   final String subtitle;
   final String? badge;
   final bool highlighted;
+  final bool showSliders;
+  final Color? accentColor;
+  final Color? actionColor;
+  final String? actionLabel;
   final double? leverage;
   final ValueChanged<double>? onLeverageChanged;
   final double? riskPercent;
@@ -1779,6 +2013,10 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
     required this.onTap,
     this.badge,
     this.highlighted = false,
+    this.showSliders = true,
+    this.accentColor,
+    this.actionColor,
+    this.actionLabel,
     this.leverage,
     this.onLeverageChanged,
     this.riskPercent,
@@ -1787,15 +2025,20 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final accent = accentColor ?? const Color(0xFF43A047);
     final borderColor = highlighted
-        ? const Color(0xFF43A047).withValues(alpha: 0.55)
+        ? accent.withValues(alpha: 0.55)
         : Colors.grey[800]!;
-    final bg = highlighted ? const Color(0xFF1B3320) : const Color(0xFF1E1E1E);
+    final bg = highlighted
+        ? (accentColor != null ? const Color(0xFF1A2533) : const Color(0xFF1B3320))
+        : const Color(0xFF1E1E1E);
     final roundedLeverage = leverage?.round() ?? 5;
     final riskValue = riskPercent ?? 1.0;
     final riskLabel = riskValue == riskValue.roundToDouble()
         ? riskValue.round().toString()
         : riskValue.toStringAsFixed(1);
+    final buttonColor = actionColor ?? const Color(0xFF43A047);
+    final buttonLabel = actionLabel ?? title;
 
     return Material(
       color: bg,
@@ -1839,7 +2082,7 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
                       ),
                     ),
                   if (highlighted)
-                    const Icon(Icons.chevron_right_rounded, color: Color(0xFF43A047)),
+                    Icon(Icons.chevron_right_rounded, color: accent),
                 ],
               ),
               const SizedBox(height: 10),
@@ -1847,7 +2090,7 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
                 subtitle,
                 style: TextStyle(fontSize: 13, height: 1.45, color: Colors.grey[500]),
               ),
-              if (highlighted && leverage != null && onLeverageChanged != null) ...[
+              if (showSliders && highlighted && leverage != null && onLeverageChanged != null) ...[
                 const SizedBox(height: 14),
                 Container(
                   padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
@@ -1894,7 +2137,7 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
                   ),
                 ),
               ],
-              if (highlighted && riskPercent != null && onRiskPercentChanged != null) ...[
+              if (showSliders && highlighted && riskPercent != null && onRiskPercentChanged != null) ...[
                 const SizedBox(height: 10),
                 Container(
                   padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
@@ -1990,14 +2233,14 @@ class _CitadelExecutionOptionTile extends StatelessWidget {
                   child: FilledButton(
                     onPressed: onTap,
                     style: FilledButton.styleFrom(
-                      backgroundColor: const Color(0xFF43A047),
+                      backgroundColor: buttonColor,
                       foregroundColor: Colors.white,
                       padding: const EdgeInsets.symmetric(vertical: 14),
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                     ),
-                    child: const Text(
-                      'Execute as MARKET Order NOW',
-                      style: TextStyle(fontWeight: FontWeight.w800, fontSize: 14),
+                    child: Text(
+                      buttonLabel,
+                      style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 14),
                     ),
                   ),
                 ),
@@ -2118,27 +2361,28 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
       if (!OracleCitadelStore.isConfigured) return;
     }
 
-    final serverLinked = await OracleCitadelService.verifyServerLinked();
-    if (!serverLinked) {
-      await OracleCitadelStore.clearExchangeLinked();
+    var linkStatus = await OracleCitadelService.checkServerLinked();
+    if (!linkStatus.linked) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: const Text(
-            'BloFin keys not found on server. Re-link in Oracle Citadel Setup (enter API Key + Secret, then Save).',
-          ),
-          backgroundColor: const Color(0xFFB71C1C),
-          behavior: SnackBarBehavior.floating,
-          duration: const Duration(seconds: 8),
-          action: SnackBarAction(
-            label: 'Setup',
-            textColor: Colors.white,
-            onPressed: () => showCitadelSetupDialog(context),
-          ),
-        ),
-      );
-      if (mounted) await showCitadelSetupDialog(context);
-      return;
+      ScaffoldMessenger.of(context).clearSnackBars();
+      await showCitadelSetupDialog(context);
+      await OracleCitadelStore.load();
+      if (!mounted) return;
+      linkStatus = await OracleCitadelService.checkServerLinked();
+      if (!linkStatus.linked) {
+        if (!mounted) return;
+        setState(() {
+          _sendErrorMessage = linkStatus.userMessage ??
+              'BloFin keys not found on server. Re-link in Oracle Citadel Setup '
+              '(enter App API Key + BloFin API Key + Secret, then Save & Connect).';
+        });
+        return;
+      }
+    }
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).clearSnackBars();
+      setState(() => _sendErrorMessage = null);
     }
 
     if (mounted) {
@@ -2285,6 +2529,22 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
                           fontWeight: FontWeight.w500,
                         ),
                       ),
+                    ),
+                    TextButton(
+                      onPressed: () async {
+                        _clearSendError();
+                        await showCitadelSetupDialog(context);
+                        if (!mounted) return;
+                        final ok = await OracleCitadelService.verifyServerLinked();
+                        if (ok) setState(() => _sendErrorMessage = null);
+                      },
+                      style: TextButton.styleFrom(
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      child: const Text('Setup', style: TextStyle(fontWeight: FontWeight.w700)),
                     ),
                     IconButton(
                       visualDensity: VisualDensity.compact,
