@@ -3889,7 +3889,7 @@ class MainScreen extends StatefulWidget {
   State<MainScreen> createState() => _MainScreenState();
 }
 
-class _MainScreenState extends State<MainScreen> {
+class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   static const int _tabHome = 0;
   static const int _tabCharts = 3;
 
@@ -3937,6 +3937,7 @@ class _MainScreenState extends State<MainScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadPersistedHistory();
     SubscriptionPlanStore.load();
     OracleCitadelStore.load();
@@ -3951,9 +3952,17 @@ class _MainScreenState extends State<MainScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     NotificationService.instance.registerDailyAnalysesNavigator(null);
     NotificationService.instance.onDailyAnalysisPayload = null;
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_refreshDailyAnalysesForHome());
+    }
   }
 
   Future<void> _ingestDailyAnalysisFromPush(Map<String, dynamic> data) async {
@@ -3967,6 +3976,7 @@ class _MainScreenState extends State<MainScreen> {
   }
 
   Future<void> _applyDailyAnalysesToHistory() async {
+    _pruneAnalysisHistoryBeforeDay(_analysisDayKey(DateTime.now()));
     final merged = DailyAnalysisStore.mergeIntoHistory(history);
     if (!mounted) return;
     setState(() => history
@@ -5376,7 +5386,7 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Push notifications scroll target — Daily Analysis section on Home.
   final GlobalKey _dailyAnalysesSectionKey = GlobalKey();
 
-  /// Reload today's BTC / ETH / SOL cards from local store (after push, pull-refresh, Quick Analyze).
+  /// Reload today's BTC / ETH / SOL / XRP cards from local store (after push, pull-refresh, Quick Analyze).
   void reloadDailyAnalysesFromParent() {
     if (!mounted) return;
     _reloadDailyAnalysisItems();
@@ -5610,7 +5620,7 @@ class _HomeScreenState extends State<HomeScreen> {
           child: _AppEmptyState(
             icon: Icons.insights_outlined,
             title: 'No analysis yet',
-            subtitle: 'Run Quick Analyze — today\'s report appears here until tomorrow\'s update.',
+            subtitle: 'BTC, ETH, SOL, and XRP post here daily at 7:30 AM CST. Pull to refresh.',
           ),
         ),
       ];

@@ -23,6 +23,7 @@ Endpoints (lib/main.dart):
   POST /chat      — Expert Oracle Trader AI chat
   POST /exchange_keys — Oracle Citadel exchange key storage (encrypted secret)
   POST /execute_trade — Oracle Citadel trade execution (Flutter Send to Citadel)
+  GET  /daily_analyses — today's scheduled Home daily analysis batch (BTC, ETH, SOL, XRP)
 
 Price chain (analysis): Mobula → CoinGecko (aggressive) → Binance Spot/Futures
 Derivatives (/analyze): funding, OI, long/short ratio, liquidations (Binance Futures)
@@ -40,6 +41,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import re
 import time
 import uuid
@@ -102,6 +104,21 @@ CITADEL_ENCRYPTION_KEY = (os.getenv("CITADEL_ENCRYPTION_KEY") or "").strip()
 # Mount a Railway volume at /data and set CITADEL_DATA_DIR=/data so keys survive redeploys.
 _CITADEL_DATA_DIR = Path(os.getenv("CITADEL_DATA_DIR", str(_BACKEND_DIR / "data")))
 _CITADEL_KEYS_FILE = _CITADEL_DATA_DIR / "exchange_keys.json"
+
+# Home "Daily Analysis" — auto-generated BTC/ETH/SOL/XRP batch (7:30 AM America/Chicago).
+DAILY_ANALYSIS_ENABLED = os.getenv("DAILY_ANALYSIS_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+DAILY_ANALYSIS_TZ = os.getenv("DAILY_ANALYSIS_TZ", "America/Chicago")
+DAILY_ANALYSIS_HOUR = int(os.getenv("DAILY_ANALYSIS_HOUR", "7"))
+DAILY_ANALYSIS_MINUTE = int(os.getenv("DAILY_ANALYSIS_MINUTE", "30"))
+DAILY_ANALYSIS_COINS: tuple[str, ...] = ("BTC", "ETH", "SOL", "XRP")
+_DAILY_ANALYSIS_FILE = _CITADEL_DATA_DIR / "daily_analyses.json"
+_daily_scheduler_task: Optional[asyncio.Task] = None
+_last_daily_run_day: Optional[str] = None
 
 # BloFin Open API — demo/testnet uses a separate host from live production.
 BLOFIN_DEMO_API_BASE_URL = "https://demo-trading-openapi.blofin.com"
@@ -3957,6 +3974,160 @@ Then disclaimer."""
 
 
 # ---------------------------------------------------------------------------
+# Daily Analysis — scheduled batch (7:30 AM CST/CDT) + GET /daily_analyses
+# ---------------------------------------------------------------------------
+
+
+def _chicago_day_key(dt: Optional[datetime] = None) -> str:
+    local = dt or datetime.now(ZoneInfo(DAILY_ANALYSIS_TZ))
+    return local.strftime("%Y-%m-%d")
+
+
+def _load_daily_analysis_store() -> dict[str, Any]:
+    if not _DAILY_ANALYSIS_FILE.is_file():
+        return {}
+    try:
+        raw = json.loads(_DAILY_ANALYSIS_FILE.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception as exc:
+        logger.error("daily_analysis_read_failed path=%s err=%s", _DAILY_ANALYSIS_FILE, exc)
+        return {}
+
+
+def _persist_daily_analysis_batch(day: str, entries: list[dict[str, Any]]) -> None:
+    """Replace on-disk store with today's batch only (prior days are dropped)."""
+    payload = {
+        "day": day,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "analyses": entries,
+    }
+    _CITADEL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = _DAILY_ANALYSIS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(_DAILY_ANALYSIS_FILE)
+
+
+def _init_daily_scheduler_state() -> None:
+    global _last_daily_run_day
+    store = _load_daily_analysis_store()
+    day = store.get("day")
+    if isinstance(day, str) and day:
+        _last_daily_run_day = day
+
+
+async def _generate_daily_analysis_entry(coin: str, day: str) -> dict[str, Any]:
+    """Build one daily analysis row using the same Grok pipeline as POST /analyze."""
+    normalized = coin.strip().upper()
+    mode = "analysis"
+    direction = normalize_direction("Smart Direction")
+    timeframe = "1D"
+    market = fetch_live_price_for_analysis(normalized)
+    derivatives = fetch_derivatives_snapshot(normalized, spot_price=float(market["price"]))
+    system_prompt = default_system_prompt(mode, scalp_mode=False)
+    user_prompt = build_analyze_user_prompt(
+        coin=normalized,
+        timeframe=timeframe,
+        mode=mode,
+        direction=direction,
+        market=market,
+        scalp_mode=False,
+        derivatives=derivatives,
+    )
+    try:
+        report = await run_grok_in_executor(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.36,
+            max_tokens=1520,
+        )
+    except asyncio.TimeoutError:
+        reason = f"daily analysis exceeded {ANALYZE_ROUTE_TIMEOUT}s"
+        logger.error("daily_analysis_grok_timeout coin=%s %s", normalized, reason)
+        report = build_analyze_fallback_report(
+            coin=normalized, mode=mode, market=market, reason=reason
+        )
+    except GrokError as exc:
+        logger.error(
+            "daily_analysis_grok_failed coin=%s msg=%s http=%s",
+            normalized,
+            exc.user_message,
+            exc.status_code,
+        )
+        report = build_analyze_fallback_report(
+            coin=normalized, mode=mode, market=market, reason=exc.user_message
+        )
+    report = ensure_disclaimer(report)
+    local_now = datetime.now(ZoneInfo(DAILY_ANALYSIS_TZ))
+    return {
+        "id": f"{day}_{normalized}",
+        "coin": normalized,
+        "report": report,
+        "bias": "",
+        "current_price": market["price"],
+        "price_source": market.get("source"),
+        "analysisDay": day,
+        "source": "analysis",
+        "time": f"{local_now.month}/{local_now.day} {local_now.hour}:{local_now.minute:02d}",
+    }
+
+
+async def _run_daily_analysis_batch(*, reason: str = "scheduled") -> None:
+    global _last_daily_run_day
+    day = _chicago_day_key()
+    logger.info("daily_analysis_batch_start day=%s reason=%s coins=%s", day, reason, DAILY_ANALYSIS_COINS)
+    entries: list[dict[str, Any]] = []
+    for coin in DAILY_ANALYSIS_COINS:
+        try:
+            entries.append(await _generate_daily_analysis_entry(coin, day))
+            logger.info("daily_analysis_coin_done coin=%s day=%s", coin, day)
+        except Exception as exc:
+            logger.exception("daily_analysis_coin_failed coin=%s day=%s err=%s", coin, day, exc)
+    if entries:
+        _persist_daily_analysis_batch(day, entries)
+        _last_daily_run_day = day
+        logger.info("daily_analysis_batch_saved day=%s count=%s", day, len(entries))
+    else:
+        logger.error("daily_analysis_batch_empty day=%s reason=%s", day, reason)
+
+
+async def _maybe_catchup_daily_analyses() -> None:
+    """If server starts after 7:30 AM Chicago and today's batch is missing, generate it."""
+    if not DAILY_ANALYSIS_ENABLED or not GROK_API_KEY:
+        return
+    day = _chicago_day_key()
+    store = _load_daily_analysis_store()
+    existing = store.get("analyses") if store.get("day") == day else []
+    if isinstance(existing, list) and len(existing) >= len(DAILY_ANALYSIS_COINS):
+        return
+    now = datetime.now(ZoneInfo(DAILY_ANALYSIS_TZ))
+    if now.hour < DAILY_ANALYSIS_HOUR or (
+        now.hour == DAILY_ANALYSIS_HOUR and now.minute < DAILY_ANALYSIS_MINUTE
+    ):
+        return
+    await _run_daily_analysis_batch(reason="startup_catchup")
+
+
+async def _daily_analysis_scheduler_loop() -> None:
+    global _last_daily_run_day
+    while True:
+        try:
+            if DAILY_ANALYSIS_ENABLED and GROK_API_KEY:
+                now = datetime.now(ZoneInfo(DAILY_ANALYSIS_TZ))
+                day = now.strftime("%Y-%m-%d")
+                if (
+                    now.hour == DAILY_ANALYSIS_HOUR
+                    and now.minute == DAILY_ANALYSIS_MINUTE
+                    and _last_daily_run_day != day
+                ):
+                    await _run_daily_analysis_batch(reason="scheduler")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("daily_analysis_scheduler err=%s", exc)
+        await asyncio.sleep(30)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
 
@@ -3987,7 +4158,30 @@ async def lifespan(app: FastAPI):
         )
     else:
         logger.info("startup | grok_model=%s configured (key present)", GROK_MODEL)
+
+    global _daily_scheduler_task
+    _init_daily_scheduler_state()
+    if DAILY_ANALYSIS_ENABLED:
+        logger.info(
+            "startup | daily_analysis enabled tz=%s at=%02d:%02d coins=%s",
+            DAILY_ANALYSIS_TZ,
+            DAILY_ANALYSIS_HOUR,
+            DAILY_ANALYSIS_MINUTE,
+            ",".join(DAILY_ANALYSIS_COINS),
+        )
+        _daily_scheduler_task = asyncio.create_task(_daily_analysis_scheduler_loop())
+        asyncio.create_task(_maybe_catchup_daily_analyses())
+    else:
+        logger.info("startup | daily_analysis disabled (DAILY_ANALYSIS_ENABLED=false)")
+
     yield
+
+    if _daily_scheduler_task is not None:
+        _daily_scheduler_task.cancel()
+        try:
+            await _daily_scheduler_task
+        except asyncio.CancelledError:
+            pass
     logger.info("shutdown | shutting down Grok executor")
     _GROK_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
@@ -4363,6 +4557,29 @@ async def analyze_api_prefix(request: AnalyzeRequest, http_request: Request):
 @app.post("/api/tradesetup")
 async def trade_setup_api_prefix(request: AnalyzeRequest, http_request: Request):
     return await _handle_analyze(request, http_request, mode_override="tradesetup")
+
+
+@app.get("/daily_analyses")
+@app.get("/daily_analyses/")
+@app.get("/api/daily_analyses")
+async def get_daily_analyses() -> dict[str, Any]:
+    """Today's scheduled daily analyses for Home (BTC, ETH, SOL, XRP)."""
+    day = _chicago_day_key()
+    store = _load_daily_analysis_store()
+    analyses: list[Any] = []
+    if store.get("day") == day:
+        raw = store.get("analyses")
+        if isinstance(raw, list):
+            analyses = raw
+    return {
+        "success": True,
+        "day": day,
+        "analyses": analyses,
+        "count": len(analyses),
+        "coins": list(DAILY_ANALYSIS_COINS),
+        "timezone": DAILY_ANALYSIS_TZ,
+        "scheduled_at": f"{DAILY_ANALYSIS_HOUR:02d}:{DAILY_ANALYSIS_MINUTE:02d}",
+    }
 
 
 @app.get("/api/health")

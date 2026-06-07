@@ -200,7 +200,7 @@ class NotificationService {
     await _local.zonedSchedule(
       dailyMorningNotificationId,
       OracleNotificationType.dailyUpdate.title,
-      'Your daily BTC, ETH, and SOL analysis is ready. Open the app for On-Chain Oracle insights.',
+      'Your daily BTC, ETH, SOL, and XRP analysis is ready. Open the app for On-Chain Oracle insights.',
       scheduled,
       _detailsFor(OracleNotificationType.dailyUpdate),
       androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
@@ -245,7 +245,7 @@ class NotificationService {
     await _showLocal(
       type: OracleNotificationType.dailyUpdate,
       title: OracleNotificationType.dailyUpdate.title,
-      body: body ?? 'Morning briefing: check BTC, ETH, SOL daily reports in the app.',
+      body: body ?? 'Morning briefing: check BTC, ETH, SOL, and XRP daily reports in the app.',
       payload: {'type': OracleNotificationType.dailyUpdate.name},
     );
   }

@@ -4,12 +4,12 @@ import 'package:flutter/foundation.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:http/http.dart' as http;
 
-/// Local persistence + backend ingest for Home "Daily Analysis" (BTC, ETH, SOL).
+/// Local persistence + backend ingest for Home "Daily Analysis" (BTC, ETH, SOL, XRP).
 abstract final class DailyAnalysisStore {
   static const _boxName = 'oco_daily_analysis';
   static const _byDayKey = 'analyses_by_day';
 
-  static const List<String> dailyCoins = ['BTC', 'ETH', 'SOL'];
+  static const List<String> dailyCoins = ['BTC', 'ETH', 'SOL', 'XRP'];
 
   static Box<dynamic>? _box;
 
@@ -64,7 +64,7 @@ abstract final class DailyAnalysisStore {
     return map;
   }
 
-  /// BTC → ETH → SOL, then any other coins saved today.
+  /// BTC → ETH → SOL → XRP, then any other coins saved today.
   static List<Map<String, dynamic>> loadTodayOrdered({String? day}) {
     final byCoin = loadTodayByCoin(day: day);
     final ordered = <Map<String, dynamic>>[];
@@ -118,6 +118,9 @@ abstract final class DailyAnalysisStore {
     Iterable<Map<String, dynamic>> items, {
     String ingestSource = 'backend',
   }) async {
+    if (ingestSource == 'backend') {
+      return replaceTodayBatch(items, ingestSource: ingestSource);
+    }
     for (final raw in items) {
       final coin = raw['coin']?.toString();
       final report = (raw['report'] ?? raw['analysis'] ?? raw['text'])?.toString() ?? '';
@@ -136,6 +139,42 @@ abstract final class DailyAnalysisStore {
       );
     }
     return loadTodayOrdered();
+  }
+
+  /// Replace local store with today's backend batch — drops all prior days.
+  static Future<List<Map<String, dynamic>>> replaceTodayBatch(
+    Iterable<Map<String, dynamic>> items, {
+    String ingestSource = 'backend',
+  }) async {
+    await init();
+    final dk = dayKey();
+    final dayRows = <Map<String, dynamic>>[];
+    for (final raw in items) {
+      final coin = raw['coin']?.toString();
+      final report = (raw['report'] ?? raw['analysis'] ?? raw['text'])?.toString() ?? '';
+      if (coin == null || report.trim().isEmpty) continue;
+      final normalized = _normalizeCoin(coin) ?? coin.toUpperCase();
+      final analysisDay = raw['analysisDay']?.toString() ?? dk;
+      dayRows.add(<String, dynamic>{
+        'id': raw['id']?.toString() ?? '${analysisDay}_$normalized',
+        'coin': normalized,
+        'report': report,
+        'bias': raw['bias']?.toString() ?? raw['direction']?.toString() ?? '',
+        'confidence': raw['confidence'] ?? raw['confidence_percent'],
+        'key_levels': raw['key_levels'] is Map
+            ? Map<String, dynamic>.from(raw['key_levels'] as Map)
+            : raw['keyLevels'] is Map
+                ? Map<String, dynamic>.from(raw['keyLevels'] as Map)
+                : null,
+        'time': raw['time']?.toString() ?? _formatTime(DateTime.now()),
+        'source': 'analysis',
+        'analysisDay': analysisDay,
+        'ingestSource': ingestSource,
+        'updatedAt': DateTime.now().toIso8601String(),
+      });
+    }
+    await _saveAllDays({dk: dayRows});
+    return loadTodayOrdered(day: dk);
   }
 
   /// FCM / local notification payload (single coin or batch).
