@@ -1,6 +1,7 @@
 # Restore On-Chain Oracle AI to the oco-complete-stable snapshot.
 # Use when you need to revert to the last known-good full build:
-#   Oracle Vision, Oracle Desk, Citadel leverage + position size (setup + market dialog),
+#   Oracle Vision, Oracle Desk, Citadel market + limit orders (demo/live routing),
+#   automated daily analysis (BTC, ETH, SOL, XRP @ 7:30 AM CST),
 #   post-fill success screen, BloFin live price, margin-safe order sizing.
 #
 # Usage (from repo root or scripts folder):
@@ -17,6 +18,8 @@ $restores = @(
     @{ backup = "lib\screens\oracle_desk_screen.dart.oco-complete-stable.backup"; target = "lib\screens\oracle_desk_screen.dart" },
     @{ backup = "lib\services\oracle_vision_service.dart.oco-complete-stable.backup"; target = "lib\services\oracle_vision_service.dart" },
     @{ backup = "lib\services\oracle_desk_service.dart.oco-complete-stable.backup"; target = "lib\services\oracle_desk_service.dart" },
+    @{ backup = "lib\services\daily_analysis_store.dart.oco-complete-stable.backup"; target = "lib\services\daily_analysis_store.dart" },
+    @{ backup = "lib\services\notification_service.dart.oco-complete-stable.backup"; target = "lib\services\notification_service.dart" },
     @{ backup = "backend\api.py.oco-complete-stable.backup"; target = "backend\api.py" },
     @{ backup = "backend\test_citadel_leverage.py.oco-complete-stable.backup"; target = "backend\test_citadel_leverage.py" }
 )

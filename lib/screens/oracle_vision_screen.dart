@@ -77,14 +77,14 @@ abstract final class _OracleVisionLiveCopy {
     final fund = _fundingSnippet(opp.coin);
     final side = opp.direction.isLong ? 'bid absorption' : 'offer pressure';
     final vwap = opp.direction.isLong ? 'reclaiming' : 'rejecting';
-    return '${opp.coin} $timeframe: $vwap session VWAP, $side + $fund — Oracle flow ${opp.direction.label}.';
+    return '${opp.coin} $timeframe: $vwap Daily VWAP, $side + $fund — ${opp.direction.label} bias.';
   }
 
   static String _enrichPulse(String base, OraclePulseOpportunity opp, String timeframe) {
     if (base.contains(timeframe) || base.contains('VWAP') || base.contains('funding')) {
       return base;
     }
-    return '$base · $timeframe tape in sync with ${opp.direction.label} bias.';
+    return '$base · $timeframe structure lining up ${opp.direction.label}.';
   }
 }
 
@@ -424,7 +424,7 @@ class _LiquidationHeatmapPanel extends StatelessWidget {
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    'Pinned liq clusters · $timeframe tape',
+                    'Pinned liq clusters · $timeframe structure',
                     style: TextStyle(fontSize: 11, color: Colors.grey[600], height: 1.25),
                   ),
                   const SizedBox(height: 8),

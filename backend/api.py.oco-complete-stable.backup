@@ -23,6 +23,7 @@ Endpoints (lib/main.dart):
   POST /chat      — Expert Oracle Trader AI chat
   POST /exchange_keys — Oracle Citadel exchange key storage (encrypted secret)
   POST /execute_trade — Oracle Citadel trade execution (Flutter Send to Citadel)
+  GET  /daily_analyses — today's scheduled Home daily analysis batch (BTC, ETH, SOL, XRP)
 
 Price chain (analysis): Mobula → CoinGecko (aggressive) → Binance Spot/Futures
 Derivatives (/analyze): funding, OI, long/short ratio, liquidations (Binance Futures)
@@ -40,6 +41,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import re
 import time
 import uuid
@@ -102,6 +104,21 @@ CITADEL_ENCRYPTION_KEY = (os.getenv("CITADEL_ENCRYPTION_KEY") or "").strip()
 # Mount a Railway volume at /data and set CITADEL_DATA_DIR=/data so keys survive redeploys.
 _CITADEL_DATA_DIR = Path(os.getenv("CITADEL_DATA_DIR", str(_BACKEND_DIR / "data")))
 _CITADEL_KEYS_FILE = _CITADEL_DATA_DIR / "exchange_keys.json"
+
+# Home "Daily Analysis" — auto-generated BTC/ETH/SOL/XRP batch (7:30 AM America/Chicago).
+DAILY_ANALYSIS_ENABLED = os.getenv("DAILY_ANALYSIS_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+DAILY_ANALYSIS_TZ = os.getenv("DAILY_ANALYSIS_TZ", "America/Chicago")
+DAILY_ANALYSIS_HOUR = int(os.getenv("DAILY_ANALYSIS_HOUR", "7"))
+DAILY_ANALYSIS_MINUTE = int(os.getenv("DAILY_ANALYSIS_MINUTE", "30"))
+DAILY_ANALYSIS_COINS: tuple[str, ...] = ("BTC", "ETH", "SOL", "XRP")
+_DAILY_ANALYSIS_FILE = _CITADEL_DATA_DIR / "daily_analyses.json"
+_daily_scheduler_task: Optional[asyncio.Task] = None
+_last_daily_run_day: Optional[str] = None
 
 # BloFin Open API — demo/testnet uses a separate host from live production.
 BLOFIN_DEMO_API_BASE_URL = "https://demo-trading-openapi.blofin.com"
@@ -309,7 +326,7 @@ class ExchangeKeysRequest(BaseModel):
 
 class ExecuteTradeRequest(BaseModel):
     """
-    Oracle Citadel trade execution — MARKET only (BloFin).
+    Oracle Citadel trade execution — MARKET or LIMIT (BloFin).
     """
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
@@ -324,6 +341,10 @@ class ExecuteTradeRequest(BaseModel):
     risk_percent: float = Field(1.0, ge=0.1, le=100.0)
     leverage: float = Field(float(BLOFIN_DEFAULT_LEVERAGE), ge=1.0, le=100.0)
     order_type: str = Field("market", max_length=16)
+    use_demo_mode: Optional[bool] = Field(
+        None,
+        validation_alias=AliasChoices("use_demo_mode", "demo_mode"),
+    )
 
     @field_validator("user_id", "coin", "direction", mode="before")
     @classmethod
@@ -350,6 +371,11 @@ class ExecuteTradeRequest(BaseModel):
     @field_validator("order_type", mode="before")
     @classmethod
     def _normalize_order_type(cls, value: Any) -> str:
+        if value is None:
+            return "market"
+        token = str(value).strip().lower()
+        if token == "limit":
+            return "limit"
         return "market"
 
 
@@ -1725,6 +1751,96 @@ def get_citadel_user_record(user_id: str) -> Optional[dict[str, Any]]:
     return _normalize_citadel_exchange_record(record)
 
 
+def _coerce_demo_mode_flag(value: Any) -> Optional[bool]:
+    """Parse use_demo_mode / demo_mode from JSON (bool, 0/1, true/false strings)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"", "null", "none"}:
+        return None
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _record_prefers_blofin_demo(record: dict[str, Any]) -> bool:
+    return bool(record.get("use_demo_mode")) or (
+        "demo-trading-openapi.blofin.com"
+        in str(record.get("api_base_url") or "").lower()
+    )
+
+
+def _resolve_execute_trade_blofin_profile(
+    record: dict[str, Any],
+    raw_body: dict[str, Any],
+    *,
+    user_id: str,
+    req_id: str,
+) -> dict[str, Any]:
+    """
+    Pick BloFin demo vs live host for this trade.
+    Flutter's use_demo_mode wins over stale server rows (demo keys on live host → 152401).
+    """
+    client_demo = _coerce_demo_mode_flag(
+        raw_body.get("use_demo_mode", raw_body.get("demo_mode"))
+    )
+    record_demo = _record_prefers_blofin_demo(record)
+    use_demo = record_demo if client_demo is None else client_demo
+    profile = resolve_citadel_exchange_profile(record.get("exchange") or "blofin", use_demo)
+    api_base = profile.get("api_base_url") or BLOFIN_LIVE_API_BASE_URL
+
+    if client_demo is not None and client_demo != record_demo:
+        try:
+            store = _load_citadel_key_store()
+            row = store.get(user_id)
+            if isinstance(row, dict):
+                row["use_demo_mode"] = use_demo
+                row["environment"] = profile["environment"]
+                row["api_base_url"] = api_base
+                row["exchange"] = profile["exchange"]
+                row["updated_at"] = datetime.now(timezone.utc).isoformat()
+                store[user_id] = row
+                _save_citadel_key_store(store)
+                logger.info(
+                    "citadel_demo_profile_synced request_id=%s user_id=%s use_demo=%s base=%s",
+                    req_id,
+                    user_id,
+                    use_demo,
+                    api_base,
+                )
+        except Exception as exc:
+            logger.warning(
+                "citadel_demo_profile_sync_failed request_id=%s user_id=%s err=%s",
+                req_id,
+                user_id,
+                exc,
+            )
+
+    if client_demo is not None and client_demo != record_demo:
+        logger.info(
+            "execute_trade_demo_override request_id=%s user_id=%s record_demo=%s "
+            "client_demo=%s base=%s",
+            req_id,
+            user_id,
+            record_demo,
+            client_demo,
+            api_base,
+        )
+
+    return {
+        "exchange": profile["exchange"],
+        "environment": profile["environment"],
+        "api_base_url": api_base,
+        "use_demo_mode": use_demo,
+    }
+
+
 def _execute_trade_log_payload(body: dict[str, Any]) -> dict[str, Any]:
     """Log-safe view of execute_trade JSON — never includes API keys or secrets."""
     return {
@@ -1738,6 +1854,7 @@ def _execute_trade_log_payload(body: dict[str, Any]) -> dict[str, Any]:
         "tp2": body.get("tp2"),
         "risk_percent": body.get("risk_percent"),
         "leverage": body.get("leverage"),
+        "use_demo_mode": body.get("use_demo_mode", body.get("demo_mode")),
     }
 
 
@@ -1750,21 +1867,35 @@ def _coerce_positive_float(value: Any) -> Optional[float]:
 
 
 def _normalize_execute_trade_payload(raw: dict[str, Any]) -> dict[str, Any]:
-    """Map Flutter payloads — Oracle Citadel accepts MARKET orders only."""
+    """Map Flutter payloads; MARKET when order_type=market or entry_price=\"market\"."""
     data = dict(raw)
-    data["order_type"] = "market"
+    order_token = str(data.get("order_type", "market")).strip().lower()
     entry_raw = data.get("entry_price", data.get("entry"))
     entry_is_market = isinstance(entry_raw, str) and entry_raw.strip().lower() == "market"
-    if entry_is_market:
-        sl = _coerce_positive_float(data.get("stop_loss") or data.get("sl"))
-        tp1 = _coerce_positive_float(data.get("tp1"))
-        ref = (tp1 + sl) / 2 if sl is not None and tp1 is not None else None
-        data["entry_price"] = ref if ref is not None else _coerce_positive_float(data.get("entry_price")) or 1.0
+    is_market = order_token == "market" or entry_is_market
+
+    if is_market:
+        data["order_type"] = "market"
+        if entry_is_market:
+            sl = _coerce_positive_float(data.get("stop_loss") or data.get("sl"))
+            tp1 = _coerce_positive_float(data.get("tp1"))
+            ref = (tp1 + sl) / 2 if sl is not None and tp1 is not None else None
+            data["entry_price"] = ref if ref is not None else _coerce_positive_float(data.get("entry_price")) or 1.0
+    else:
+        data["order_type"] = "limit"
     return data
 
 
+def _is_market_trade_request(trade: ExecuteTradeRequest, raw_body: dict[str, Any]) -> bool:
+    """True when client requests immediate market entry."""
+    if trade.order_type == "market":
+        return True
+    entry_raw = raw_body.get("entry_price", raw_body.get("entry"))
+    return isinstance(entry_raw, str) and entry_raw.strip().lower() == "market"
+
+
 def _parse_execute_trade_request(raw_body: dict[str, Any]) -> ExecuteTradeRequest:
-    """Validate execute_trade payload (MARKET-only Citadel)."""
+    """Validate execute_trade payload (MARKET + LIMIT)."""
     return ExecuteTradeRequest.model_validate(_normalize_execute_trade_payload(raw_body))
 
 
@@ -2407,6 +2538,128 @@ async def _blofin_confirm_market_fill(
     return last
 
 
+def _blofin_limit_order_accepted(
+    *,
+    state: Any = None,
+    filled_size: Any = None,
+    filled_amount: Any = None,
+) -> tuple[bool, str]:
+    """
+    LIMIT success = resting on book (live) OR already filled (price traded through limit).
+    Returns (ok, limit_status) where limit_status is resting|filled.
+    """
+    token = str(state or "").strip().lower()
+    if token in {"live", "partially_filled"}:
+        return True, "resting"
+    if _blofin_market_fill_satisfied(
+        filled_size=filled_size,
+        filled_amount=filled_amount,
+        state=state,
+    ):
+        return True, "filled"
+    if token == "filled":
+        return True, "filled"
+    return False, ""
+
+
+async def _blofin_confirm_limit_order(
+    *,
+    base_url: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    inst_id: str,
+    order_id: str,
+    placement: dict[str, Any],
+    request_id: str = "?",
+) -> dict[str, Any]:
+    """
+    Confirm LIMIT placement succeeded — resting on book OR filled immediately.
+    """
+    ok, limit_status = _blofin_limit_order_accepted(
+        state=placement.get("state"),
+        filled_size=placement.get("filled_size"),
+        filled_amount=placement.get("filled_amount"),
+    )
+    if ok:
+        logger.info(
+            "execute_trade_limit_confirmed request_id=%s order_id=%s source=placement "
+            "state=%s limit_status=%s filled=%s",
+            request_id,
+            order_id,
+            placement.get("state"),
+            limit_status,
+            placement.get("filled_size"),
+        )
+        return {
+            "limit_ok": True,
+            "live_ok": limit_status == "resting",
+            "ok": True,
+            "limit_status": limit_status,
+            "state": placement.get("state"),
+            "filled_size": placement.get("filled_size"),
+            "average_price": placement.get("average_price"),
+            "size": placement.get("remaining_size"),
+            "poll_attempt": 0,
+            "source": "placement",
+        }
+
+    await asyncio.sleep(BLOFIN_POST_ORDER_CONFIRM_DELAY_SEC)
+
+    last: dict[str, Any] = {"limit_ok": False, "live_ok": False, "ok": False}
+    for attempt in range(1, BLOFIN_MARKET_FILL_CONFIRM_MAX_POLLS + 1):
+        detail = _blofin_fetch_order_detail(
+            base_url=base_url,
+            api_key=api_key,
+            api_secret=api_secret,
+            passphrase=passphrase,
+            inst_id=inst_id,
+            order_id=order_id,
+            request_id=request_id,
+        )
+        ok, limit_status = _blofin_limit_order_accepted(
+            state=detail.get("state"),
+            filled_size=detail.get("filled_size"),
+            filled_amount=detail.get("filled_amount"),
+        )
+        limit_ok = bool(detail.get("ok")) and ok
+        last = {
+            **detail,
+            "limit_ok": limit_ok,
+            "live_ok": limit_ok and limit_status == "resting",
+            "limit_status": limit_status if limit_ok else "",
+            "poll_attempt": attempt,
+            "source": "order_detail",
+        }
+        if limit_ok:
+            logger.info(
+                "execute_trade_limit_confirmed request_id=%s order_id=%s source=order_detail "
+                "poll=%s state=%s limit_status=%s filled=%s avg=%s",
+                request_id,
+                order_id,
+                attempt,
+                detail.get("state"),
+                limit_status,
+                detail.get("filled_size"),
+                detail.get("average_price"),
+            )
+            return last
+        if attempt < BLOFIN_MARKET_FILL_CONFIRM_MAX_POLLS:
+            await asyncio.sleep(BLOFIN_MARKET_FILL_CONFIRM_POLL_SEC)
+
+    logger.warning(
+        "execute_trade_limit_unconfirmed request_id=%s order_id=%s polls=%s "
+        "last_state=%s last_filled=%s last_ok=%s",
+        request_id,
+        order_id,
+        BLOFIN_MARKET_FILL_CONFIRM_MAX_POLLS,
+        last.get("state"),
+        last.get("filled_size"),
+        last.get("ok"),
+    )
+    return last
+
+
 def _normalize_citadel_leverage(value: Any) -> int:
     """Clamp Citadel leverage to BloFin-safe 1x–100x (default 5x)."""
     try:
@@ -2482,7 +2735,7 @@ def _blofin_place_order(
     """
     Place order on BloFin.
     MARKET: orderType=market — no price field (BloFin rejects price on market orders).
-    LIMIT: orderType=limit + price (not used by Citadel — MARKET-only).
+    LIMIT: orderType=limit + price (Citadel limit path).
     TP/SL: trigger prices + -1 market execution + triggerPriceType=last per BloFin docs.
     """
     inst_id = _blofin_inst_id(coin)
@@ -2709,6 +2962,12 @@ def _blofin_user_friendly_error(code: Any, msg: Optional[str]) -> str:
     text = (msg or "").strip()
     code_str = str(code or "")
     lower = text.lower()
+    if code_str == "152401" or "access key does not exist" in lower:
+        return (
+            "BloFin rejected your API key for this environment. "
+            "BloFin Demo keys require 'Use Demo/Testnet Mode' ON in Oracle Citadel Setup. "
+            "Live keys require Demo OFF."
+        )
     if code_str == "152409" or "signature verification failed" in lower:
         return (
             "Signature verification failed - please double-check API Key, Secret, "
@@ -3715,6 +3974,160 @@ Then disclaimer."""
 
 
 # ---------------------------------------------------------------------------
+# Daily Analysis — scheduled batch (7:30 AM CST/CDT) + GET /daily_analyses
+# ---------------------------------------------------------------------------
+
+
+def _chicago_day_key(dt: Optional[datetime] = None) -> str:
+    local = dt or datetime.now(ZoneInfo(DAILY_ANALYSIS_TZ))
+    return local.strftime("%Y-%m-%d")
+
+
+def _load_daily_analysis_store() -> dict[str, Any]:
+    if not _DAILY_ANALYSIS_FILE.is_file():
+        return {}
+    try:
+        raw = json.loads(_DAILY_ANALYSIS_FILE.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception as exc:
+        logger.error("daily_analysis_read_failed path=%s err=%s", _DAILY_ANALYSIS_FILE, exc)
+        return {}
+
+
+def _persist_daily_analysis_batch(day: str, entries: list[dict[str, Any]]) -> None:
+    """Replace on-disk store with today's batch only (prior days are dropped)."""
+    payload = {
+        "day": day,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "analyses": entries,
+    }
+    _CITADEL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = _DAILY_ANALYSIS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(_DAILY_ANALYSIS_FILE)
+
+
+def _init_daily_scheduler_state() -> None:
+    global _last_daily_run_day
+    store = _load_daily_analysis_store()
+    day = store.get("day")
+    if isinstance(day, str) and day:
+        _last_daily_run_day = day
+
+
+async def _generate_daily_analysis_entry(coin: str, day: str) -> dict[str, Any]:
+    """Build one daily analysis row using the same Grok pipeline as POST /analyze."""
+    normalized = coin.strip().upper()
+    mode = "analysis"
+    direction = normalize_direction("Smart Direction")
+    timeframe = "1D"
+    market = fetch_live_price_for_analysis(normalized)
+    derivatives = fetch_derivatives_snapshot(normalized, spot_price=float(market["price"]))
+    system_prompt = default_system_prompt(mode, scalp_mode=False)
+    user_prompt = build_analyze_user_prompt(
+        coin=normalized,
+        timeframe=timeframe,
+        mode=mode,
+        direction=direction,
+        market=market,
+        scalp_mode=False,
+        derivatives=derivatives,
+    )
+    try:
+        report = await run_grok_in_executor(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.36,
+            max_tokens=1520,
+        )
+    except asyncio.TimeoutError:
+        reason = f"daily analysis exceeded {ANALYZE_ROUTE_TIMEOUT}s"
+        logger.error("daily_analysis_grok_timeout coin=%s %s", normalized, reason)
+        report = build_analyze_fallback_report(
+            coin=normalized, mode=mode, market=market, reason=reason
+        )
+    except GrokError as exc:
+        logger.error(
+            "daily_analysis_grok_failed coin=%s msg=%s http=%s",
+            normalized,
+            exc.user_message,
+            exc.status_code,
+        )
+        report = build_analyze_fallback_report(
+            coin=normalized, mode=mode, market=market, reason=exc.user_message
+        )
+    report = ensure_disclaimer(report)
+    local_now = datetime.now(ZoneInfo(DAILY_ANALYSIS_TZ))
+    return {
+        "id": f"{day}_{normalized}",
+        "coin": normalized,
+        "report": report,
+        "bias": "",
+        "current_price": market["price"],
+        "price_source": market.get("source"),
+        "analysisDay": day,
+        "source": "analysis",
+        "time": f"{local_now.month}/{local_now.day} {local_now.hour}:{local_now.minute:02d}",
+    }
+
+
+async def _run_daily_analysis_batch(*, reason: str = "scheduled") -> None:
+    global _last_daily_run_day
+    day = _chicago_day_key()
+    logger.info("daily_analysis_batch_start day=%s reason=%s coins=%s", day, reason, DAILY_ANALYSIS_COINS)
+    entries: list[dict[str, Any]] = []
+    for coin in DAILY_ANALYSIS_COINS:
+        try:
+            entries.append(await _generate_daily_analysis_entry(coin, day))
+            logger.info("daily_analysis_coin_done coin=%s day=%s", coin, day)
+        except Exception as exc:
+            logger.exception("daily_analysis_coin_failed coin=%s day=%s err=%s", coin, day, exc)
+    if entries:
+        _persist_daily_analysis_batch(day, entries)
+        _last_daily_run_day = day
+        logger.info("daily_analysis_batch_saved day=%s count=%s", day, len(entries))
+    else:
+        logger.error("daily_analysis_batch_empty day=%s reason=%s", day, reason)
+
+
+async def _maybe_catchup_daily_analyses() -> None:
+    """If server starts after 7:30 AM Chicago and today's batch is missing, generate it."""
+    if not DAILY_ANALYSIS_ENABLED or not GROK_API_KEY:
+        return
+    day = _chicago_day_key()
+    store = _load_daily_analysis_store()
+    existing = store.get("analyses") if store.get("day") == day else []
+    if isinstance(existing, list) and len(existing) >= len(DAILY_ANALYSIS_COINS):
+        return
+    now = datetime.now(ZoneInfo(DAILY_ANALYSIS_TZ))
+    if now.hour < DAILY_ANALYSIS_HOUR or (
+        now.hour == DAILY_ANALYSIS_HOUR and now.minute < DAILY_ANALYSIS_MINUTE
+    ):
+        return
+    await _run_daily_analysis_batch(reason="startup_catchup")
+
+
+async def _daily_analysis_scheduler_loop() -> None:
+    global _last_daily_run_day
+    while True:
+        try:
+            if DAILY_ANALYSIS_ENABLED and GROK_API_KEY:
+                now = datetime.now(ZoneInfo(DAILY_ANALYSIS_TZ))
+                day = now.strftime("%Y-%m-%d")
+                if (
+                    now.hour == DAILY_ANALYSIS_HOUR
+                    and now.minute == DAILY_ANALYSIS_MINUTE
+                    and _last_daily_run_day != day
+                ):
+                    await _run_daily_analysis_batch(reason="scheduler")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("daily_analysis_scheduler err=%s", exc)
+        await asyncio.sleep(30)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
 
@@ -3745,7 +4158,30 @@ async def lifespan(app: FastAPI):
         )
     else:
         logger.info("startup | grok_model=%s configured (key present)", GROK_MODEL)
+
+    global _daily_scheduler_task
+    _init_daily_scheduler_state()
+    if DAILY_ANALYSIS_ENABLED:
+        logger.info(
+            "startup | daily_analysis enabled tz=%s at=%02d:%02d coins=%s",
+            DAILY_ANALYSIS_TZ,
+            DAILY_ANALYSIS_HOUR,
+            DAILY_ANALYSIS_MINUTE,
+            ",".join(DAILY_ANALYSIS_COINS),
+        )
+        _daily_scheduler_task = asyncio.create_task(_daily_analysis_scheduler_loop())
+        asyncio.create_task(_maybe_catchup_daily_analyses())
+    else:
+        logger.info("startup | daily_analysis disabled (DAILY_ANALYSIS_ENABLED=false)")
+
     yield
+
+    if _daily_scheduler_task is not None:
+        _daily_scheduler_task.cancel()
+        try:
+            await _daily_scheduler_task
+        except asyncio.CancelledError:
+            pass
     logger.info("shutdown | shutting down Grok executor")
     _GROK_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
@@ -4121,6 +4557,29 @@ async def analyze_api_prefix(request: AnalyzeRequest, http_request: Request):
 @app.post("/api/tradesetup")
 async def trade_setup_api_prefix(request: AnalyzeRequest, http_request: Request):
     return await _handle_analyze(request, http_request, mode_override="tradesetup")
+
+
+@app.get("/daily_analyses")
+@app.get("/daily_analyses/")
+@app.get("/api/daily_analyses")
+async def get_daily_analyses() -> dict[str, Any]:
+    """Today's scheduled daily analyses for Home (BTC, ETH, SOL, XRP)."""
+    day = _chicago_day_key()
+    store = _load_daily_analysis_store()
+    analyses: list[Any] = []
+    if store.get("day") == day:
+        raw = store.get("analyses")
+        if isinstance(raw, list):
+            analyses = raw
+    return {
+        "success": True,
+        "day": day,
+        "analyses": analyses,
+        "count": len(analyses),
+        "coins": list(DAILY_ANALYSIS_COINS),
+        "timezone": DAILY_ANALYSIS_TZ,
+        "scheduled_at": f"{DAILY_ANALYSIS_HOUR:02d}:{DAILY_ANALYSIS_MINUTE:02d}",
+    }
 
 
 @app.get("/api/health")
@@ -4580,10 +5039,11 @@ async def exchange_keys(http_request: Request) -> JSONResponse:
 
 async def _handle_execute_trade(http_request: Request) -> JSONResponse:
     """
-    POST /execute_trade — Oracle Citadel MARKET execution only (BloFin).
+    POST /execute_trade — Oracle Citadel MARKET or LIMIT execution (BloFin).
 
     Accepts JSON:
-      user_id, coin, direction, entry_price, stop_loss, tp1, tp2, risk_percent, order_type=market
+      user_id, coin, direction, entry_price, stop_loss, tp1, tp2, risk_percent,
+      order_type=market|limit, leverage
     Auth: X-API-Key header must match app_api_key saved via POST /exchange_keys.
     """
     req_id = getattr(http_request.state, "request_id", "?")
@@ -4735,11 +5195,18 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             headers={"X-Request-ID": req_id},
         )
 
-    order_type = "market"
+    is_market = _is_market_trade_request(trade, raw_body)
+    order_type = "market" if is_market else "limit"
     effective_risk, requested_risk = _resolve_effective_risk_percent(trade.risk_percent)
-    exchange = record.get("exchange") or "unspecified"
-    environment = record.get("environment") or "live"
-    api_base_url = record.get("api_base_url") or BLOFIN_LIVE_API_BASE_URL
+    blofin_profile = _resolve_execute_trade_blofin_profile(
+        record,
+        raw_body,
+        user_id=user_id,
+        req_id=req_id,
+    )
+    exchange = blofin_profile.get("exchange") or record.get("exchange") or "blofin"
+    environment = blofin_profile.get("environment") or "live"
+    api_base_url = blofin_profile.get("api_base_url") or BLOFIN_LIVE_API_BASE_URL
     trade_id = uuid.uuid4().hex[:16]
 
     if effective_risk < requested_risk:
@@ -4783,7 +5250,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             content={
                 "success": False,
                 "detail": f"Oracle Citadel requires BloFin (exchange={exchange}).",
-                "user_message": "Link BloFin keys in Oracle Citadel Setup to execute MARKET orders.",
+                "user_message": "Link BloFin keys in Oracle Citadel Setup to execute trades.",
                 "request_id": req_id,
             },
             headers={"X-Request-ID": req_id},
@@ -4833,6 +5300,293 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
 
     inst_id = _blofin_inst_id(trade.coin)
 
+    # ── LIMIT: BloFin resting entry + SL on order (TP legs deferred until fill) ──
+    if not is_market:
+        effective_leverage = _normalize_citadel_leverage(trade.leverage)
+
+        lev_result = _blofin_set_leverage(
+            base_url=api_base_url,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            passphrase=passphrase,
+            coin=trade.coin,
+            leverage=effective_leverage,
+            request_id=req_id,
+        )
+        if lev_result.get("ok"):
+            logger.info("Leverage set to %sx on BloFin (limit)", effective_leverage)
+        else:
+            logger.warning(
+                "blofin_set_leverage_failed request_id=%s inst=%s leverage=%sx http=%s code=%s msg=%s "
+                "— continuing with LIMIT order (exchange may use prior leverage)",
+                req_id,
+                inst_id,
+                effective_leverage,
+                lev_result.get("http_status"),
+                lev_result.get("code"),
+                lev_result.get("msg"),
+            )
+
+        limit_entry = float(trade.entry_price)
+        order_size, size_meta = _blofin_calculate_order_size(
+            coin=trade.coin,
+            entry_price=limit_entry,
+            stop_loss=trade.stop_loss,
+            risk_percent=effective_risk,
+            leverage=effective_leverage,
+            base_url=api_base_url,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            passphrase=passphrase,
+            request_id=req_id,
+        )
+
+        logger.info(
+            "execute_trade_limit_dispatch request_id=%s trade_id=%s blofin_base=%s inst=%s "
+            "limit_price=%.6f order_size=%s leverage=%sx size_meta=%s",
+            req_id,
+            trade_id,
+            api_base_url,
+            inst_id,
+            limit_entry,
+            order_size,
+            effective_leverage,
+            size_meta,
+        )
+
+        entry_result = _blofin_place_order(
+            base_url=api_base_url,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            passphrase=passphrase,
+            coin=trade.coin,
+            direction=trade.direction,
+            order_type="limit",
+            size=order_size,
+            price=str(limit_entry),
+            tp1=None,
+            sl=trade.stop_loss,
+            client_order_id=trade_id[:32],
+            request_id=req_id,
+        )
+
+        entry_order_id = entry_result.get("order_id")
+        if not entry_result.get("ok") or not entry_order_id:
+            friendly = _blofin_user_friendly_error(
+                entry_result.get("code"),
+                entry_result.get("msg"),
+            )
+            logger.warning(
+                "execute_trade_limit_failure request_id=%s trade_id=%s http=%s code=%s msg=%s",
+                req_id,
+                trade_id,
+                entry_result.get("http_status"),
+                entry_result.get("code"),
+                entry_result.get("msg"),
+            )
+            fail_body: dict[str, Any] = {
+                "success": False,
+                "status": "failed",
+                "order_type": "limit",
+                "trade_id": trade_id,
+                "detail": entry_result.get("msg") or "BloFin LIMIT order rejected.",
+                "user_message": friendly,
+                "blofin_code": entry_result.get("code"),
+                "request_id": req_id,
+            }
+            if _blofin_is_ip_whitelist_error(entry_result.get("code"), entry_result.get("msg")):
+                egress_ip = _citadel_egress_ip_for_whitelist()
+                if egress_ip:
+                    fail_body["whitelist_ip"] = egress_ip
+            return JSONResponse(
+                status_code=502,
+                content=fail_body,
+                headers={"X-Request-ID": req_id},
+            )
+
+        confirm = await _blofin_confirm_limit_order(
+            base_url=api_base_url,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            passphrase=passphrase,
+            inst_id=inst_id,
+            order_id=entry_order_id,
+            placement=entry_result,
+            request_id=req_id,
+        )
+
+        if not confirm.get("limit_ok"):
+            logger.warning(
+                "execute_trade_limit_unconfirmed request_id=%s trade_id=%s order_id=%s "
+                "environment=%s base_url=%s state=%s order_size=%s",
+                req_id,
+                trade_id,
+                entry_order_id,
+                environment,
+                api_base_url,
+                confirm.get("state"),
+                order_size,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "success": False,
+                    "status": "failed",
+                    "order_type": "limit",
+                    "trade_id": trade_id,
+                    "order_id": entry_order_id,
+                    "detail": (
+                        "BloFin accepted the LIMIT order but Citadel could not confirm it. "
+                        f"state={confirm.get('state')!s} filledSize={confirm.get('filled_size')!s}"
+                    ),
+                    "user_message": (
+                        "LIMIT order was submitted to BloFin but could not be confirmed. "
+                        f"Check order history on BloFin ({environment}). Order ID {entry_order_id}."
+                    ),
+                    "blofin_confirm": {
+                        "state": confirm.get("state"),
+                        "filled_size": confirm.get("filled_size"),
+                    },
+                    "api_base_url": api_base_url,
+                    "request_id": req_id,
+                },
+                headers={"X-Request-ID": req_id},
+            )
+
+        limit_status = confirm.get("limit_status") or (
+            "filled" if confirm.get("state") == "filled" else "resting"
+        )
+        rr = compute_rr(limit_entry, trade.tp1, trade.stop_loss)
+
+        tp1_tpsl_id: Optional[str] = None
+        tp2_tpsl_id: Optional[str] = None
+        tp1_size: Optional[str] = None
+        tp2_size: Optional[str] = None
+        tp_warnings: list[str] = []
+
+        # Limit filled immediately — attach dual TP legs (same as MARKET post-fill).
+        if limit_status == "filled":
+            spec = _blofin_fetch_instrument_spec(
+                base_url=api_base_url,
+                inst_id=inst_id,
+                request_id=req_id,
+            )
+            position_size = (
+                confirm.get("filled_size")
+                or confirm.get("size")
+                or order_size
+            )
+            position_size_str = str(position_size)
+            tp1_size, tp2_size = _blofin_dual_tp_contract_sizes(
+                position_size_str,
+                lot_size=float(spec["lotSize"]),
+                min_size=float(spec["minSize"]),
+            )
+
+            tp1_result = _blofin_place_tpsl_take_profit(
+                base_url=api_base_url,
+                api_key=exchange_api_key,
+                api_secret=exchange_secret,
+                passphrase=passphrase,
+                coin=trade.coin,
+                direction=trade.direction,
+                tp_price=trade.tp1,
+                size=tp1_size,
+                client_order_id=f"{trade_id[:28]}l1",
+                request_id=req_id,
+            )
+            tp1_tpsl_id = tp1_result.get("tpsl_id")
+            if not tp1_result.get("ok"):
+                tp_warnings.append(f"TP1 (40%) not placed: {tp1_result.get('msg') or 'unknown'}")
+
+            tp2_result = _blofin_place_tpsl_take_profit(
+                base_url=api_base_url,
+                api_key=exchange_api_key,
+                api_secret=exchange_secret,
+                passphrase=passphrase,
+                coin=trade.coin,
+                direction=trade.direction,
+                tp_price=trade.tp2,
+                size=tp2_size,
+                client_order_id=f"{trade_id[:28]}l2",
+                request_id=req_id,
+            )
+            tp2_tpsl_id = tp2_result.get("tpsl_id")
+            if not tp2_result.get("ok"):
+                tp_warnings.append(f"TP2 (60%) not placed: {tp2_result.get('msg') or 'unknown'}")
+
+        fill_entry = _parse_blofin_price_token(confirm.get("average_price")) or limit_entry
+        if limit_status == "filled":
+            user_message = (
+                f"LIMIT order filled on BloFin ({environment}). "
+                f"{trade.coin} {trade.direction.upper()} · Fill {format_usd(fill_entry)} · "
+                f"Order ID {entry_order_id}"
+            )
+            message = f"LIMIT order filled for {trade.coin} {trade.direction.upper()}."
+        else:
+            user_message = (
+                f"Limit order resting on BloFin ({environment}). "
+                f"{trade.coin} {trade.direction.upper()} · Entry {format_usd(limit_entry)} · "
+                f"Order ID {entry_order_id}. Check Open Orders — TP legs apply after fill."
+            )
+            message = f"LIMIT order placed for {trade.coin} {trade.direction.upper()}."
+
+        logger.info(
+            "execute_trade_limit_outcome request_id=%s trade_id=%s order_id=%s "
+            "limit_status=%s state=%s filled=%s avg=%s",
+            req_id,
+            trade_id,
+            entry_order_id,
+            limit_status,
+            confirm.get("state"),
+            confirm.get("filled_size"),
+            confirm.get("average_price"),
+        )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "status": "success",
+                "order_type": "limit",
+                "limit_status": limit_status,
+                "trade_id": trade_id,
+                "order_id": entry_order_id,
+                "tp1_tpsl_id": tp1_tpsl_id,
+                "tp2_tpsl_id": tp2_tpsl_id,
+                "tp1_size": tp1_size,
+                "tp2_size": tp2_size,
+                "tp_warnings": tp_warnings,
+                "user_id": user_id,
+                "coin": trade.coin,
+                "direction": trade.direction,
+                "entry_price": limit_entry,
+                "fill_entry_price": fill_entry if limit_status == "filled" else None,
+                "stop_loss": trade.stop_loss,
+                "tp1": trade.tp1,
+                "tp2": trade.tp2,
+                "risk_percent": effective_risk,
+                "risk_percent_requested": requested_risk,
+                "order_size": order_size,
+                "leverage": effective_leverage,
+                "rr": rr,
+                "exchange": exchange,
+                "environment": environment,
+                "api_base_url": api_base_url,
+                "message": message,
+                "user_message": user_message,
+                "blofin_confirm": {
+                    "state": confirm.get("state"),
+                    "filled_size": confirm.get("filled_size"),
+                    "average_price": confirm.get("average_price"),
+                    "size": confirm.get("size"),
+                },
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    # ── MARKET: BloFin immediate entry (unchanged) ──
     # Reference price for sizing (live Mobula/CG/Binance — not sent as limit price on market).
     try:
         live = fetch_live_price_for_analysis(trade.coin)

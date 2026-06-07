@@ -113,14 +113,14 @@ abstract final class OracleDeskService {
           coin: 'BTC',
           direction: OraclePulseDirection.long,
           convictionPct: 72,
-          whyNow: 'Default radar lock — momentum scan active on BTC.',
+          whyNow: 'BTC on radar — watching Daily VWAP reclaim + liquidity sweep setup.',
           signalTimeframe: signalTimeframe,
         ),
         OraclePulseOpportunity(
           coin: 'ETH',
           direction: OraclePulseDirection.long,
           convictionPct: 68,
-          whyNow: 'ETH liquidity leading — awaiting live quote sync.',
+          whyNow: 'ETH bid absorption building — sweep below equal lows possible.',
           signalTimeframe: signalTimeframe,
         ),
       ];
@@ -173,15 +173,15 @@ abstract final class OracleDeskService {
     final setupToday = history.any((h) =>
         h['source'] == 'trade_setup' && (h['coin'] ?? '').toString().toUpperCase() == coin);
     if (hasDaily && aligned) {
-      return 'Daily Oracle + $move — MTF confluence lining up for ${dir.label}.';
+      return '$coin reclaiming Daily VWAP + $move — MTF lining up ${dir.label}.';
     }
     if (setupToday) {
-      return 'Fresh AI setup zone — $move with active Oracle levels.';
+      return 'Fresh setup zone — $move with active OB/FVG levels on $coin.';
     }
     if (aligned) {
-      return 'Tape aligns with your bias — $move impulse ${dir.label.toLowerCase()}.';
+      return 'Structure aligns ${dir.label} — $move with bid/offer absorption building.';
     }
-    return 'Volatility spike $move — radar flagged for tactical ${dir.label}.';
+    return 'Liquidity sweep setup $move — radar flagged tactical ${dir.label} on $coin.';
   }
 
   static List<String> _biasSymbols(List<String> watchlist, List<Map<String, dynamic>> trades) {
@@ -342,8 +342,8 @@ abstract final class OracleDeskService {
             : 'balanced';
 
     final watchLine = watchParts.isEmpty
-        ? 'Macro tape is mixed across your tracked symbols.'
-        : 'Watchlist tape: ${watchParts.join(' · ')}.';
+        ? 'Watchlist mixed — no clean Daily VWAP reclaim across majors yet.'
+        : 'Watchlist: ${watchParts.join(' · ')}.';
 
     final perfLine = closedOnWatch > 0
         ? ' You have $closedOnWatch closed setup${closedOnWatch == 1 ? '' : 's'} on watchlist names'
@@ -352,7 +352,7 @@ abstract final class OracleDeskService {
             ? ' $setupCount AI trade setup${setupCount == 1 ? '' : 's'} saved — performance curve building as trades close.'
             : ' Run Trade Setup on your watchlist to personalize this desk.';
 
-    return '$watchLine Oracle models a $biasWord session (weighted momentum ${avg >= 0 ? '+' : ''}${avg.toStringAsFixed(2)}%).$perfLine';
+    return '$watchLine Desk bias $biasWord (${avg >= 0 ? '+' : ''}${avg.toStringAsFixed(2)}% composite 24h).$perfLine';
   }
 
   static Map<String, double> _winRateByCoin(List<Map<String, dynamic>> trades) {

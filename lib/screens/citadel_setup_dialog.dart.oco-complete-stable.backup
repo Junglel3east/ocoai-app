@@ -922,7 +922,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
   late final TextEditingController _riskController;
 
   bool _saving = false;
-  bool _useDemoMode = false;
+  bool _useDemoMode = true;
 
   /// Shown after successful exchange key link (also restored from prefs on open).
   bool _isExchangeLinked = false;
@@ -950,7 +950,16 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;
 
-    final linked = prefs.getBool(_kCitadelExchangeLinkedPref) ?? false;
+    var linked = prefs.getBool(_kCitadelExchangeLinkedPref) ?? false;
+    final demoPref = prefs.getBool(_kCitadelDemoModePref) ?? true;
+    if (OracleCitadelStore.isConfigured) {
+      linked = await OracleCitadelService.verifyServerLinked();
+      if (!linked) {
+        await OracleCitadelStore.clearExchangeLinked();
+      }
+    } else {
+      linked = false;
+    }
     final label = prefs.getString(_kCitadelConnectedExchangePref) ?? 'Exchange';
     final iso = prefs.getString(_kCitadelLastConnectedPref);
     DateTime? lastConnected;
@@ -959,7 +968,8 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
     }
 
     setState(() {
-      _useDemoMode = prefs.getBool(_kCitadelDemoModePref) ?? false;
+      _useDemoMode = demoPref;
+      OracleCitadelStore.useDemoMode = demoPref;
       _isExchangeLinked = linked && OracleCitadelStore.isConfigured;
       _connectedExchangeLabel = label;
       _lastConnectedAt = lastConnected;
@@ -1031,6 +1041,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
 
     try {
       await OracleCitadelStore.saveLeverage(_leverage);
+      await OracleCitadelStore.saveDemoMode(_useDemoMode);
       await OracleCitadelStore.save(
         userId: _userIdController.text,
         apiKey: _apiKeyController.text,
@@ -1051,6 +1062,13 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
           useDemoMode: _useDemoMode,
           riskPercent: risk,
         );
+        final verified = await OracleCitadelService.verifyServerLinked();
+        if (!verified) {
+          throw OracleCitadelException(
+            'Keys were sent but the server could not verify them. '
+            'Confirm your App API Key matches the value above, then Save & Connect again.',
+          );
+        }
         final label = _useDemoMode ? 'BloFin' : 'Exchange API';
         await _persistConnectionStatus(exchangeLabel: label, demoMode: _useDemoMode);
         if (!mounted) return;
@@ -1062,6 +1080,14 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
         });
         _showSnackOnParent('Oracle Citadel connected successfully');
         return;
+      }
+
+      final serverOk = await OracleCitadelService.verifyServerLinked();
+      if (!serverOk) {
+        throw OracleCitadelException(
+          'BloFin API Key and Secret are required on the server. '
+          'Enter them below and tap Save & Connect.',
+        );
       }
 
       if (!mounted) return;
@@ -1242,9 +1268,10 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                           activeThumbColor: const Color(0xFF00BFFF),
                           onChanged: _saving
                               ? null
-                              : (value) {
+                              : (value) async {
                                   if (!mounted) return;
                                   setState(() => _useDemoMode = value);
+                                  await OracleCitadelStore.saveDemoMode(value);
                                 },
                         ),
                       ),
