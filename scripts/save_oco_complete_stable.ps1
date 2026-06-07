@@ -35,6 +35,7 @@ foreach ($item in $snapshots) {
     Write-Host "  saved $($item.backup)" -ForegroundColor Green
 }
 
-Write-Host "`nDone. Optional — pin git tag to this commit:" -ForegroundColor Cyan
-Write-Host "  git tag -f oco-complete-stable"
-Write-Host "  git push origin oco-complete-stable --force"
+Write-Host ""
+Write-Host "Done. Optional - pin git tag to this commit:" -ForegroundColor Cyan
+Write-Host '  git tag -f oco-complete-stable'
+Write-Host '  git push origin oco-complete-stable --force'
