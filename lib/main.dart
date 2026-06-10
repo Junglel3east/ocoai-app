@@ -28,6 +28,7 @@ import 'services/analysis_history_store.dart';
 import 'services/daily_analysis_store.dart';
 import 'services/watchlist_binance_ws_service.dart';
 import 'services/notification_service.dart';
+import 'services/citadel_positions_service.dart';
 import 'services/oracle_desk_service.dart';
 import 'services/oracle_vision_service.dart';
 import 'services/user_profile_store.dart';
@@ -41,6 +42,7 @@ part 'screens/trade_setup_screen.dart';
 part 'screens/trade_performance_screen.dart';
 part 'screens/citadel_trade_levels.dart';
 part 'screens/citadel_setup_dialog.dart';
+part 'screens/citadel_live_positions.dart';
 part 'screens/oracle_desk_screen.dart';
 
 const String kNewsApiKey = String.fromEnvironment(
@@ -4314,8 +4316,12 @@ class MainScreen extends StatefulWidget {
 /// Bottom-nav Citadel tab — Expert: full Citadel hub; Free/Premium: upgrade gate.
 class _CitadelScreen extends StatefulWidget {
   final bool isActive;
+  final CitadelPositionClosedCallback? onPositionClosed;
 
-  const _CitadelScreen({required this.isActive});
+  const _CitadelScreen({
+    required this.isActive,
+    this.onPositionClosed,
+  });
 
   @override
   State<_CitadelScreen> createState() => _CitadelScreenState();
@@ -4363,6 +4369,7 @@ class _CitadelScreenState extends State<_CitadelScreen> {
       return _CitadelExpertView(
         key: _expertKey,
         isActive: widget.isActive,
+        onPositionClosed: widget.onPositionClosed,
         onOpenSetup: () async {
           await showCitadelSetupDialog(context);
           await _expertKey.currentState?.refreshHub();
@@ -4377,11 +4384,13 @@ class _CitadelScreenState extends State<_CitadelScreen> {
 class _CitadelExpertView extends StatefulWidget {
   final bool isActive;
   final Future<void> Function() onOpenSetup;
+  final CitadelPositionClosedCallback? onPositionClosed;
 
   const _CitadelExpertView({
     super.key,
     required this.isActive,
     required this.onOpenSetup,
+    this.onPositionClosed,
   });
 
   @override
@@ -4552,6 +4561,14 @@ class _CitadelExpertViewState extends State<_CitadelExpertView> {
                     ],
                   ),
                 ),
+              if (!_loading && _serverLinked) ...[
+                const SizedBox(height: 20),
+                CitadelLivePositionsPanel(
+                  isActive: widget.isActive,
+                  serverLinked: _serverLinked,
+                  onPositionClosed: widget.onPositionClosed,
+                ),
+              ],
               if (!_loading) ...[
                 const SizedBox(height: 18),
                 _CitadelLeverageRiskPanel(
@@ -5364,6 +5381,40 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     return "Win Rate: $rate% ($_winCount Wins / $_closedTradeCount Total)";
   }
 
+  /// Citadel close — win/loss from realized PnL (early exit counts if profitable).
+  void recordCitadelRealizedClose({required String coin, required double realizedPnl}) {
+    final normalized = coin.trim().toUpperCase();
+    Map<String, dynamic>? target;
+    for (final trade in trades) {
+      if (trade['status'] != 'Open') continue;
+      final tradeCoin = (trade['coin'] ?? '').toString().trim().toUpperCase();
+      if (tradeCoin == normalized) {
+        target = trade;
+        break;
+      }
+    }
+    if (target == null) return;
+
+    String nextStatus;
+    if (realizedPnl > 0) {
+      nextStatus = 'Win';
+    } else if (realizedPnl < 0) {
+      nextStatus = 'Loss';
+    } else {
+      nextStatus = 'Closed';
+    }
+
+    setState(() {
+      target!['status'] = nextStatus;
+      target['realizedPnl'] = realizedPnl;
+      target['closedVia'] = 'citadel';
+      target['closedAt'] = DateTime.now().toIso8601String();
+    });
+    _syncTradeStatusToHistory();
+    _persistTrades();
+    _persistHistory();
+  }
+
   Future<void> _refreshOpenTrades() async {
     final hasOpenTrades = trades.any((trade) => trade["status"] == "Open");
     if (!hasOpenTrades) return;
@@ -5526,7 +5577,12 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             onClearDailyAnalyses: clearDailyAnalyses,
             onRefreshDailyAnalyses: _refreshDailyAnalysesForHome,
           ),
-          _CitadelScreen(isActive: _selectedIndex == _tabCitadel),
+          _CitadelScreen(
+            isActive: _selectedIndex == _tabCitadel,
+            onPositionClosed: ({required String coin, required double realizedPnl}) {
+              recordCitadelRealizedClose(coin: coin, realizedPnl: realizedPnl);
+            },
+          ),
           TradeSetupScreen(
             coin: 'BTC',
             trades: trades,

@@ -140,6 +140,9 @@ BLOFIN_MARKET_INSTRUMENTS_PATH = "/api/v1/market/instruments"
 BLOFIN_MARKET_MARK_PRICE_PATH = "/api/v1/market/mark-price"
 BLOFIN_MARKET_TICKERS_PATH = "/api/v1/market/tickers"
 BLOFIN_SET_LEVERAGE_PATH = "/api/v1/account/set-leverage"
+BLOFIN_POSITIONS_PATH = "/api/v1/account/positions"
+BLOFIN_CLOSE_POSITION_PATH = "/api/v1/trade/close-position"
+BLOFIN_ORDERS_TPSL_PENDING_PATH = "/api/v1/trade/orders-tpsl-pending"
 BLOFIN_DEFAULT_LEVERAGE = 5
 BLOFIN_ORDER_SIZE = os.getenv("BLOFIN_ORDER_SIZE", "0.1")
 BLOFIN_MARGIN_MODE = os.getenv("BLOFIN_MARGIN_MODE", "cross")
@@ -3054,6 +3057,326 @@ def _resolve_blofin_passphrase(record: dict[str, Any]) -> str:
     """Passphrase for BloFin headers — env or optional per-user field (never logged)."""
     stored = (record.get("exchange_passphrase") or "").strip()
     return stored or BLOFIN_PASSPHRASE
+
+
+def _citadel_coin_from_inst_id(inst_id: str) -> str:
+    raw = (inst_id or "").strip().upper()
+    if "-" in raw:
+        return raw.split("-")[0]
+    return raw.replace("USDT", "").replace("USD", "")
+
+
+def _citadel_position_direction(pos_qty: float, position_side: str) -> str:
+    side = (position_side or "net").strip().lower()
+    if side == "long":
+        return "long"
+    if side == "short":
+        return "short"
+    return "long" if pos_qty >= 0 else "short"
+
+
+def _blofin_fetch_positions(
+    *,
+    base_url: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    inst_id: Optional[str] = None,
+    request_id: str = "?",
+) -> list[dict[str, Any]]:
+    """Open BloFin positions — normalized for Citadel Live Positions UI."""
+    path = BLOFIN_POSITIONS_PATH
+    if inst_id:
+        path = f"{path}?instId={inst_id}"
+    http_status, _raw, parsed = _blofin_private_request(
+        base_url=base_url,
+        api_key=api_key,
+        api_secret=api_secret,
+        passphrase=passphrase,
+        method="GET",
+        path=path,
+        request_id=request_id,
+        log_tag="blofin_positions",
+    )
+    if not isinstance(parsed, dict) or http_status != 200 or str(parsed.get("code")) != "0":
+        return []
+    rows = parsed.get("data")
+    if not isinstance(rows, list):
+        return []
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            qty = float(row.get("positions") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if abs(qty) <= 0:
+            continue
+        inst = str(row.get("instId") or "")
+        direction = _citadel_position_direction(qty, str(row.get("positionSide") or "net"))
+        try:
+            entry = float(row.get("averagePrice") or 0)
+            mark = float(row.get("markPrice") or 0)
+            upnl = float(row.get("unrealizedPnl") or 0)
+            upnl_ratio = float(row.get("unrealizedPnlRatio") or 0) * 100.0
+            liq = float(row.get("liquidationPrice") or 0)
+            lev = float(row.get("leverage") or 1)
+        except (TypeError, ValueError):
+            continue
+        out.append(
+            {
+                "positionId": str(row.get("positionId") or ""),
+                "instId": inst,
+                "coin": _citadel_coin_from_inst_id(inst),
+                "direction": direction,
+                "entryPrice": entry,
+                "markPrice": mark,
+                "size": abs(qty),
+                "leverage": lev,
+                "unrealizedPnl": upnl,
+                "unrealizedPnlPct": upnl_ratio,
+                "liquidationPrice": liq,
+                "marginMode": str(row.get("marginMode") or BLOFIN_MARGIN_MODE),
+                "positionSide": str(row.get("positionSide") or "net"),
+            }
+        )
+    return out
+
+
+def _blofin_close_position(
+    *,
+    base_url: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    inst_id: str,
+    margin_mode: str,
+    position_side: str,
+    request_id: str = "?",
+) -> dict[str, Any]:
+    body = {
+        "instId": inst_id,
+        "marginMode": margin_mode or BLOFIN_MARGIN_MODE,
+        "positionSide": position_side or "net",
+    }
+    http_status, raw_text, parsed = _blofin_private_request(
+        base_url=base_url,
+        api_key=api_key,
+        api_secret=api_secret,
+        passphrase=passphrase,
+        method="POST",
+        path=BLOFIN_CLOSE_POSITION_PATH,
+        body=body,
+        request_id=request_id,
+        log_tag="blofin_close_position",
+    )
+    if not isinstance(parsed, dict):
+        return {
+            "ok": False,
+            "http_status": http_status,
+            "code": "invalid_json",
+            "msg": "BloFin close-position returned non-JSON",
+            "raw_preview": (raw_text or "")[:500],
+        }
+    ok = http_status == 200 and str(parsed.get("code")) == "0"
+    return {
+        "ok": ok,
+        "http_status": http_status,
+        "code": parsed.get("code"),
+        "msg": parsed.get("msg"),
+        "response": _blofin_safe_response_log(parsed),
+    }
+
+
+def _blofin_fetch_tpsl_pending(
+    *,
+    base_url: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    inst_id: Optional[str] = None,
+    request_id: str = "?",
+) -> list[dict[str, Any]]:
+    path = BLOFIN_ORDERS_TPSL_PENDING_PATH
+    if inst_id:
+        path = f"{path}?instId={inst_id}"
+    http_status, _raw, parsed = _blofin_private_request(
+        base_url=base_url,
+        api_key=api_key,
+        api_secret=api_secret,
+        passphrase=passphrase,
+        method="GET",
+        path=path,
+        request_id=request_id,
+        log_tag="blofin_tpsl_pending",
+    )
+    if not isinstance(parsed, dict) or http_status != 200 or str(parsed.get("code")) != "0":
+        return []
+    rows = parsed.get("data")
+    if not isinstance(rows, list):
+        return []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _blofin_place_trailing_stop_order(
+    *,
+    base_url: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    inst_id: str,
+    direction: str,
+    mark_price: float,
+    callback_pct: float,
+    size: str,
+    request_id: str = "?",
+) -> dict[str, Any]:
+    cb = max(0.1, min(float(callback_pct), 25.0))
+    mark = float(mark_price)
+    if mark <= 0:
+        return {"ok": False, "msg": "Invalid mark price for trailing stop."}
+    sl_price = mark * (1.0 - cb / 100.0) if direction == "long" else mark * (1.0 + cb / 100.0)
+    http_status, raw_text, parsed = _blofin_private_request(
+        base_url=base_url,
+        api_key=api_key,
+        api_secret=api_secret,
+        passphrase=passphrase,
+        method="POST",
+        path=BLOFIN_TRADE_ORDER_TPSL_PATH,
+        body={
+            "instId": inst_id,
+            "marginMode": BLOFIN_MARGIN_MODE,
+            "positionSide": "net",
+            "side": _blofin_tp_close_side(direction),
+            "slTriggerPrice": str(sl_price),
+            "slOrderPrice": "-1",
+            "slTriggerPriceType": "mark",
+            "size": str(size),
+            "reduceOnly": "true",
+        },
+        request_id=request_id,
+        log_tag="blofin_trailing_stop",
+    )
+    if not isinstance(parsed, dict):
+        return {
+            "ok": False,
+            "http_status": http_status,
+            "code": "invalid_json",
+            "msg": "BloFin trailing stop returned non-JSON",
+            "raw_preview": (raw_text or "")[:500],
+        }
+    result = _blofin_parse_tpsl_response(parsed, http_status=http_status)
+    result["sl_trigger_price"] = sl_price
+    result["callback_pct"] = cb
+    return result
+
+
+def _citadel_resolve_blofin_session(
+    http_request: Request,
+    user_id: str,
+) -> tuple[Optional[dict[str, Any]], Optional[JSONResponse]]:
+    """Auth + decrypt BloFin credentials for Citadel position endpoints."""
+    req_id = getattr(http_request.state, "request_id", "?")
+    header_app_key = (http_request.headers.get("X-API-Key") or http_request.headers.get("x-api-key") or "").strip()
+    if not user_id:
+        return None, JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": "user_id is required.",
+                "user_message": "Citadel user id missing.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+    if not header_app_key:
+        return None, JSONResponse(
+            status_code=401,
+            content={
+                "success": False,
+                "detail": "X-API-Key header is required.",
+                "user_message": "App API Key required. Open Oracle Citadel Setup.",
+                "error_code": "credentials_missing",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+    record = get_citadel_user_record(user_id)
+    if not record:
+        return None, JSONResponse(
+            status_code=404,
+            content={
+                "success": False,
+                "detail": f"No exchange keys for user_id={user_id}.",
+                "user_message": "Exchange keys not found. Re-link in Citadel Setup.",
+                "error_code": "credentials_missing",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+    stored_app_key = (record.get("app_api_key") or "").strip()
+    if not stored_app_key or stored_app_key != header_app_key:
+        return None, JSONResponse(
+            status_code=403,
+            content={
+                "success": False,
+                "detail": "X-API-Key mismatch.",
+                "user_message": "App API Key mismatch. Re-save Citadel Setup.",
+                "error_code": "credentials_mismatch",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+    exchange_api_key = (record.get("exchange_api_key") or "").strip()
+    exchange_secret_enc = record.get("exchange_secret_encrypted") or ""
+    if not exchange_api_key or not exchange_secret_enc:
+        return None, JSONResponse(
+            status_code=404,
+            content={
+                "success": False,
+                "detail": "Exchange credentials incomplete.",
+                "user_message": "Exchange keys incomplete. Re-link in Citadel Setup.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+    exchange_secret = decrypt_secret_at_rest(exchange_secret_enc)
+    if exchange_secret is None:
+        return None, JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "detail": "Could not decrypt exchange secret.",
+                "user_message": "Server credential error. Re-save exchange keys.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+    passphrase = _resolve_blofin_passphrase(record)
+    if not passphrase:
+        return None, JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "detail": "BloFin passphrase not configured.",
+                "user_message": "Server BloFin passphrase missing. Set BLOFIN_PASSPHRASE on Railway.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+    blofin_profile = _resolve_execute_trade_blofin_profile(record, {}, user_id=user_id, req_id=req_id)
+    api_base_url = blofin_profile.get("api_base_url") or BLOFIN_LIVE_API_BASE_URL
+    return {
+        "req_id": req_id,
+        "user_id": user_id,
+        "api_key": exchange_api_key,
+        "api_secret": exchange_secret,
+        "passphrase": passphrase,
+        "api_base_url": api_base_url,
+        "record": record,
+    }, None
 
 
 def _blofin_user_friendly_error(code: Any, msg: Optional[str]) -> str:
@@ -6377,6 +6700,249 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
         content=fail_body,
         headers={"X-Request-ID": req_id},
     )
+
+# ─── Oracle Citadel Live Positions (BloFin) ───────────────────────────────────
+
+
+async def _handle_citadel_positions(http_request: Request) -> JSONResponse:
+    user_id = (http_request.query_params.get("user_id") or "").strip()
+    session, err = _citadel_resolve_blofin_session(http_request, user_id)
+    if err is not None:
+        return err
+    assert session is not None
+    inst_id = (http_request.query_params.get("inst_id") or "").strip() or None
+    positions = await asyncio.to_thread(
+        _blofin_fetch_positions,
+        base_url=session["api_base_url"],
+        api_key=session["api_key"],
+        api_secret=session["api_secret"],
+        passphrase=session["passphrase"],
+        inst_id=inst_id,
+        request_id=session["req_id"],
+    )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": True,
+            "positions": positions,
+            "count": len(positions),
+            "request_id": session["req_id"],
+        },
+        headers={"X-Request-ID": session["req_id"]},
+    )
+
+
+async def _handle_citadel_close_position(http_request: Request, *, flash: bool = False) -> JSONResponse:
+    req_id = getattr(http_request.state, "request_id", "?")
+    try:
+        raw = await http_request.json()
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    user_id = (raw.get("user_id") or "").strip()
+    session, err = _citadel_resolve_blofin_session(http_request, user_id)
+    if err is not None:
+        return err
+    assert session is not None
+    inst_id = (raw.get("inst_id") or raw.get("instId") or "").strip()
+    if not inst_id:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": "inst_id is required.",
+                "user_message": "Instrument id missing for close.",
+                "request_id": session["req_id"],
+            },
+            headers={"X-Request-ID": session["req_id"]},
+        )
+    margin_mode = (raw.get("margin_mode") or raw.get("marginMode") or BLOFIN_MARGIN_MODE).strip()
+    position_side = (raw.get("position_side") or raw.get("positionSide") or "net").strip()
+    unrealized_pnl = float(raw.get("unrealized_pnl") or raw.get("unrealizedPnl") or 0)
+
+    result = await asyncio.to_thread(
+        _blofin_close_position,
+        base_url=session["api_base_url"],
+        api_key=session["api_key"],
+        api_secret=session["api_secret"],
+        passphrase=session["passphrase"],
+        inst_id=inst_id,
+        margin_mode=margin_mode,
+        position_side=position_side,
+        request_id=session["req_id"],
+    )
+    if not result.get("ok"):
+        msg = _blofin_user_friendly_error(result.get("code"), result.get("msg"))
+        return JSONResponse(
+            status_code=502,
+            content={
+                "success": False,
+                "detail": msg,
+                "user_message": msg,
+                "request_id": session["req_id"],
+            },
+            headers={"X-Request-ID": session["req_id"]},
+        )
+    realized = unrealized_pnl
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": True,
+            "flash": flash,
+            "inst_id": inst_id,
+            "realized_pnl": realized,
+            "coin": _citadel_coin_from_inst_id(inst_id),
+            "win": realized > 0,
+            "loss": realized < 0,
+            "request_id": session["req_id"],
+        },
+        headers={"X-Request-ID": session["req_id"]},
+    )
+
+
+async def _handle_citadel_trailing_stop(http_request: Request) -> JSONResponse:
+    try:
+        raw = await http_request.json()
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    user_id = (raw.get("user_id") or "").strip()
+    session, err = _citadel_resolve_blofin_session(http_request, user_id)
+    if err is not None:
+        return err
+    assert session is not None
+    inst_id = (raw.get("inst_id") or raw.get("instId") or "").strip()
+    direction = (raw.get("direction") or "long").strip().lower()
+    try:
+        mark_price = float(raw.get("mark_price") or raw.get("markPrice") or 0)
+        callback_pct = float(raw.get("callback_pct") or raw.get("callbackPct") or 1.5)
+        size = str(raw.get("size") or "1")
+    except (TypeError, ValueError):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "user_message": "Invalid trailing stop parameters.",
+                "request_id": session["req_id"],
+            },
+            headers={"X-Request-ID": session["req_id"]},
+        )
+    if not inst_id or mark_price <= 0:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "user_message": "inst_id and mark_price are required.",
+                "request_id": session["req_id"],
+            },
+            headers={"X-Request-ID": session["req_id"]},
+        )
+    result = await asyncio.to_thread(
+        _blofin_place_trailing_stop_order,
+        base_url=session["api_base_url"],
+        api_key=session["api_key"],
+        api_secret=session["api_secret"],
+        passphrase=session["passphrase"],
+        inst_id=inst_id,
+        direction=direction,
+        mark_price=mark_price,
+        callback_pct=callback_pct,
+        size=size,
+        request_id=session["req_id"],
+    )
+    if not result.get("ok"):
+        msg = _blofin_user_friendly_error(result.get("code"), result.get("msg"))
+        return JSONResponse(
+            status_code=502,
+            content={
+                "success": False,
+                "user_message": msg or "Trailing stop could not be placed.",
+                "request_id": session["req_id"],
+            },
+            headers={"X-Request-ID": session["req_id"]},
+        )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": True,
+            "tpsl_id": result.get("tpsl_id"),
+            "sl_trigger_price": result.get("sl_trigger_price"),
+            "callback_pct": result.get("callback_pct"),
+            "request_id": session["req_id"],
+        },
+        headers={"X-Request-ID": session["req_id"]},
+    )
+
+
+async def _handle_citadel_tpsl_details(http_request: Request) -> JSONResponse:
+    user_id = (http_request.query_params.get("user_id") or "").strip()
+    session, err = _citadel_resolve_blofin_session(http_request, user_id)
+    if err is not None:
+        return err
+    assert session is not None
+    inst_id = (http_request.query_params.get("inst_id") or "").strip() or None
+    orders = await asyncio.to_thread(
+        _blofin_fetch_tpsl_pending,
+        base_url=session["api_base_url"],
+        api_key=session["api_key"],
+        api_secret=session["api_secret"],
+        passphrase=session["passphrase"],
+        inst_id=inst_id,
+        request_id=session["req_id"],
+    )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": True,
+            "orders": orders,
+            "count": len(orders),
+            "request_id": session["req_id"],
+        },
+        headers={"X-Request-ID": session["req_id"]},
+    )
+
+
+@app.get("/citadel/positions")
+@app.get("/citadel/positions/")
+@app.get("/api/citadel/positions")
+@app.get("/api/citadel/positions/")
+async def citadel_positions(http_request: Request) -> JSONResponse:
+    return await _handle_citadel_positions(http_request)
+
+
+@app.post("/citadel/close_position")
+@app.post("/citadel/close_position/")
+@app.post("/api/citadel/close_position")
+@app.post("/api/citadel/close_position/")
+async def citadel_close_position(http_request: Request) -> JSONResponse:
+    return await _handle_citadel_close_position(http_request, flash=False)
+
+
+@app.post("/citadel/flash_close")
+@app.post("/citadel/flash_close/")
+@app.post("/api/citadel/flash_close")
+@app.post("/api/citadel/flash_close/")
+async def citadel_flash_close(http_request: Request) -> JSONResponse:
+    return await _handle_citadel_close_position(http_request, flash=True)
+
+
+@app.post("/citadel/trailing_stop")
+@app.post("/citadel/trailing_stop/")
+@app.post("/api/citadel/trailing_stop")
+@app.post("/api/citadel/trailing_stop/")
+async def citadel_trailing_stop(http_request: Request) -> JSONResponse:
+    return await _handle_citadel_trailing_stop(http_request)
+
+
+@app.get("/citadel/tpsl_details")
+@app.get("/citadel/tpsl_details/")
+@app.get("/api/citadel/tpsl_details")
+@app.get("/api/citadel/tpsl_details/")
+async def citadel_tpsl_details(http_request: Request) -> JSONResponse:
+    return await _handle_citadel_tpsl_details(http_request)
+
 
 # Oracle Citadel execute — /api/* aliases prevent 404 (mirrors exchange_keys pattern)
 @app.post("/execute_trade")

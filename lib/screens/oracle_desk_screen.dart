@@ -82,7 +82,7 @@ class _OracleDeskScreenState extends State<OracleDeskScreen> with SingleTickerPr
           confidencePct: 48,
           title: 'Neutral / Range-Bound',
           reasoning:
-              'Could not refresh live quotes. Oracle Pulse is using watchlist defaults until sync recovers.',
+              'Could not refresh live quotes. War Room is using watchlist defaults until sync recovers.',
           recommendedCoins: widget.watchlist.take(4).map((c) => c.toUpperCase()).toList(),
           avgMomentum: 0,
         );
@@ -152,10 +152,11 @@ class _OracleDeskScreenState extends State<OracleDeskScreen> with SingleTickerPr
                 const SizedBox(height: _AppSpacing.section),
                 _biasSection(accent, perf),
                 const SizedBox(height: _AppSpacing.section),
-                _OraclePulseSection(
+                _WarRoomSection(
+                  bias: _bias,
                   opportunities: _oraclePulse,
-                  radarAnimation: _radarController,
-                  onGenerateSetup: _openTradeSetupForCoin,
+                  perf: perf,
+                  pulseAnimation: _radarController,
                 ),
                 const SizedBox(height: _AppSpacing.section),
                 _EdgeBreakdownPanel(edge: perf.edge, streak: perf.streak),
@@ -327,19 +328,6 @@ class _OracleDeskScreenState extends State<OracleDeskScreen> with SingleTickerPr
             }).toList(),
           ),
         ],
-      ),
-    );
-  }
-
-  void _openTradeSetupForCoin(String coin) {
-    Navigator.push(
-      context,
-      _premiumPageRoute(
-        (_) => TradeSetupScreen(
-          coin: coin,
-          trades: widget.trades,
-          onTradeSetupGenerated: widget.onTradeSetupGenerated,
-        ),
       ),
     );
   }
@@ -1175,131 +1163,313 @@ class _GlowEquityPainter extends CustomPainter {
   bool shouldRepaint(covariant _GlowEquityPainter old) => old.series != series;
 }
 
-// ─── Oracle Pulse — live opportunity radar ──────────────────────────────────
+// ─── War Room — battlefield intelligence command center ─────────────────────
 
-class _OraclePulseSection extends StatelessWidget {
+class _WarRoomIntel {
+  final String tensionLabel;
+  final double tensionValue;
+  final int longPowerPct;
+  final int shortPowerPct;
+  final List<_BattleZone> zones;
+  final String edgeStatus;
+  final String edgeSubtext;
+  final double edgeReadiness;
+  final Color edgeColor;
+
+  const _WarRoomIntel({
+    required this.tensionLabel,
+    required this.tensionValue,
+    required this.longPowerPct,
+    required this.shortPowerPct,
+    required this.zones,
+    required this.edgeStatus,
+    required this.edgeSubtext,
+    required this.edgeReadiness,
+    required this.edgeColor,
+  });
+
+  static _WarRoomIntel fromDesk({
+    required OracleDeskBias bias,
+    required List<OraclePulseOpportunity> opportunities,
+    required OracleDeskPerformance perf,
+  }) {
+    final momentum = bias.avgMomentum.abs();
+    final tensionValue = ((momentum / 5.0).clamp(0.0, 1.0) * 0.55 + (bias.confidencePct / 100.0) * 0.45)
+        .clamp(0.0, 1.0);
+    final tensionLabel = tensionValue < 0.35
+        ? 'LOW'
+        : tensionValue < 0.68
+            ? 'MEDIUM'
+            : 'HIGH';
+
+    var longW = 0.0;
+    var shortW = 0.0;
+    for (final o in opportunities) {
+      if (o.direction.isLong) {
+        longW += o.convictionPct;
+      } else {
+        shortW += o.convictionPct;
+      }
+    }
+    if (perf.edge.longSamples + perf.edge.shortSamples >= 3) {
+      longW += perf.edge.longWinRatePct * 0.4;
+      shortW += perf.edge.shortWinRatePct * 0.4;
+    }
+    if (longW + shortW <= 0) {
+      switch (bias.kind) {
+        case OracleDeskBiasKind.bullish:
+          longW = 68;
+          shortW = 32;
+        case OracleDeskBiasKind.bearish:
+          longW = 32;
+          shortW = 68;
+        case OracleDeskBiasKind.neutral:
+          longW = 50;
+          shortW = 50;
+      }
+    }
+    final totalForce = longW + shortW;
+    final longPct = totalForce > 0 ? (longW / totalForce * 100).round().clamp(0, 100) : 50;
+    final shortPct = 100 - longPct;
+
+    final zones = opportunities.take(3).map((o) {
+      final isLong = o.direction.isLong;
+      return _BattleZone(
+        coin: o.coin,
+        direction: o.direction.label,
+        level: _battleZoneLevel(o),
+        reactionProb: o.convictionPct.clamp(55, 94),
+        accent: isLong ? const Color(0xFF00E676) : const Color(0xFFFF5252),
+      );
+    }).toList();
+    if (zones.isEmpty) {
+      zones.addAll([
+        _BattleZone(
+          coin: 'BTC',
+          direction: 'LONG',
+          level: 'Daily VWAP + previous lows liquidity zone',
+          reactionProb: 72,
+          accent: const Color(0xFF00E676),
+        ),
+        _BattleZone(
+          coin: 'ETH',
+          direction: 'SHORT',
+          level: 'OB rejection + FVG mitigation zone',
+          reactionProb: 68,
+          accent: const Color(0xFFFF5252),
+        ),
+      ]);
+    }
+
+    final streak = perf.streak;
+    late final String edgeStatus;
+    late final String edgeSubtext;
+    late final double edgeReadiness;
+    late final Color edgeColor;
+    switch (streak.kind) {
+      case OracleDeskStreakKind.hot:
+        edgeStatus = 'COMBAT READY';
+        edgeSubtext =
+            '${streak.label} · ${perf.winRatePct.toStringAsFixed(0)}% win rate · deploy with conviction';
+        edgeReadiness = (0.72 + (streak.count.clamp(0, 5) * 0.04)).clamp(0.0, 0.98);
+        edgeColor = const Color(0xFF00E676);
+      case OracleDeskStreakKind.cold:
+        edgeStatus = 'REGROUP';
+        edgeSubtext = '${streak.label} · cut size · wait for HTF alignment';
+        edgeReadiness = (0.42 - (streak.count.clamp(0, 5) * 0.04)).clamp(0.12, 0.55);
+        edgeColor = const Color(0xFFFF5252);
+      case OracleDeskStreakKind.neutral:
+        edgeStatus = 'ON STANDBY';
+        edgeSubtext = perf.closedCount == 0
+            ? 'No closed trades yet · paper setups to build edge'
+            : '${perf.winRatePct.toStringAsFixed(0)}% win rate · hunt A+ setups only';
+        edgeReadiness = (perf.winRatePct / 100.0 * 0.55 + 0.35).clamp(0.35, 0.78);
+        edgeColor = const Color(0xFF00BFFF);
+    }
+
+    return _WarRoomIntel(
+      tensionLabel: tensionLabel,
+      tensionValue: tensionValue,
+      longPowerPct: longPct,
+      shortPowerPct: shortPct,
+      zones: zones,
+      edgeStatus: edgeStatus,
+      edgeSubtext: edgeSubtext,
+      edgeReadiness: edgeReadiness,
+      edgeColor: edgeColor,
+    );
+  }
+
+  static String _battleZoneLevel(OraclePulseOpportunity o) {
+    final why = o.whyNow.toLowerCase();
+    if (why.contains('vwap')) return 'Daily VWAP battle zone';
+    if (why.contains('sweep') || why.contains('liquidity')) return 'Liquidity sweep + reaction zone';
+    if (why.contains('ob') || why.contains('fvg')) return 'OB / FVG mitigation zone';
+    return '${o.coin} key structure zone';
+  }
+}
+
+class _BattleZone {
+  final String coin;
+  final String direction;
+  final String level;
+  final int reactionProb;
+  final Color accent;
+
+  const _BattleZone({
+    required this.coin,
+    required this.direction,
+    required this.level,
+    required this.reactionProb,
+    required this.accent,
+  });
+}
+
+class _WarRoomSection extends StatelessWidget {
+  final OracleDeskBias bias;
   final List<OraclePulseOpportunity> opportunities;
-  final Animation<double> radarAnimation;
-  final void Function(String coin) onGenerateSetup;
+  final OracleDeskPerformance perf;
+  final Animation<double> pulseAnimation;
 
-  const _OraclePulseSection({
+  const _WarRoomSection({
+    required this.bias,
     required this.opportunities,
-    required this.radarAnimation,
-    required this.onGenerateSetup,
+    required this.perf,
+    required this.pulseAnimation,
   });
 
   @override
   Widget build(BuildContext context) {
-    const cyan = Color(0xFF00D4FF);
+    final intel = _WarRoomIntel.fromDesk(
+      bias: bias,
+      opportunities: opportunities,
+      perf: perf,
+    );
+
     return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        SizedBox(
-          height: 72,
-          child: Stack(
-            clipBehavior: Clip.none,
-            children: [
-              Positioned(
-                left: -8,
-                top: 0,
-                child: AnimatedBuilder(
-                  animation: radarAnimation,
-                  builder: (context, _) {
-                    return Transform.rotate(
-                      angle: radarAnimation.value * 2 * pi,
-                      child: Container(
-                        width: 72,
-                        height: 72,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          gradient: SweepGradient(
-                            colors: [
-                              Colors.transparent,
-                              cyan.withValues(alpha: 0.28),
-                              Colors.transparent,
-                            ],
-                            stops: const [0.0, 0.5, 1.0],
-                          ),
-                        ),
-                      ),
-                    );
-                  },
-                ),
-              ),
-              Positioned(
-                left: 0,
-                right: 0,
-                bottom: 0,
-                child: Row(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          _PulsingDot(color: cyan),
-                          const SizedBox(width: 8),
-                          Text(
-                            'LIVE',
-                            style: TextStyle(
-                              fontSize: 10,
-                              fontWeight: FontWeight.w800,
-                              letterSpacing: 1.6,
-                              color: cyan,
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 6),
-                      const Text(
-                        'Oracle Pulse — Live Opportunities',
-                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800, letterSpacing: -0.3),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        'High-confluence radar · tap to deploy Trade Setup',
-                        style: TextStyle(fontSize: 12, color: Colors.grey[600]),
-                      ),
-                    ],
-                  ),
-                ),
-                  Icon(Icons.radar, color: cyan.withValues(alpha: 0.65), size: 28),
-                ],
-              ),
-            ),
+        _WarRoomHeader(pulseAnimation: pulseAnimation),
+        const SizedBox(height: 16),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(child: _WarRoomGaugeCard(intel: intel)),
+            const SizedBox(width: 10),
+            Expanded(child: _DominantForceCard(intel: intel)),
           ],
         ),
-        ),
-        const SizedBox(height: 16),
-        ...opportunities.asMap().entries.map((entry) {
-          return _OraclePulseCard(
-            opportunity: entry.value,
-            index: entry.key,
-            onGenerate: () => onGenerateSetup(entry.value.coin),
-          );
-        }),
+        const SizedBox(height: 10),
+        _CriticalBattleZonesCard(zones: intel.zones, pulseAnimation: pulseAnimation),
+        const SizedBox(height: 10),
+        _YourEdgeStatusCard(intel: intel, pulseAnimation: pulseAnimation),
       ],
     );
   }
 }
 
-class _PulsingDot extends StatefulWidget {
-  final Color color;
-  const _PulsingDot({required this.color});
+class _WarRoomHeader extends StatelessWidget {
+  final Animation<double> pulseAnimation;
+
+  const _WarRoomHeader({required this.pulseAnimation});
 
   @override
-  State<_PulsingDot> createState() => _PulsingDotState();
+  Widget build(BuildContext context) {
+    const red = Color(0xFFFF1744);
+    const cyan = Color(0xFF00D4FF);
+
+    return AnimatedBuilder(
+      animation: pulseAnimation,
+      builder: (context, child) {
+        final pulse = 0.35 + (sin(pulseAnimation.value * 2 * pi) * 0.5 + 0.5) * 0.45;
+        return Container(
+          padding: const EdgeInsets.fromLTRB(16, 18, 16, 16),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(16),
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [
+                const Color(0xFF1A0A12).withValues(alpha: 0.95),
+                const Color(0xFF0A0E18),
+                const Color(0xFF0A0A0C),
+              ],
+            ),
+            border: Border.all(
+              color: Color.lerp(red, cyan, pulse)!.withValues(alpha: 0.55),
+              width: 1.2,
+            ),
+            boxShadow: [
+              BoxShadow(color: red.withValues(alpha: 0.12 * pulse), blurRadius: 24, spreadRadius: 1),
+              BoxShadow(color: cyan.withValues(alpha: 0.10 * pulse), blurRadius: 20),
+            ],
+          ),
+          child: child,
+        );
+      },
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              _WarRoomPulseDot(color: red),
+              const SizedBox(width: 8),
+              _WarRoomPulseDot(color: cyan),
+              const SizedBox(width: 10),
+              Text(
+                'LIVE INTEL',
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 1.8,
+                  color: cyan.withValues(alpha: 0.9),
+                ),
+              ),
+              const Spacer(),
+              Icon(Icons.shield_moon_outlined, color: red.withValues(alpha: 0.75), size: 22),
+            ],
+          ),
+          const SizedBox(height: 10),
+          ShaderMask(
+            shaderCallback: (bounds) => const LinearGradient(
+              colors: [Color(0xFFFF5252), Color(0xFF00D4FF), Color(0xFF7C4DFF)],
+            ).createShader(bounds),
+            child: const Text(
+              'War Room',
+              style: TextStyle(
+                fontSize: 26,
+                fontWeight: FontWeight.w900,
+                letterSpacing: -0.5,
+                color: Colors.white,
+              ),
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Real-time battlefield intelligence',
+            style: TextStyle(fontSize: 12, color: Colors.grey[500], letterSpacing: 0.3),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
-class _PulsingDotState extends State<_PulsingDot> with SingleTickerProviderStateMixin {
+class _WarRoomPulseDot extends StatefulWidget {
+  final Color color;
+  const _WarRoomPulseDot({required this.color});
+
+  @override
+  State<_WarRoomPulseDot> createState() => _WarRoomPulseDotState();
+}
+
+class _WarRoomPulseDotState extends State<_WarRoomPulseDot> with SingleTickerProviderStateMixin {
   late final AnimationController _c;
 
   @override
   void initState() {
     super.initState();
-    _c = AnimationController(vsync: this, duration: const Duration(milliseconds: 1200))..repeat(reverse: true);
+    _c = AnimationController(vsync: this, duration: const Duration(milliseconds: 1100))..repeat(reverse: true);
   }
 
   @override
@@ -1312,15 +1482,15 @@ class _PulsingDotState extends State<_PulsingDot> with SingleTickerProviderState
   Widget build(BuildContext context) {
     return AnimatedBuilder(
       animation: _c,
-      builder: (context, child) {
+      builder: (context, _) {
         return Container(
-          width: 8,
-          height: 8,
+          width: 7,
+          height: 7,
           decoration: BoxDecoration(
             shape: BoxShape.circle,
-            color: widget.color.withValues(alpha: 0.5 + _c.value * 0.5),
+            color: widget.color.withValues(alpha: 0.45 + _c.value * 0.55),
             boxShadow: [
-              BoxShadow(color: widget.color.withValues(alpha: 0.6), blurRadius: 6 + _c.value * 6),
+              BoxShadow(color: widget.color.withValues(alpha: 0.7), blurRadius: 5 + _c.value * 8),
             ],
           ),
         );
@@ -1329,213 +1499,465 @@ class _PulsingDotState extends State<_PulsingDot> with SingleTickerProviderState
   }
 }
 
-class _OraclePulseCard extends StatefulWidget {
-  final OraclePulseOpportunity opportunity;
-  final int index;
-  final VoidCallback onGenerate;
+class _WarRoomPanel extends StatelessWidget {
+  final Widget child;
+  final Color accent;
 
-  const _OraclePulseCard({
-    required this.opportunity,
-    required this.index,
-    required this.onGenerate,
-  });
+  const _WarRoomPanel({required this.child, required this.accent});
 
   @override
-  State<_OraclePulseCard> createState() => _OraclePulseCardState();
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(14),
+        gradient: const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xFF141018), Color(0xFF0A0A0E)],
+        ),
+        border: Border.all(color: accent.withValues(alpha: 0.28)),
+        boxShadow: [
+          BoxShadow(color: accent.withValues(alpha: 0.08), blurRadius: 16, spreadRadius: 0),
+        ],
+      ),
+      child: child,
+    );
+  }
 }
 
-class _OraclePulseCardState extends State<_OraclePulseCard> with SingleTickerProviderStateMixin {
-  late final AnimationController _glow;
+class _WarRoomGaugeCard extends StatelessWidget {
+  final _WarRoomIntel intel;
 
-  @override
-  void initState() {
-    super.initState();
-    _glow = AnimationController(
-      vsync: this,
-      duration: Duration(milliseconds: 1800 + widget.index * 200),
-    )..repeat(reverse: true);
-  }
+  const _WarRoomGaugeCard({required this.intel});
 
-  @override
-  void dispose() {
-    _glow.dispose();
-    super.dispose();
-  }
-
-  static Color _coinColor(String coin) {
-    switch (coin) {
-      case 'BTC':
-        return const Color(0xFFF7931A);
-      case 'ETH':
-        return const Color(0xFF627EEA);
-      case 'SOL':
-        return const Color(0xFF14F195);
-      case 'BNB':
-        return const Color(0xFFF0B90B);
+  Color _tensionColor() {
+    switch (intel.tensionLabel) {
+      case 'HIGH':
+        return const Color(0xFFFF5252);
+      case 'MEDIUM':
+        return const Color(0xFFFFB300);
       default:
-        return const Color(0xFF00D4FF);
+        return const Color(0xFF00E676);
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final opp = widget.opportunity;
-    final isLong = opp.direction.isLong;
-    final dirColor = isLong ? const Color(0xFF00E676) : const Color(0xFFFF5252);
-    final coinColor = _coinColor(opp.coin);
-
-    return AnimatedBuilder(
-      animation: _glow,
-      builder: (context, child) {
-        final pulse = 0.12 + _glow.value * 0.18;
-        return Padding(
-          padding: const EdgeInsets.only(bottom: 12),
-          child: Container(
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(18),
-              boxShadow: [
-                BoxShadow(color: dirColor.withValues(alpha: pulse), blurRadius: 22, spreadRadius: 0),
-                BoxShadow(color: coinColor.withValues(alpha: pulse * 0.5), blurRadius: 14),
-              ],
-            ),
-            child: child,
+    final color = _tensionColor();
+    return _WarRoomPanel(
+      accent: color,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.speed, size: 16, color: color.withValues(alpha: 0.9)),
+              const SizedBox(width: 6),
+              Text(
+                'Market Tension',
+                style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: Colors.grey[400]),
+              ),
+            ],
           ),
-        );
-      },
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(18),
-        child: Stack(
-          children: [
-            Positioned.fill(
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.centerLeft,
-                    end: Alignment.centerRight,
-                    colors: [
-                      dirColor.withValues(alpha: 0.08),
-                      const Color(0xFF12141C),
-                      const Color(0xFF0A0A0E),
-                    ],
+          const SizedBox(height: 12),
+          SizedBox(
+            height: 72,
+            width: double.infinity,
+            child: CustomPaint(
+              painter: _TensionGaugePainter(value: intel.tensionValue, color: color),
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 22),
+                  child: Text(
+                    intel.tensionLabel,
+                    style: TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 1.2,
+                      color: color,
+                    ),
                   ),
                 ),
               ),
             ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'Volatility + positioning pressure',
+            style: TextStyle(fontSize: 10, color: Colors.grey[600]),
+            maxLines: 2,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TensionGaugePainter extends CustomPainter {
+  final double value;
+  final Color color;
+
+  _TensionGaugePainter({required this.value, required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height * 0.92);
+    final radius = size.width * 0.38;
+    const start = pi;
+    const sweep = pi;
+
+    final track = Paint()
+      ..color = const Color(0xFF1E2836)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 7
+      ..strokeCap = StrokeCap.round;
+    canvas.drawArc(Rect.fromCircle(center: center, radius: radius), start, sweep, false, track);
+
+    final fill = Paint()
+      ..shader = SweepGradient(
+        startAngle: pi,
+        endAngle: 2 * pi,
+        colors: [color.withValues(alpha: 0.35), color],
+      ).createShader(Rect.fromCircle(center: center, radius: radius))
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 7
+      ..strokeCap = StrokeCap.round;
+    canvas.drawArc(Rect.fromCircle(center: center, radius: radius), start, sweep * value.clamp(0.02, 1.0), false, fill);
+
+    final needleAngle = pi + sweep * value.clamp(0.0, 1.0);
+    final needleEnd = Offset(
+      center.dx + cos(needleAngle) * (radius - 4),
+      center.dy + sin(needleAngle) * (radius - 4),
+    );
+    canvas.drawCircle(needleEnd, 4.5, Paint()..color = color..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3));
+    canvas.drawCircle(needleEnd, 2.5, Paint()..color = Colors.white);
+  }
+
+  @override
+  bool shouldRepaint(covariant _TensionGaugePainter old) => old.value != value || old.color != color;
+}
+
+class _DominantForceCard extends StatelessWidget {
+  final _WarRoomIntel intel;
+
+  const _DominantForceCard({required this.intel});
+
+  @override
+  Widget build(BuildContext context) {
+    const longColor = Color(0xFF00E676);
+    const shortColor = Color(0xFFFF5252);
+    final dominant = intel.longPowerPct >= intel.shortPowerPct ? 'LONGS' : 'SHORTS';
+    final domColor = intel.longPowerPct >= intel.shortPowerPct ? longColor : shortColor;
+
+    return _WarRoomPanel(
+      accent: domColor,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.balance, size: 16, color: domColor.withValues(alpha: 0.9)),
+              const SizedBox(width: 6),
+              Text(
+                'Dominant Force',
+                style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: Colors.grey[400]),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(
+            dominant,
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900, color: domColor, letterSpacing: 0.8),
+          ),
+          const SizedBox(height: 10),
+          _ForceBar(label: 'LONGS', pct: intel.longPowerPct, color: longColor),
+          const SizedBox(height: 8),
+          _ForceBar(label: 'SHORTS', pct: intel.shortPowerPct, color: shortColor),
+        ],
+      ),
+    );
+  }
+}
+
+class _ForceBar extends StatelessWidget {
+  final String label;
+  final int pct;
+  final Color color;
+
+  const _ForceBar({required this.label, required this.pct, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(label, style: TextStyle(fontSize: 9, fontWeight: FontWeight.w700, color: Colors.grey[500])),
+            Text('$pct%', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w800, color: color)),
+          ],
+        ),
+        const SizedBox(height: 4),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(4),
+          child: TweenAnimationBuilder<double>(
+            tween: Tween(begin: 0, end: pct / 100.0),
+            duration: const Duration(milliseconds: 900),
+            curve: Curves.easeOutCubic,
+            builder: (context, v, _) {
+              return Stack(
                 children: [
-                  Row(
-                    children: [
-                      Container(
-                        width: 48,
-                        height: 48,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          gradient: RadialGradient(
-                            colors: [coinColor.withValues(alpha: 0.5), coinColor.withValues(alpha: 0.08)],
-                          ),
-                          border: Border.all(color: coinColor.withValues(alpha: 0.5)),
-                          boxShadow: [BoxShadow(color: coinColor.withValues(alpha: 0.35), blurRadius: 12)],
-                        ),
-                        child: Center(
-                          child: Text(
-                            opp.coin.length > 3 ? opp.coin.substring(0, 3) : opp.coin,
-                            style: TextStyle(fontWeight: FontWeight.w900, fontSize: 13, color: coinColor),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 14),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Text(
-                                  opp.coin,
-                                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
-                                ),
-                                const SizedBox(width: 10),
-                                Icon(
-                                  isLong ? Icons.north_east : Icons.south_east,
-                                  size: 20,
-                                  color: dirColor,
-                                ),
-                                Text(
-                                  opp.direction.label,
-                                  style: TextStyle(
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w800,
-                                    color: dirColor,
-                                    letterSpacing: 0.5,
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 6),
-                            Row(
-                              children: [
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                                  decoration: BoxDecoration(
-                                    borderRadius: BorderRadius.circular(20),
-                                    color: const Color(0xFF00D4FF).withValues(alpha: 0.12),
-                                    border: Border.all(color: const Color(0xFF00D4FF).withValues(alpha: 0.35)),
-                                  ),
-                                  child: Text(
-                                    '${opp.convictionPct}% conviction',
-                                    style: const TextStyle(
-                                      fontSize: 11,
-                                      fontWeight: FontWeight.w700,
-                                      color: Color(0xFF00D4FF),
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    opp.whyNow,
-                    style: TextStyle(fontSize: 13, height: 1.4, color: Colors.grey[400]),
-                  ),
-                  const SizedBox(height: 14),
-                  SizedBox(
-                    width: double.infinity,
-                    child: FilledButton.icon(
-                      onPressed: widget.onGenerate,
-                      icon: const Icon(Icons.bolt, size: 18),
-                      label: const Text('Generate Trade Setup'),
-                      style: FilledButton.styleFrom(
-                        backgroundColor: const Color(0xFF00BFFF),
-                        foregroundColor: Colors.black,
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  Container(height: 6, color: const Color(0xFF1A2230)),
+                  FractionallySizedBox(
+                    widthFactor: v.clamp(0.0, 1.0),
+                    child: Container(
+                      height: 6,
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(colors: [color.withValues(alpha: 0.5), color]),
+                        boxShadow: [BoxShadow(color: color.withValues(alpha: 0.45), blurRadius: 6)],
                       ),
                     ),
                   ),
                 ],
-              ),
-            ),
-            Positioned.fill(
-              child: IgnorePointer(
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(18),
-                    border: Border.all(color: dirColor.withValues(alpha: 0.22)),
-                  ),
-                ),
-              ),
-            ),
-          ],
+              );
+            },
+          ),
         ),
+      ],
+    );
+  }
+}
+
+class _CriticalBattleZonesCard extends StatelessWidget {
+  final List<_BattleZone> zones;
+  final Animation<double> pulseAnimation;
+
+  const _CriticalBattleZonesCard({required this.zones, required this.pulseAnimation});
+
+  @override
+  Widget build(BuildContext context) {
+    const purple = Color(0xFF7C4DFF);
+    return _WarRoomPanel(
+      accent: purple,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.gps_fixed, size: 16, color: purple.withValues(alpha: 0.9)),
+              const SizedBox(width: 6),
+              Text(
+                'Critical Battle Zones',
+                style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: Colors.grey[400]),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          ...zones.asMap().entries.map((e) {
+            final z = e.value;
+            return Padding(
+              padding: EdgeInsets.only(bottom: e.key < zones.length - 1 ? 10 : 0),
+              child: _BattleZoneRow(zone: z, index: e.key, pulseAnimation: pulseAnimation),
+            );
+          }),
+        ],
       ),
     );
   }
+}
+
+class _BattleZoneRow extends StatelessWidget {
+  final _BattleZone zone;
+  final int index;
+  final Animation<double> pulseAnimation;
+
+  const _BattleZoneRow({
+    required this.zone,
+    required this.index,
+    required this.pulseAnimation,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: pulseAnimation,
+      builder: (context, child) {
+        final flicker = 0.85 + (sin((pulseAnimation.value + index * 0.2) * 2 * pi) * 0.5 + 0.5) * 0.15;
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            color: zone.accent.withValues(alpha: 0.06),
+            border: Border.all(color: zone.accent.withValues(alpha: 0.22 * flicker)),
+          ),
+          child: child,
+        );
+      },
+      child: Row(
+        children: [
+          Container(
+            width: 36,
+            height: 36,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: zone.accent.withValues(alpha: 0.12),
+              border: Border.all(color: zone.accent.withValues(alpha: 0.4)),
+            ),
+            child: Center(
+              child: Text(
+                zone.coin.length > 3 ? zone.coin.substring(0, 3) : zone.coin,
+                style: TextStyle(fontSize: 10, fontWeight: FontWeight.w900, color: zone.accent),
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '${zone.coin} · ${zone.direction}',
+                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  zone.level,
+                  style: TextStyle(fontSize: 10, color: Colors.grey[500], height: 1.3),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          Column(
+            children: [
+              Text(
+                '${zone.reactionProb}%',
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w900, color: zone.accent),
+              ),
+              Text(
+                'react',
+                style: TextStyle(fontSize: 8, color: Colors.grey[600], letterSpacing: 0.5),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _YourEdgeStatusCard extends StatelessWidget {
+  final _WarRoomIntel intel;
+  final Animation<double> pulseAnimation;
+
+  const _YourEdgeStatusCard({required this.intel, required this.pulseAnimation});
+
+  @override
+  Widget build(BuildContext context) {
+    return _WarRoomPanel(
+      accent: intel.edgeColor,
+      child: Row(
+        children: [
+          SizedBox(
+            width: 72,
+            height: 72,
+            child: AnimatedBuilder(
+              animation: pulseAnimation,
+              builder: (context, _) {
+                final pulse = 0.9 + (sin(pulseAnimation.value * 2 * pi) * 0.5 + 0.5) * 0.1;
+                return CustomPaint(
+                  painter: _ReadinessRingPainter(
+                    progress: intel.edgeReadiness,
+                    color: intel.edgeColor,
+                    pulse: pulse,
+                  ),
+                  child: Center(
+                    child: Text(
+                      '${(intel.edgeReadiness * 100).round()}',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w900,
+                        color: intel.edgeColor,
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Your Edge Status',
+                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: Colors.grey[400]),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  intel.edgeStatus,
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w900,
+                    letterSpacing: 0.6,
+                    color: intel.edgeColor,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  intel.edgeSubtext,
+                  style: TextStyle(fontSize: 11, height: 1.35, color: Colors.grey[500]),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ReadinessRingPainter extends CustomPainter {
+  final double progress;
+  final Color color;
+  final double pulse;
+
+  _ReadinessRingPainter({required this.progress, required this.color, required this.pulse});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = size.width * 0.38;
+
+    final track = Paint()
+      ..color = const Color(0xFF1E2836)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 5;
+    canvas.drawCircle(center, radius, track);
+
+    final arc = Paint()
+      ..color = color.withValues(alpha: 0.85 * pulse)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 5
+      ..strokeCap = StrokeCap.round
+      ..maskFilter = MaskFilter.blur(BlurStyle.normal, 2 * pulse);
+    canvas.drawArc(
+      Rect.fromCircle(center: center, radius: radius),
+      -pi / 2,
+      2 * pi * progress.clamp(0.02, 1.0),
+      false,
+      arc,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _ReadinessRingPainter old) =>
+      old.progress != progress || old.color != color || old.pulse != pulse;
 }
