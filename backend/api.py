@@ -250,6 +250,8 @@ class AnalyzeRequest(BaseModel):
     request_ts: Optional[int] = None
     user_id: Optional[str] = Field(None, max_length=128)
     vision_confluence_pct: Optional[float] = Field(None, ge=0, le=100)
+    # User's chosen leverage — Citadel-configured when sent by Flutter; else server defaults to 5x.
+    leverage: Optional[float] = Field(None, ge=1.0, le=100.0)
 
 
 class ReviewRequest(BaseModel):
@@ -425,7 +427,10 @@ def refresh_coingecko_symbol_index(force: bool = False) -> None:
     global _COINGECKO_CACHE_LOADED_AT
 
     now = time.time()
-    if not force and (now - _COINGECKO_CACHE_LOADED_AT) < _COINGECKO_CACHE_TTL_SECONDS:
+    # Symbol→id mapping only (not prices) — forced refresh capped at 1/min so the
+    # Home 7s live-price polling never hammers CoinGecko with 500-row index pulls.
+    min_age = 60.0 if force else _COINGECKO_CACHE_TTL_SECONDS
+    if (now - _COINGECKO_CACHE_LOADED_AT) < min_age:
         return
 
     try:
@@ -3487,10 +3492,19 @@ def is_scalp_context(
     return False
 
 
-def default_system_prompt(mode: str, *, scalp_mode: bool = False) -> str:
+def default_system_prompt(
+    mode: str,
+    *,
+    scalp_mode: bool = False,
+    leverage: Optional[float] = None,
+) -> str:
     """
     Master system prompt — seasoned leverage trader voice. Preserves exact Flutter headings.
+    [leverage] = user's actual leverage (Citadel-configured or request-supplied); strict 5x default.
     """
+    lev = float(leverage) if leverage and 1.0 <= float(leverage) <= 100.0 else float(BLOFIN_DEFAULT_LEVERAGE)
+    # Price move on the stop that equals 1% account risk at this leverage (1% / leverage).
+    stop_move_pct = 1.0 / lev
     scalp_active = f"""
 ═══════════════════════════════════════
 ⚡ SCALP MODE ACTIVE — BEST SETUP ON THE BOARD OR FLAT
@@ -3564,14 +3578,26 @@ RULE 0 — LIVE PRICE (ZERO TOLERANCE)
 • Long: SL < Entry < TP1 ≤ TP2. Short: TP2 ≤ TP1 < Entry < SL. Wrong geometry → fix or omit levels.
 
 ═══════════════════════════════════════
-RULE 0.5 — LEVERAGE (PERMANENT — ALL TRADE SETUPS & R:R)
+RULE 0.5 — LEVERAGE (CRITICAL — EVERY SETUP, EVERY CALCULATION)
 ═══════════════════════════════════════
-Always base every Trade Setup, risk calculation, and R:R on the user's chosen leverage.
-• If Oracle Citadel is linked (user_id in prompt) and leverage is configured, use that exact leverage.
-• Otherwise default to {BLOFIN_DEFAULT_LEVERAGE}x leverage.
-Adjust stop distance, position size commentary, and targets realistically for the chosen leverage.
-At {BLOFIN_DEFAULT_LEVERAGE}x+: tighter invalidation beyond sweep/OB — wide stops on high leverage are account killers.
-Be conservative and professional.
+CRITICAL: ALWAYS base every single Trade Setup, risk management, position sizing, stop distance,
+and R:R calculation on the user's actual leverage.
+
+• If the user has Citadel configured and a leverage value is provided in the request, use that
+  exact leverage.
+• Otherwise default strictly to {BLOFIN_DEFAULT_LEVERAGE}x leverage.
+
+ACTIVE LEVERAGE FOR THIS REQUEST: {lev:.0f}x
+
+At {lev:.0f}x leverage:
+• A 1% account risk = only ~{stop_move_pct:.2f}% price move on the stop.
+• Adjust stop distance tighter, size positions conservatively, and set realistic TPs that work
+  well at {lev:.0f}x.
+• ALWAYS state the leverage being used and how it affects the setup (e.g. "At {lev:.0f}x leverage
+  this stop represents 1% account risk").
+• Wide stops at leverage are account killers — invalidation goes beyond the sweep/OB, never arbitrary %.
+
+Be direct, concise, and professional like an experienced crypto leverage trader. No fluff.
 
 ═══════════════════════════════════════
 RULE 1 — RISK:REWARD & LEVEL PRECISION (NON-NEGOTIABLE)
@@ -3936,8 +3962,21 @@ def resolve_prompt_leverage(
     *,
     user_id: Optional[str] = None,
     system_prompt: Optional[str] = None,
+    request_leverage: Optional[float] = None,
 ) -> float:
-    """Citadel-linked users default to configured leverage; else 5x unless client prompt specifies."""
+    """
+    User's actual leverage for every analysis / trade-setup prompt.
+    Priority: explicit request value → leverage named in client system prompt →
+    Citadel record (last leverage used on execute_trade) → strict 5x default.
+    """
+    if request_leverage is not None:
+        try:
+            lev = float(request_leverage)
+            if 1.0 <= lev <= 100.0:
+                return lev
+        except (TypeError, ValueError):
+            pass
+
     if system_prompt:
         for pattern in (
             r"leverage[^\d]{0,12}(\d{1,3})\s*x",
@@ -3953,10 +3992,35 @@ def resolve_prompt_leverage(
                 except (TypeError, ValueError):
                     pass
 
-    if user_id and _citadel_blofin_linked_record(user_id):
-        return float(BLOFIN_DEFAULT_LEVERAGE)
+    if user_id:
+        record = _citadel_blofin_linked_record(user_id)
+        if record:
+            try:
+                stored = float(record.get("leverage") or 0)
+                if 1.0 <= stored <= 100.0:
+                    return stored
+            except (TypeError, ValueError):
+                pass
 
     return float(BLOFIN_DEFAULT_LEVERAGE)
+
+
+def remember_citadel_leverage(user_id: str, leverage: float) -> None:
+    """Persist last-used Citadel leverage so future analyses use the user's exact setting."""
+    try:
+        store = _load_citadel_key_store()
+        record = store.get(user_id)
+        if not isinstance(record, dict):
+            return
+        lev = max(1.0, min(100.0, float(leverage)))
+        if record.get("leverage") == lev:
+            return
+        record["leverage"] = lev
+        store[user_id] = record
+        _save_citadel_key_store(store)
+        logger.info("citadel_leverage_remembered user_id=%s leverage=%sx", user_id[:16], lev)
+    except Exception as exc:
+        logger.warning("citadel_leverage_remember_failed user_id=%s err=%s", (user_id or "")[:16], exc)
 
 
 def build_analyze_user_prompt(
@@ -3971,6 +4035,7 @@ def build_analyze_user_prompt(
     vision_confluence_pct: Optional[float] = None,
     user_id: Optional[str] = None,
     system_prompt: Optional[str] = None,
+    leverage: Optional[float] = None,
 ) -> str:
     price = float(market["price"])
     change_pct = float(market["change_24h_pct"])
@@ -3988,7 +4053,11 @@ def build_analyze_user_prompt(
     coingecko_block = format_coingecko_pro_prompt_block(market)
     market_fallback_note = format_market_data_fallback_note(market)
     live_price_banner = format_live_price_banner(market)
-    prompt_leverage = resolve_prompt_leverage(user_id=user_id, system_prompt=system_prompt)
+    prompt_leverage = resolve_prompt_leverage(
+        user_id=user_id,
+        system_prompt=system_prompt,
+        request_leverage=leverage,
+    )
     has_mobula = market.get("source") == "mobula"
     has_blofin = market.get("source") in {"blofin", "blofin_demo"}
     has_cg_pro = market.get("source") == "coingecko_pro"
@@ -4043,10 +4112,13 @@ Weak edge → "NO SCALP — STAY FLAT" and OMIT **TRADE LEVELS**.
             )
         )
     )
+    stop_move_pct = 1.0 / prompt_leverage
     leverage_line = (
         f"ACTIVE LEVERAGE FOR THIS SETUP: {prompt_leverage:.0f}x"
-        + (" (Oracle Citadel linked — honor configured leverage)" if citadel_linked else " (default)")
-        + f". Size SL distance and R:R realistically for {prompt_leverage:.0f}x — conservative and professional."
+        + (" (Oracle Citadel configured — use this EXACT leverage)" if citadel_linked else " (strict default)")
+        + f"\nAt {prompt_leverage:.0f}x: 1% account risk = ~{stop_move_pct:.2f}% price move on the stop. "
+        f"Size SL distance, position, and TPs for {prompt_leverage:.0f}x — and STATE the leverage in the setup "
+        f"(e.g. \"At {prompt_leverage:.0f}x leverage this stop represents 1% account risk\")."
     )
     mode_close = (
         "TRADE SETUP MODE: One shot. **TRADE LEVELS** required unless flat — then execution card explains "
@@ -4566,6 +4638,50 @@ async def get_live_price(coin: str, user_id: Optional[str] = None) -> dict[str, 
     }
 
 
+@app.get("/market_movers")
+async def get_market_movers(limit: int = 250) -> dict[str, Any]:
+    """Live rows (price + 24h %) for the Market Movers page — CoinGecko Pro when keyed."""
+    per_page = max(50, min(int(limit or 250), 250))
+    try:
+        response = requests.get(
+            f"{_coingecko_api_base()}/coins/markets",
+            params={
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": per_page,
+                "page": 1,
+                "sparkline": "false",
+                "price_change_percentage": "24h",
+            },
+            headers=_coingecko_request_headers(no_cache=True),
+            timeout=12,
+        )
+        response.raise_for_status()
+        rows: list[dict[str, Any]] = []
+        for item in response.json():
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol") or "").upper()
+            price = item.get("current_price")
+            if not symbol or not isinstance(price, (int, float)) or price <= 0:
+                continue
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "price": float(price),
+                    "change_24h_pct": float(item.get("price_change_percentage_24h") or 0),
+                }
+            )
+        return {
+            "success": True,
+            "rows": rows,
+            "source": "coingecko_pro" if COINGECKO_PRO_API_KEY else "coingecko",
+        }
+    except Exception as exc:
+        logger.warning("market_movers_endpoint_fail err=%s", exc)
+        raise HTTPException(status_code=502, detail="Unable to fetch market movers data.") from exc
+
+
 @app.get("/coins")
 async def list_coins(limit: int = 150) -> dict[str, Any]:
     refresh_coingecko_symbol_index()
@@ -4612,7 +4728,18 @@ async def _handle_analyze(
 
         derivatives = fetch_derivatives_snapshot(coin, spot_price=float(market["price"]))
 
-        system_prompt = default_system_prompt(mode, scalp_mode=scalp_mode)
+        # User's actual leverage: request value → client prompt → Citadel record → strict 5x.
+        effective_leverage = resolve_prompt_leverage(
+            user_id=user_id,
+            system_prompt=request.system_prompt,
+            request_leverage=request.leverage,
+        )
+
+        system_prompt = default_system_prompt(
+            mode,
+            scalp_mode=scalp_mode,
+            leverage=effective_leverage,
+        )
         user_prompt = build_analyze_user_prompt(
             coin=coin,
             timeframe=request.timeframe,
@@ -4624,10 +4751,11 @@ async def _handle_analyze(
             vision_confluence_pct=request.vision_confluence_pct,
             user_id=user_id,
             system_prompt=request.system_prompt,
+            leverage=effective_leverage,
         )
 
         logger.info(
-            "analyze request_id=%s coin=%s mode=%s tf=%s dir=%s scalp=%s price=%.6f src=%s "
+            "analyze request_id=%s coin=%s mode=%s tf=%s dir=%s scalp=%s leverage=%sx price=%.6f src=%s "
             "mobula_liq=%s on_chain_vol=%s deriv=%s",
             req_id,
             coin,
@@ -4635,6 +4763,7 @@ async def _handle_analyze(
             request.timeframe,
             direction,
             scalp_mode,
+            f"{effective_leverage:.0f}",
             market["price"],
             market.get("source"),
             market.get("liquidity_usd") if market.get("source") == "mobula" else None,
@@ -5496,6 +5625,8 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
     # ── LIMIT: BloFin resting entry + SL on order (TP legs deferred until fill) ──
     if not is_market:
         effective_leverage = _normalize_citadel_leverage(trade.leverage)
+        # Persist for analysis prompts — future setups use this exact leverage.
+        remember_citadel_leverage(user_id, effective_leverage)
 
         lev_result = _blofin_set_leverage(
             base_url=api_base_url,
@@ -5795,6 +5926,8 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
         reference_price = float(trade.entry_price)
 
     effective_leverage = _normalize_citadel_leverage(trade.leverage)
+    # Persist for analysis prompts — future setups use this exact leverage.
+    remember_citadel_leverage(user_id, effective_leverage)
 
     lev_result = _blofin_set_leverage(
         base_url=api_base_url,
