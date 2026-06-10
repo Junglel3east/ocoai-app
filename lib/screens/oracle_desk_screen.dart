@@ -131,18 +131,22 @@ class _OracleDeskScreenState extends State<OracleDeskScreen> with SingleTickerPr
     );
     final accent = _biasColor(_bias.kind);
 
+    final bottomInset = MediaQuery.paddingOf(context).bottom;
+
     return Scaffold(
       backgroundColor: const Color(0xFF0A0A0C),
       body: AppScreenBody(
-        includeBottomNav: true,
+        // Tab Scaffold already sizes body above bottomNavigationBar — no extra nav clearance.
+        includeBottomNav: false,
         child: RefreshIndicator(
           color: const Color(0xFF00BFFF),
           onRefresh: _onRefresh,
           child: SingleChildScrollView(
             physics: const AlwaysScrollableScrollPhysics(parent: BouncingScrollPhysics()),
-            padding: const EdgeInsets.fromLTRB(_AppSpacing.screen, 8, _AppSpacing.screen, 28),
+            padding: EdgeInsets.fromLTRB(_AppSpacing.screen, 8, _AppSpacing.screen, 16 + bottomInset),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
+              mainAxisSize: MainAxisSize.min,
               children: [
                 _deskHeader(accent),
                 const SizedBox(height: _AppSpacing.section),
@@ -333,6 +337,7 @@ class _OracleDeskScreenState extends State<OracleDeskScreen> with SingleTickerPr
       _premiumPageRoute(
         (_) => TradeSetupScreen(
           coin: coin,
+          trades: widget.trades,
           onTradeSetupGenerated: widget.onTradeSetupGenerated,
         ),
       ),

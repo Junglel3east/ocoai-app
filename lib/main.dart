@@ -26,7 +26,6 @@ import 'package:webview_flutter_wkwebview/webview_flutter_wkwebview.dart';
 
 import 'services/analysis_history_store.dart';
 import 'services/daily_analysis_store.dart';
-import 'services/market_movers_service.dart';
 import 'services/watchlist_binance_ws_service.dart';
 import 'services/notification_service.dart';
 import 'services/oracle_desk_service.dart';
@@ -41,7 +40,6 @@ part 'screens/quick_analyze_screen.dart';
 part 'screens/oracle_vision_screen.dart';
 part 'screens/trade_setup_screen.dart';
 part 'screens/trade_performance_screen.dart';
-part 'screens/market_movers_screen.dart';
 part 'screens/citadel_trade_levels.dart';
 part 'screens/citadel_setup_dialog.dart';
 part 'screens/oracle_desk_screen.dart';
@@ -611,6 +609,82 @@ abstract final class SubscriptionPlanStore {
   }
 
   static bool get isFree => !isPremium && !isExpert;
+
+  static bool get isPremiumOrHigher => isPremium || isExpert;
+
+  static bool get hasOracleVisionAccess => isPremiumOrHigher;
+
+  static bool get hasOracleDeskAccess => isExpert;
+
+  static bool get hasCitadelAccess => isExpert;
+
+  static bool get hasAiChatAccess => isPremiumOrHigher;
+
+  static bool get hasUnlimitedAiChat => isExpert;
+
+  static const int freeWatchlistMax = 5;
+
+  static const int freeTradeSetupsPerDay = 3;
+
+  static const int premiumChatMessagesPerDay = 10;
+
+  static const _premiumChatDayKey = 'premium_chat_day';
+
+  static const _premiumChatCountKey = 'premium_chat_count';
+
+  static String _localDayKey([DateTime? dt]) {
+    final local = (dt ?? DateTime.now()).toLocal();
+    final m = local.month.toString().padLeft(2, '0');
+    final d = local.day.toString().padLeft(2, '0');
+    return '${local.year}-$m-$d';
+  }
+
+  static bool canAddWatchlistCoin(int currentCount) {
+    if (!isFree) return true;
+    return currentCount < freeWatchlistMax;
+  }
+
+  static int countTradeSetupsToday(List<Map<String, dynamic>> trades) {
+    final now = DateTime.now();
+    return trades.where((t) {
+      final created = DateTime.tryParse(t['createdAt']?.toString() ?? '');
+      if (created == null) return false;
+      return created.year == now.year &&
+          created.month == now.month &&
+          created.day == now.day;
+    }).length;
+  }
+
+  static bool canGenerateTradeSetup(List<Map<String, dynamic>> trades) {
+    if (!isFree) return true;
+    return countTradeSetupsToday(trades) < freeTradeSetupsPerDay;
+  }
+
+  static bool canUseAlertType(String type) {
+    if (!isFree) return true;
+    return type == 'Price';
+  }
+
+  static Future<bool> canSendChatMessage() async {
+    if (isExpert) return true;
+    if (!isPremium) return false;
+    final prefs = await SharedPreferences.getInstance();
+    final today = _localDayKey();
+    final storedDay = prefs.getString(_premiumChatDayKey) ?? '';
+    final count = storedDay == today ? (prefs.getInt(_premiumChatCountKey) ?? 0) : 0;
+    return count < premiumChatMessagesPerDay;
+  }
+
+  static Future<void> recordPremiumChatMessage() async {
+    if (!isPremium || isExpert) return;
+    final prefs = await SharedPreferences.getInstance();
+    final today = _localDayKey();
+    final storedDay = prefs.getString(_premiumChatDayKey) ?? '';
+    var count = storedDay == today ? (prefs.getInt(_premiumChatCountKey) ?? 0) : 0;
+    count++;
+    await prefs.setString(_premiumChatDayKey, today);
+    await prefs.setInt(_premiumChatCountKey, count);
+  }
 
   static Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -2357,7 +2431,7 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
 
   Future<void> _onPressed() async {
     await SubscriptionPlanStore.load();
-    if (!SubscriptionPlanStore.isExpert) {
+    if (!SubscriptionPlanStore.hasCitadelAccess) {
       if (mounted) showCitadelUpgradePrompt(context);
       return;
     }
@@ -2811,6 +2885,28 @@ abstract final class CoinAccessPolicy {
     }
     return 'Free plan: BTC, ETH, SOL only';
   }
+
+  /// Free tier: BTC / ETH / SOL only on Home Daily Analysis.
+  static List<Map<String, dynamic>> filterDailyAnalysesForPlan(
+    List<Map<String, dynamic>> rows,
+  ) {
+    if (SubscriptionPlanStore.isPremiumOrHigher) return rows;
+    return rows.where((r) {
+      final coin = normalizeCoinSymbol(r['coin']?.toString() ?? '') ?? '';
+      return freeCoins.contains(coin);
+    }).toList();
+  }
+
+  static List<Map<String, dynamic>> filterDailyAnalysesInHistory(
+    List<Map<String, dynamic>> history,
+  ) {
+    if (SubscriptionPlanStore.isPremiumOrHigher) return history;
+    return history.where((item) {
+      if (item['source'] != 'analysis') return true;
+      final coin = normalizeCoinSymbol(item['coin']?.toString() ?? '') ?? '';
+      return freeCoins.contains(coin);
+    }).toList();
+  }
 }
 
 Future<String?> resolveCoinForCurrentPlan(
@@ -3181,8 +3277,12 @@ Future<String?> showCoinSymbolSearchModal(BuildContext context, {String? current
 
 Future<void> openAiChat(BuildContext context) async {
   await SubscriptionPlanStore.load();
-  if (!SubscriptionPlanStore.hasExpertChatAccess) {
-    if (context.mounted) _showChatUpgradePrompt(context);
+  if (!SubscriptionPlanStore.hasAiChatAccess) {
+    if (context.mounted) _showChatUpgradePrompt(context, minimumTier: 'Premium');
+    return;
+  }
+  if (SubscriptionPlanStore.isPremium && !await SubscriptionPlanStore.canSendChatMessage()) {
+    if (context.mounted) _showChatDailyLimitPrompt(context);
     return;
   }
   if (context.mounted) {
@@ -3190,16 +3290,118 @@ Future<void> openAiChat(BuildContext context) async {
   }
 }
 
-void _showChatUpgradePrompt(BuildContext context) {
+void _showWatchlistLimitPrompt(BuildContext context) {
   showDialog<void>(
     context: context,
     builder: (ctx) => AlertDialog(
       backgroundColor: const Color(0xFF1A1A1A),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      title: const Text('Expert Plan Required', style: TextStyle(fontWeight: FontWeight.w600)),
+      title: const Text('Watchlist Limit Reached', style: TextStyle(fontWeight: FontWeight.w600)),
       content: Text(
-        'Oracle AI Chat is available on the Expert (Top Tier) plan. '
-        'Upgrade to unlock real-time AI assistance for your analyses and trade setups.',
+        'Free plan includes up to ${SubscriptionPlanStore.freeWatchlistMax} watchlist coins. '
+        'Upgrade to Premium for full Top 150 coverage.',
+        style: TextStyle(height: 1.45, color: Colors.grey[400]),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx),
+          child: Text('Not Now', style: TextStyle(color: Colors.grey[500])),
+        ),
+        TextButton(
+          onPressed: () {
+            Navigator.pop(ctx);
+            Navigator.push(ctx, _premiumPageRoute((_) => const SubscriptionPlanScreen()));
+          },
+          child: const Text(
+            'View Plans',
+            style: TextStyle(color: Color(0xFF00BFFF), fontWeight: FontWeight.w600),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+void showTradeSetupLimitPrompt(BuildContext context) {
+  showDialog<void>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: const Color(0xFF1A1A1A),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      title: const Text('Daily Limit Reached', style: TextStyle(fontWeight: FontWeight.w600)),
+      content: Text(
+        'Free plan includes ${SubscriptionPlanStore.freeTradeSetupsPerDay} trade setups per day. '
+        'Upgrade to Premium for unlimited setups.',
+        style: TextStyle(height: 1.45, color: Colors.grey[400]),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx),
+          child: Text('Not Now', style: TextStyle(color: Colors.grey[500])),
+        ),
+        TextButton(
+          onPressed: () {
+            Navigator.pop(ctx);
+            Navigator.push(ctx, _premiumPageRoute((_) => const SubscriptionPlanScreen()));
+          },
+          child: const Text(
+            'View Plans',
+            style: TextStyle(color: Color(0xFF00BFFF), fontWeight: FontWeight.w600),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+void _showChatUpgradePrompt(BuildContext context, {required String minimumTier}) {
+  final premiumGate = minimumTier == 'Premium';
+  showDialog<void>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: const Color(0xFF1A1A1A),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      title: Text(
+        premiumGate ? 'Premium Plan Required' : 'Expert Plan Required',
+        style: const TextStyle(fontWeight: FontWeight.w600),
+      ),
+      content: Text(
+        premiumGate
+            ? 'Oracle AI Chat is available on Premium (limited) and Expert (unlimited) plans. '
+                'Upgrade to unlock real-time AI assistance for your analyses and trade setups.'
+            : 'Unlimited Oracle AI Chat is available on the Expert (Top Tier) plan.',
+        style: TextStyle(height: 1.45, color: Colors.grey[400]),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx),
+          child: Text('Not Now', style: TextStyle(color: Colors.grey[500])),
+        ),
+        TextButton(
+          onPressed: () {
+            Navigator.pop(ctx);
+            Navigator.push(ctx, _premiumPageRoute((_) => const SubscriptionPlanScreen()));
+          },
+          child: const Text(
+            'View Plans',
+            style: TextStyle(color: Color(0xFF00BFFF), fontWeight: FontWeight.w600),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+void _showChatDailyLimitPrompt(BuildContext context) {
+  showDialog<void>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: const Color(0xFF1A1A1A),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      title: const Text('Daily Chat Limit Reached', style: TextStyle(fontWeight: FontWeight.w600)),
+      content: Text(
+        'Premium includes ${SubscriptionPlanStore.premiumChatMessagesPerDay} AI chat messages per day. '
+        'Upgrade to Expert for unlimited Oracle Trader AI Chat.',
         style: TextStyle(height: 1.45, color: Colors.grey[400]),
       ),
       actions: [
@@ -3263,6 +3465,16 @@ class _ChatScreenState extends State<ChatScreen> {
     final text = _controller.text.trim();
     if (text.isEmpty || _sending) return;
 
+    await SubscriptionPlanStore.load();
+    if (!SubscriptionPlanStore.hasAiChatAccess) {
+      if (mounted) _showChatUpgradePrompt(context, minimumTier: 'Premium');
+      return;
+    }
+    if (SubscriptionPlanStore.isPremium && !await SubscriptionPlanStore.canSendChatMessage()) {
+      if (mounted) _showChatDailyLimitPrompt(context);
+      return;
+    }
+
     setState(() {
       _sending = true;
       _messages.add({'role': 'user', 'text': text});
@@ -3285,6 +3497,7 @@ class _ChatScreenState extends State<ChatScreen> {
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body) as Map<String, dynamic>;
         final reply = (data['reply'] ?? '').toString().trim();
+        await SubscriptionPlanStore.recordPremiumChatMessage();
         if (mounted) {
           setState(() {
             _messages.add({
@@ -3877,12 +4090,718 @@ class MainScreen extends StatefulWidget {
   State<MainScreen> createState() => _MainScreenState();
 }
 
+/// Bottom-nav Citadel tab — Expert: full Citadel hub; Free/Premium: upgrade gate.
+class _CitadelScreen extends StatefulWidget {
+  final bool isActive;
+
+  const _CitadelScreen({required this.isActive});
+
+  @override
+  State<_CitadelScreen> createState() => _CitadelScreenState();
+}
+
+class _CitadelScreenState extends State<_CitadelScreen> {
+  bool _isExpert = false;
+  final GlobalKey<_CitadelExpertViewState> _expertKey = GlobalKey();
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshPlan();
+  }
+
+  @override
+  void didUpdateWidget(covariant _CitadelScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isActive && !oldWidget.isActive) {
+      _refreshPlan();
+    }
+  }
+
+  Future<void> _refreshPlan() async {
+    await SubscriptionPlanStore.load();
+    if (!mounted) return;
+    final expert = SubscriptionPlanStore.hasCitadelAccess;
+    setState(() => _isExpert = expert);
+    if (expert) {
+      _expertKey.currentState?.refreshHub();
+    }
+  }
+
+  Future<void> _openSubscription() async {
+    await Navigator.push(
+      context,
+      _premiumPageRoute((_) => const SubscriptionPlanScreen()),
+    );
+    await _refreshPlan();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isExpert) {
+      return _CitadelExpertView(
+        key: _expertKey,
+        isActive: widget.isActive,
+        onOpenSetup: () async {
+          await showCitadelSetupDialog(context);
+          await _expertKey.currentState?.refreshHub();
+        },
+      );
+    }
+    return _CitadelUpgradeView(onUpgrade: _openSubscription);
+  }
+}
+
+/// Expert plan — full Citadel hub (BloFin status, leverage, setup).
+class _CitadelExpertView extends StatefulWidget {
+  final bool isActive;
+  final Future<void> Function() onOpenSetup;
+
+  const _CitadelExpertView({
+    super.key,
+    required this.isActive,
+    required this.onOpenSetup,
+  });
+
+  @override
+  State<_CitadelExpertView> createState() => _CitadelExpertViewState();
+}
+
+class _CitadelExpertViewState extends State<_CitadelExpertView> {
+  bool _loading = true;
+  bool _serverLinked = false;
+  String? _linkMessage;
+  String _exchangeLabel = 'BloFin';
+  DateTime? _lastConnected;
+  double _leverage = 5;
+  double _riskPercent = 1;
+
+  @override
+  void initState() {
+    super.initState();
+    refreshHub();
+  }
+
+  @override
+  void didUpdateWidget(covariant _CitadelExpertView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isActive && !oldWidget.isActive) {
+      refreshHub();
+    }
+  }
+
+  Future<void> refreshHub() async {
+    setState(() => _loading = true);
+    await OracleCitadelStore.load();
+    final prefs = await SharedPreferences.getInstance();
+    final iso = prefs.getString('citadel_last_connected_iso');
+    final label = prefs.getString('citadel_connected_exchange_label');
+    var linked = false;
+    String? message;
+    if (OracleCitadelStore.isConfigured) {
+      final status = await OracleCitadelService.checkServerLinked();
+      linked = status.linked;
+      message = status.linked ? null : status.userMessage;
+    } else {
+      message = 'App credentials not saved — open setup to configure Citadel.';
+    }
+    if (!mounted) return;
+    setState(() {
+      _serverLinked = linked;
+      _linkMessage = message;
+      _exchangeLabel = (label != null && label.trim().isNotEmpty) ? label : 'BloFin';
+      _lastConnected = iso != null ? DateTime.tryParse(iso) : null;
+      _leverage = OracleCitadelStore.defaultLeverage;
+      _riskPercent = OracleCitadelStore.defaultRiskPercent;
+      _loading = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomInset = MediaQuery.paddingOf(context).bottom;
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF0E0E0E),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF1A1A1A),
+        elevation: 0,
+        title: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.shield_outlined, color: Color(0xFF00BFFF), size: 22),
+            SizedBox(width: 8),
+            Text('Citadel', style: TextStyle(fontWeight: FontWeight.w700, letterSpacing: -0.2)),
+          ],
+        ),
+        centerTitle: false,
+      ),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          physics: const BouncingScrollPhysics(),
+          padding: EdgeInsets.fromLTRB(24, 12, 24, 20 + bottomInset),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Center(
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF00BFFF).withValues(alpha: 0.12),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(Icons.shield_outlined, color: Color(0xFF00BFFF), size: 32),
+                    ),
+                    const SizedBox(width: 14),
+                    Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF43A047).withValues(alpha: 0.12),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(Icons.rocket_launch_rounded, color: Color(0xFF43A047), size: 32),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 22),
+              const Text(
+                'Oracle Citadel',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800, letterSpacing: -0.4),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'MARKET & LIMIT execution via BloFin',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.grey[400],
+                  height: 1.35,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                'Configure keys, leverage, and risk here.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 14, height: 1.45, color: Colors.grey[500]),
+              ),
+              const SizedBox(height: 24),
+              if (_loading)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 24),
+                  child: Center(
+                    child: SizedBox(
+                      width: 28,
+                      height: 28,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00BFFF)),
+                    ),
+                  ),
+                )
+              else if (_serverLinked)
+                _CitadelConnectionStatusCard(
+                  exchangeLabel: _exchangeLabel,
+                  demoMode: OracleCitadelStore.useDemoMode,
+                  lastConnected: _lastConnected ?? DateTime.now(),
+                  leverage: _leverage.round(),
+                )
+              else
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFFB74D).withValues(alpha: 0.08),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: const Color(0xFFFFB74D).withValues(alpha: 0.28)),
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Icon(Icons.link_off_rounded, color: Color(0xFFFFB74D), size: 22),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          _linkMessage ?? 'Not connected — open setup to link your BloFin API keys.',
+                          style: TextStyle(fontSize: 13, height: 1.45, color: Colors.grey[300]),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              if (!_loading) ...[
+                const SizedBox(height: 18),
+                _CitadelLeverageRiskPanel(
+                  leverage: _leverage,
+                  riskPercent: _riskPercent,
+                  onLeverageChanged: (v) async {
+                    await OracleCitadelStore.saveLeverage(v);
+                    setState(() => _leverage = OracleCitadelStore.defaultLeverage);
+                  },
+                  onRiskPercentChanged: (v) async {
+                    await OracleCitadelStore.saveRiskPercent(v);
+                    setState(() => _riskPercent = OracleCitadelStore.defaultRiskPercent);
+                  },
+                ),
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.04),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'API & execution',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.grey[500],
+                          letterSpacing: 0.3,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'User ID: ${OracleCitadelStore.userId}',
+                        style: TextStyle(fontSize: 13, color: Colors.grey[400]),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        OracleCitadelStore.useDemoMode
+                            ? 'Mode: BloFin Demo (recommended for testing)'
+                            : 'Mode: BloFin Live',
+                        style: TextStyle(fontSize: 13, color: Colors.grey[400]),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        OracleCitadelStore.isConfigured
+                            ? 'App API key: configured'
+                            : 'App API key: not set',
+                        style: TextStyle(fontSize: 13, color: Colors.grey[400]),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 24),
+                FilledButton.icon(
+                  onPressed: () => widget.onOpenSetup(),
+                  icon: const Icon(Icons.settings_outlined, size: 20),
+                  label: const Text('Open Citadel Setup'),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFF00BFFF),
+                    foregroundColor: Colors.black,
+                    padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 16),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Free / Premium — Citadel upgrade gate (mirrors Expert hero, locks execution).
+class _CitadelUpgradeView extends StatelessWidget {
+  final VoidCallback onUpgrade;
+
+  const _CitadelUpgradeView({required this.onUpgrade});
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomInset = MediaQuery.paddingOf(context).bottom;
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF0E0E0E),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF1A1A1A),
+        elevation: 0,
+        title: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.shield_outlined, color: Color(0xFF00BFFF), size: 22),
+            SizedBox(width: 8),
+            Text('Citadel', style: TextStyle(fontWeight: FontWeight.w700, letterSpacing: -0.2)),
+          ],
+        ),
+        centerTitle: false,
+      ),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          physics: const BouncingScrollPhysics(),
+          padding: EdgeInsets.fromLTRB(28, 12, 28, 20 + bottomInset),
+          child: Column(
+            children: [
+              Center(
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF00BFFF).withValues(alpha: 0.12),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(Icons.shield_outlined, color: Color(0xFF00BFFF), size: 32),
+                    ),
+                    const SizedBox(width: 14),
+                    Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF43A047).withValues(alpha: 0.12),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(Icons.rocket_launch_rounded, color: Color(0xFF43A047), size: 32),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 22),
+              const Text(
+                'Oracle Citadel',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800, letterSpacing: -0.4),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'MARKET & LIMIT execution via BloFin',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.grey[400],
+                  height: 1.35,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                'Configure keys, leverage, and risk here.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 14, height: 1.45, color: Colors.grey[500]),
+              ),
+              const SizedBox(height: 32),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton(
+                  onPressed: onUpgrade,
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFF00BFFF),
+                    foregroundColor: Colors.black,
+                    padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 16),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                    elevation: 3,
+                    shadowColor: const Color(0xFF00BFFF).withValues(alpha: 0.45),
+                  ),
+                  child: const Text(
+                    '🔓 Upgrade to Expert',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, letterSpacing: -0.2),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 20),
+              Text(
+                'Premium users get full AI analysis & Trade Setups. Citadel is Expert only.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12, height: 1.45, color: Colors.grey[600]),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Bottom-nav Oracle Vision — Premium+: live hub; Free: upgrade gate.
+class _OracleVisionTabScreen extends StatefulWidget {
+  final bool isActive;
+  final List<String> watchlist;
+  final List<Map<String, dynamic>> trades;
+  final List<Map<String, dynamic>> history;
+  final void Function(Map<String, dynamic>) onTradeSetupGenerated;
+
+  const _OracleVisionTabScreen({
+    required this.isActive,
+    required this.watchlist,
+    required this.trades,
+    required this.history,
+    required this.onTradeSetupGenerated,
+  });
+
+  @override
+  State<_OracleVisionTabScreen> createState() => _OracleVisionTabScreenState();
+}
+
+class _OracleVisionTabScreenState extends State<_OracleVisionTabScreen> {
+  bool _hasAccess = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshPlan();
+  }
+
+  @override
+  void didUpdateWidget(covariant _OracleVisionTabScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isActive && !oldWidget.isActive) {
+      _refreshPlan();
+    }
+  }
+
+  Future<void> _refreshPlan() async {
+    await SubscriptionPlanStore.load();
+    if (!mounted) return;
+    setState(() => _hasAccess = SubscriptionPlanStore.hasOracleVisionAccess);
+  }
+
+  Future<void> _openSubscription() async {
+    await Navigator.push(
+      context,
+      _premiumPageRoute((_) => const SubscriptionPlanScreen()),
+    );
+    await _refreshPlan();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_hasAccess) {
+      return OracleVisionScreen(
+        watchlist: widget.watchlist,
+        trades: widget.trades,
+        history: widget.history,
+        onTradeSetupGenerated: widget.onTradeSetupGenerated,
+      );
+    }
+    return _TierGateUpgradeView(
+      title: 'Oracle Vision',
+      icon: Icons.visibility_outlined,
+      headline: 'Oracle Vision',
+      subtitle: 'Live High-Conviction Opportunities',
+      detail: 'Real-time liquidation heatmaps, pulse signals, and confluence-driven setups.',
+      buttonLabel: '🔓 Upgrade to Premium',
+      footnote: 'Free users get Daily Analysis on BTC, ETH, and SOL. Oracle Vision is Premium+.',
+      onUpgrade: _openSubscription,
+    );
+  }
+}
+
+/// Bottom-nav Oracle Desk — Expert only; Free/Premium: upgrade gate.
+class _OracleDeskTabScreen extends StatefulWidget {
+  final bool isActive;
+  final List<String> watchlist;
+  final List<Map<String, dynamic>> trades;
+  final List<Map<String, dynamic>> history;
+  final void Function(Map<String, dynamic>) onTradeSetupGenerated;
+
+  const _OracleDeskTabScreen({
+    required this.isActive,
+    required this.watchlist,
+    required this.trades,
+    required this.history,
+    required this.onTradeSetupGenerated,
+  });
+
+  @override
+  State<_OracleDeskTabScreen> createState() => _OracleDeskTabScreenState();
+}
+
+class _OracleDeskTabScreenState extends State<_OracleDeskTabScreen> {
+  bool _isExpert = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshPlan();
+  }
+
+  @override
+  void didUpdateWidget(covariant _OracleDeskTabScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isActive && !oldWidget.isActive) {
+      _refreshPlan();
+    }
+  }
+
+  Future<void> _refreshPlan() async {
+    await SubscriptionPlanStore.load();
+    if (!mounted) return;
+    setState(() => _isExpert = SubscriptionPlanStore.hasOracleDeskAccess);
+  }
+
+  Future<void> _openSubscription() async {
+    await Navigator.push(
+      context,
+      _premiumPageRoute((_) => const SubscriptionPlanScreen()),
+    );
+    await _refreshPlan();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isExpert) {
+      return OracleDeskScreen(
+        watchlist: widget.watchlist,
+        trades: widget.trades,
+        history: widget.history,
+        onTradeSetupGenerated: widget.onTradeSetupGenerated,
+      );
+    }
+    return _TierGateUpgradeView(
+      title: 'Oracle Desk',
+      icon: Icons.dashboard_customize_outlined,
+      headline: 'Oracle Desk',
+      subtitle: 'Advanced Performance + Personal Command Center',
+      detail: 'Watchlist bias, trade performance, Oracle Pulse, and your personal trading hub.',
+      buttonLabel: '🔓 Upgrade to Expert',
+      footnote: 'Premium users get Oracle Vision and unlimited trade setups. Oracle Desk is Expert only.',
+      onUpgrade: _openSubscription,
+    );
+  }
+}
+
+/// Reusable tier gate shell (Citadel / Vision / Desk upgrade screens).
+class _TierGateUpgradeView extends StatelessWidget {
+  final String title;
+  final IconData icon;
+  final String headline;
+  final String subtitle;
+  final String detail;
+  final String buttonLabel;
+  final String footnote;
+  final VoidCallback onUpgrade;
+
+  const _TierGateUpgradeView({
+    required this.title,
+    required this.icon,
+    required this.headline,
+    required this.subtitle,
+    required this.detail,
+    required this.buttonLabel,
+    required this.footnote,
+    required this.onUpgrade,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomInset = MediaQuery.paddingOf(context).bottom;
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF0E0E0E),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF1A1A1A),
+        elevation: 0,
+        title: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, color: const Color(0xFF00BFFF), size: 22),
+            const SizedBox(width: 8),
+            Text(title, style: const TextStyle(fontWeight: FontWeight.w700, letterSpacing: -0.2)),
+          ],
+        ),
+        centerTitle: false,
+      ),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          physics: const BouncingScrollPhysics(),
+          padding: EdgeInsets.fromLTRB(28, 12, 28, 20 + bottomInset),
+          child: Column(
+            children: [
+              Center(
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF00BFFF).withValues(alpha: 0.12),
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(icon, color: const Color(0xFF00BFFF), size: 32),
+                    ),
+                    const SizedBox(width: 14),
+                    Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF43A047).withValues(alpha: 0.12),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(Icons.rocket_launch_rounded, color: Color(0xFF43A047), size: 32),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 22),
+              Text(
+                headline,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w800, letterSpacing: -0.4),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                subtitle,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.grey[400],
+                  height: 1.35,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                detail,
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 14, height: 1.45, color: Colors.grey[500]),
+              ),
+              const SizedBox(height: 32),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton(
+                  onPressed: onUpgrade,
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFF00BFFF),
+                    foregroundColor: Colors.black,
+                    padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 16),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                    elevation: 3,
+                    shadowColor: const Color(0xFF00BFFF).withValues(alpha: 0.45),
+                  ),
+                  child: Text(
+                    buttonLabel,
+                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800, letterSpacing: -0.2),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 20),
+              Text(
+                footnote,
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12, height: 1.45, color: Colors.grey[600]),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   static const int _tabHome = 0;
-  static const int _tabCharts = 3;
+  static const int _tabCitadel = 1;
+  static const int _tabTradeSetup = 2;
+  static const int _tabOracleVision = 3;
+  static const int _tabOracleDesk = 4;
 
   int _selectedIndex = _tabHome;
-  String _chartsSymbol = 'BTC';
   final List<Map<String, dynamic>> history = [];
   final List<Map<String, dynamic>> trades = [];
   DateTime? _lastTradeRefreshAt;
@@ -3894,9 +4813,14 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   final List<String> _watchlist = ['BTC', 'ETH', 'SOL', 'BNB'];
   static const Set<String> _defaultWatchlist = {'BTC', 'ETH', 'SOL', 'BNB'};
 
-  void addToWatchlist(String symbol) {
+  Future<void> addToWatchlist(String symbol) async {
     final normalized = CoinAccessPolicy.normalizeCoinSymbol(symbol);
     if (normalized == null || _watchlist.contains(normalized)) return;
+    await SubscriptionPlanStore.load();
+    if (!SubscriptionPlanStore.canAddWatchlistCoin(_watchlist.length)) {
+      if (mounted) _showWatchlistLimitPrompt(context);
+      return;
+    }
     setState(() => _watchlist.add(normalized));
     debugPrint('[Watchlist] Added coin: $normalized');
   }
@@ -3912,14 +4836,17 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     debugPrint('[Watchlist] Removed coin: $normalized');
   }
 
-  /// FIX: Pass tapped watchlist coin to ChartsScreen, not just switch tabs.
+  /// Watchlist coin → full-screen Charts (Charts no longer a bottom tab).
   void goToCharts(String symbol) {
     final normalized = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
     debugPrint('[Navigation] Watchlist → Charts: $normalized');
-    setState(() {
-      _chartsSymbol = normalized;
-      _selectedIndex = _tabCharts;
-    });
+    if (!mounted) return;
+    Navigator.push(
+      context,
+      _premiumPageRoute(
+        (_) => ChartsScreen(initialSymbol: normalized, isTabActive: true),
+      ),
+    );
   }
 
   @override
@@ -3964,8 +4891,11 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _applyDailyAnalysesToHistory() async {
+    await SubscriptionPlanStore.load();
     _pruneAnalysisHistoryBeforeDay(_analysisDayKey(DateTime.now()));
-    final merged = DailyAnalysisStore.mergeIntoHistory(history);
+    final merged = CoinAccessPolicy.filterDailyAnalysesInHistory(
+      DailyAnalysisStore.mergeIntoHistory(history),
+    );
     if (!mounted) return;
     setState(() => history
       ..clear()
@@ -4031,7 +4961,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     _repairTradeHistoryLinks();
     await _refreshOpenTrades();
     await DailyAnalysisStore.init();
-    final merged = DailyAnalysisStore.mergeIntoHistory(history);
+    await SubscriptionPlanStore.load();
+    final merged = CoinAccessPolicy.filterDailyAnalysesInHistory(
+      DailyAnalysisStore.mergeIntoHistory(history),
+    );
     if (mounted) {
       history
         ..clear()
@@ -4372,22 +5305,21 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             onClearDailyAnalyses: clearDailyAnalyses,
             onRefreshDailyAnalyses: _refreshDailyAnalysesForHome,
           ),
-          OracleVisionScreen(
+          _CitadelScreen(isActive: _selectedIndex == _tabCitadel),
+          TradeSetupScreen(
+            coin: 'BTC',
+            trades: trades,
+            onTradeSetupGenerated: addTradeSetupResult,
+          ),
+          _OracleVisionTabScreen(
+            isActive: _selectedIndex == _tabOracleVision,
             watchlist: _watchlist,
             trades: trades,
             history: history,
             onTradeSetupGenerated: addTradeSetupResult,
           ),
-          TradeSetupScreen(
-            coin: 'BTC',
-            onTradeSetupGenerated: addTradeSetupResult,
-          ),
-          ChartsScreen(
-            key: ValueKey(_chartsSymbol),
-            initialSymbol: _chartsSymbol,
-            isTabActive: _selectedIndex == _tabCharts,
-          ),
-          OracleDeskScreen(
+          _OracleDeskTabScreen(
+            isActive: _selectedIndex == _tabOracleDesk,
             watchlist: _watchlist,
             trades: trades,
             history: history,
@@ -4406,11 +5338,31 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         elevation: 12,
         type: BottomNavigationBarType.fixed,
         items: const [
-          BottomNavigationBarItem(icon: Icon(Icons.home_outlined), activeIcon: Icon(Icons.home), label: 'Home'),
-          BottomNavigationBarItem(icon: Icon(Icons.visibility_outlined), activeIcon: Icon(Icons.visibility), label: 'Oracle Vision'),
-          BottomNavigationBarItem(icon: Icon(Icons.gps_fixed), activeIcon: Icon(Icons.gps_fixed), label: 'Trade Setup'),
-          BottomNavigationBarItem(icon: Icon(Icons.bar_chart_outlined), activeIcon: Icon(Icons.bar_chart), label: 'Charts'),
-          BottomNavigationBarItem(icon: Icon(Icons.dashboard_customize_outlined), activeIcon: Icon(Icons.dashboard_customize), label: 'Oracle Desk'),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.home_outlined),
+            activeIcon: Icon(Icons.home),
+            label: 'Home',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.shield_outlined),
+            activeIcon: Icon(Icons.shield),
+            label: 'Citadel',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.gps_fixed_outlined),
+            activeIcon: Icon(Icons.gps_fixed),
+            label: 'Trade Setup',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.visibility_outlined),
+            activeIcon: Icon(Icons.visibility),
+            label: 'Oracle Vision',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.dashboard_customize_outlined),
+            activeIcon: Icon(Icons.dashboard_customize),
+            label: 'Oracle Desk',
+          ),
         ],
       ),
     );
@@ -4910,6 +5862,104 @@ Future<Map<String, _WatchlistQuote>> _fetchWatchlistQuotes(List<String> symbols)
   }
 }
 
+// --- Home live prices: 7s backend poll (/live_price → Mobula → CoinGecko Pro) ---
+
+/// Shared short-TTL cache so Watchlist + Daily Oracle Bias never double-fetch
+/// the same coin inside one polling window (keeps backend load minimal).
+abstract final class _HomeLivePriceCache {
+  static const Duration _ttl = Duration(seconds: 5);
+  static final Map<String, ({double price, double? change24hPct, DateTime at})> _cache = {};
+  static final Map<String, Future<({double price, double? change24hPct})?>> _inflight = {};
+
+  static Future<({double price, double? change24hPct})?> fetch(String coin) {
+    final upper = CoinAccessPolicy.normalizeCoinSymbol(coin) ?? coin.trim().toUpperCase();
+    final cached = _cache[upper];
+    if (cached != null && DateTime.now().difference(cached.at) < _ttl) {
+      return Future.value((price: cached.price, change24hPct: cached.change24hPct));
+    }
+    final pending = _inflight[upper];
+    if (pending != null) return pending;
+
+    final future = OracleLivePriceService.fetch(upper).then((data) {
+      _inflight.remove(upper);
+      final price = (data?['price'] as num?)?.toDouble();
+      if (price == null || price <= 0) return null;
+      final change = (data?['change_24h_pct'] as num?)?.toDouble();
+      _cache[upper] = (price: price, change24hPct: change, at: DateTime.now());
+      return (price: price, change24hPct: change);
+    });
+    _inflight[upper] = future;
+    return future;
+  }
+}
+
+/// Subtle pulsing "LIVE" dot — signals the 7s live price feed is active.
+class _LivePulseDot extends StatefulWidget {
+  const _LivePulseDot();
+
+  @override
+  State<_LivePulseDot> createState() => _LivePulseDotState();
+}
+
+class _LivePulseDotState extends State<_LivePulseDot> with SingleTickerProviderStateMixin {
+  late final AnimationController _pulse;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulse = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1400),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _pulse.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _pulse,
+      builder: (context, _) {
+        final t = 0.45 + _pulse.value * 0.55;
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 7,
+              height: 7,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: const Color(0xFF00E676).withValues(alpha: t),
+                boxShadow: [
+                  BoxShadow(
+                    color: const Color(0xFF00E676).withValues(alpha: t * 0.5),
+                    blurRadius: 6,
+                    spreadRadius: 1,
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 5),
+            Text(
+              'LIVE',
+              style: TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 1.1,
+                color: const Color(0xFF00E676).withValues(alpha: 0.55 + _pulse.value * 0.45),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
 /// Home Watchlist — horizontal scroll, live quotes, + add coin (unchanged behavior).
 class _HomeWatchlistSection extends StatefulWidget {
   final List<String> watchlist;
@@ -4949,20 +5999,47 @@ class _HomeWatchlistSectionState extends State<_HomeWatchlistSection> {
   List<String> get _normalizedWatchlist =>
       widget.watchlist.map((s) => CoinAccessPolicy.normalizeCoinSymbol(s) ?? s.trim().toUpperCase()).toList();
 
+  /// 7s live poll — backend /live_price (Mobula → CoinGecko Pro). Capped per tick.
+  Timer? _livePollTimer;
+  static const int _kMaxLivePollSymbols = 8;
+
   @override
   void initState() {
     super.initState();
     _watchlistSignature = _signatureFor(widget.watchlist);
     _loadQuotes(initial: true);
     _connectBinanceWs();
+    _livePollTimer = Timer.periodic(const Duration(seconds: 7), (_) => _pollLivePrices());
   }
 
   @override
   void dispose() {
+    _livePollTimer?.cancel();
     _wsUiThrottle?.cancel();
     _binanceWs?.disconnect();
     _binanceWs = null;
     super.dispose();
+  }
+
+  /// Updates price + 24h % only — icons, layout, and card UI untouched.
+  Future<void> _pollLivePrices() async {
+    if (!mounted) return;
+    final symbols = _normalizedWatchlist.take(_kMaxLivePollSymbols).toList();
+    if (symbols.isEmpty) return;
+    final results = await Future.wait(symbols.map(_HomeLivePriceCache.fetch));
+    if (!mounted) return;
+    setState(() {
+      for (var i = 0; i < symbols.length; i++) {
+        final r = results[i];
+        if (r == null) continue;
+        final prev = _quotes[symbols[i]];
+        _quotes[symbols[i]] = (prev ?? _WatchlistQuote(symbol: symbols[i])).copyWith(
+          priceUsd: r.price,
+          change24hPct: r.change24hPct ?? prev?.change24hPct,
+        );
+      }
+      _loadingQuotes = false;
+    });
   }
 
   @override
@@ -5273,16 +6350,23 @@ class _HomeWatchlistSectionState extends State<_HomeWatchlistSection> {
       children: [
         _SectionHeader(
           title: 'Watchlist',
-          trailing: _ScaleTap(
-            onTap: _openWatchlistCoinSearch,
-            child: Material(
-              color: const Color(0xFF00BFFF).withValues(alpha: 0.15),
-              borderRadius: BorderRadius.circular(20),
-              child: const Padding(
-                padding: EdgeInsets.all(8),
-                child: Icon(Icons.add, color: Color(0xFF00BFFF), size: 22),
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const _LivePulseDot(),
+              const SizedBox(width: 12),
+              _ScaleTap(
+                onTap: _openWatchlistCoinSearch,
+                child: Material(
+                  color: const Color(0xFF00BFFF).withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(20),
+                  child: const Padding(
+                    padding: EdgeInsets.all(8),
+                    child: Icon(Icons.add, color: Color(0xFF00BFFF), size: 22),
+                  ),
+                ),
               ),
-            ),
+            ],
           ),
         ),
         if (widget.watchlist.length > _kHomePreviewCount)
@@ -5377,11 +6461,17 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Reload today's BTC / ETH / SOL / XRP cards from local store (after push, pull-refresh, Quick Analyze).
   void reloadDailyAnalysesFromParent() {
     if (!mounted) return;
-    _reloadDailyAnalysisItems();
+    unawaited(_reloadDailyAnalysisItems());
   }
 
-  void _reloadDailyAnalysisItems() {
-    setState(() => _dailyAnalysisItems = DailyAnalysisStore.loadTodayOrdered());
+  Future<void> _reloadDailyAnalysisItems() async {
+    await SubscriptionPlanStore.load();
+    if (!mounted) return;
+    setState(() {
+      _dailyAnalysisItems = CoinAccessPolicy.filterDailyAnalysesForPlan(
+        DailyAnalysisStore.loadTodayOrdered(),
+      );
+    });
   }
 
   /// Called from MainScreen when user opens a daily-analysis notification.
@@ -5682,14 +6772,6 @@ class _HomeScreenState extends State<HomeScreen> {
         titleSpacing: 12,
         actions: [
           IconButton(
-            tooltip: 'Market Movers',
-            icon: const Icon(Icons.local_fire_department, color: Color(0xFF00BFFF)),
-            onPressed: () => Navigator.push(
-              context,
-              _premiumPageRoute((_) => const MarketMoversScreen()),
-            ),
-          ),
-          IconButton(
             tooltip: 'YouTube',
             icon: const Icon(Icons.play_circle_outline, color: Color(0xFFFF5252)),
             onPressed: () => openYouTubeChannel(context),
@@ -5853,10 +6935,65 @@ class _DailyOracleBiasBlockState extends State<_DailyOracleBiasBlock> {
   bool _loading = true;
   String? _error;
 
+  /// 7s live poll — backend /live_price (Mobula → CoinGecko Pro), shared cache.
+  Timer? _livePollTimer;
+
   @override
   void initState() {
     super.initState();
     _load(initial: true);
+    _livePollTimer = Timer.periodic(const Duration(seconds: 7), (_) => _pollLivePrices());
+  }
+
+  @override
+  void dispose() {
+    _livePollTimer?.cancel();
+    super.dispose();
+  }
+
+  /// Patches asset price + 24h % only — overall bias, confidence, and levels untouched.
+  Future<void> _pollLivePrices() async {
+    final snap = _snapshot;
+    if (!mounted || snap == null) return;
+
+    final symbols = snap.assets.map((a) => a.symbol).toList();
+    final results = await Future.wait(symbols.map(_HomeLivePriceCache.fetch));
+    if (!mounted) return;
+
+    final bySymbol = <String, ({double price, double? change24hPct})>{};
+    for (var i = 0; i < symbols.length; i++) {
+      final r = results[i];
+      if (r != null) bySymbol[symbols[i]] = r;
+    }
+    if (bySymbol.isEmpty) return;
+
+    final current = _snapshot;
+    if (current == null) return;
+
+    var changed = false;
+    final updatedAssets = current.assets.map((asset) {
+      final r = bySymbol[asset.symbol];
+      if (r == null) return asset;
+      changed = true;
+      return _OracleAssetBias(
+        symbol: asset.symbol,
+        priceUsd: r.price,
+        change24hPct: r.change24hPct ?? asset.change24hPct,
+        low24h: asset.low24h,
+        high24h: asset.high24h,
+      );
+    }).toList();
+    if (!changed) return;
+
+    setState(() {
+      _snapshot = _DailyOracleBiasSnapshot(
+        overall: current.overall,
+        confidencePct: current.confidencePct,
+        sentimentLine: current.sentimentLine,
+        assets: updatedAssets,
+        fetchedAt: DateTime.now(),
+      );
+    });
   }
 
   /// Called from Home pull-to-refresh only.
@@ -6020,9 +7157,16 @@ class _DailyOracleBiasBlockState extends State<_DailyOracleBiasBlock> {
                           style: TextStyle(fontSize: 13, height: 1.4, color: Colors.grey[400]),
                         ),
                         const SizedBox(height: 6),
-                        Text(
-                          _updatedLabel(snap.fetchedAt),
-                          style: TextStyle(fontSize: 11, color: Colors.grey[600]),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const _LivePulseDot(),
+                            const SizedBox(width: 8),
+                            Text(
+                              _updatedLabel(snap.fetchedAt),
+                              style: TextStyle(fontSize: 11, color: Colors.grey[600]),
+                            ),
+                          ],
                         ),
                       ],
                     ),
@@ -6927,9 +8071,9 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
             icon: Icons.lock_open_outlined,
             accentColor: Colors.grey,
             features: const [
-              'Daily analysis on BTC, ETH, SOL only',
-              'Basic charts',
-              'Limited trade setups',
+              'Daily Analysis (BTC, ETH, SOL only)',
+              'Basic Watchlist (max 5 coins)',
+              'Limited Trade Setups (3 per day)',
             ],
             isCurrent: _currentPlan == 'Free',
             badge: null,
@@ -6945,12 +8089,10 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
             accentColor: const Color(0xFF00BFFF),
             features: const [
               'Full coin coverage (Top 150)',
-              'All timeframes',
               'Unlimited Trade Setups',
               'AI Chat (limited)',
-              'Push Notifications',
-              'Oracle Desk Command Center',
-              'Export reports',
+              'All timeframes',
+              'Advanced custom alerts',
             ],
             isCurrent: _currentPlan == 'Premium',
             badge: 'Most Popular',
@@ -6966,13 +8108,10 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
             accentColor: const Color(0xFFFFB74D),
             features: const [
               'Everything in Premium',
-              'Analyze any coin (unlimited symbols)',
+              'Full Oracle Citadel (Automated Live Execution)',
               'Unlimited Oracle Trader AI Chat',
-              'Full On-Chain Data',
-              'Advanced Custom Alerts',
-              'Automated Trading via Oracle Citadel',
-              'Priority Support',
-              'Detailed Win Rate Analytics',
+              'Oracle Vision (Live High-Conviction Opportunities)',
+              'Oracle Desk (Advanced Performance + Personal Command Center)',
             ],
             isCurrent: _currentPlan == 'Expert',
             badge: 'Top Tier',
@@ -8860,7 +9999,45 @@ class _AlertsScreenState extends State<AlertsScreen> with SingleTickerProviderSt
     setState(() => AlertsStore.instance.remove(id));
   }
 
+  void _showAdvancedAlertUpgradePrompt() {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A1A),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('Premium Plan Required', style: TextStyle(fontWeight: FontWeight.w600)),
+        content: Text(
+          'Advanced custom alerts (RSI, MACD, Volume, VWAP Cross, News) are available on Premium and Expert plans. '
+          'Free plan includes basic Price alerts only.',
+          style: TextStyle(height: 1.45, color: Colors.grey[400]),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text('Not Now', style: TextStyle(color: Colors.grey[500])),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              Navigator.push(ctx, _premiumPageRoute((_) => const SubscriptionPlanScreen()));
+            },
+            child: const Text(
+              'View Plans',
+              style: TextStyle(color: Color(0xFF00BFFF), fontWeight: FontWeight.w600),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _openEditor({AlertRecord? existing}) async {
+    await SubscriptionPlanStore.load();
+    if (existing != null && !SubscriptionPlanStore.canUseAlertType(existing.alertType)) {
+      if (!mounted) return;
+      _showAdvancedAlertUpgradePrompt();
+      return;
+    }
     final result = await showModalBottomSheet<AlertRecord>(
       context: context,
       isScrollControlled: true,
@@ -8871,6 +10048,12 @@ class _AlertsScreenState extends State<AlertsScreen> with SingleTickerProviderSt
       builder: (ctx) => _AlertEditorSheet(initial: existing),
     );
     if (!mounted || result == null) return;
+
+    await SubscriptionPlanStore.load();
+    if (!SubscriptionPlanStore.canUseAlertType(result.alertType)) {
+      if (mounted) _showAdvancedAlertUpgradePrompt();
+      return;
+    }
 
     setState(() {
       if (existing != null) {
@@ -9293,6 +10476,9 @@ class _AlertEditorSheetState extends State<_AlertEditorSheet> {
   static const _types = ['Price', 'RSI', 'MACD', 'Volume', 'VWAP Cross', 'News'];
   static const _timeframes = ['5m', '15m', '1h', '4h', '1d'];
 
+  List<String> get _allowedTypes =>
+      SubscriptionPlanStore.isFree ? const ['Price'] : _types;
+
   late String selectedCoin;
   late bool useCustomCoin;
   late String alertType;
@@ -9304,6 +10490,7 @@ class _AlertEditorSheetState extends State<_AlertEditorSheet> {
   @override
   void initState() {
     super.initState();
+    unawaited(SubscriptionPlanStore.load());
     final existing = widget.initial;
     if (existing != null) {
       final coinUpper = existing.coin.toUpperCase();
@@ -9315,7 +10502,7 @@ class _AlertEditorSheetState extends State<_AlertEditorSheet> {
         useCustomCoin = true;
         _customCoinController.text = coinUpper;
       }
-      alertType = _types.contains(existing.alertType) ? existing.alertType : 'Price';
+      alertType = _allowedTypes.contains(existing.alertType) ? existing.alertType : 'Price';
       condition = existing.condition == 'Below' ? 'Below' : 'Above';
       timeframe = _timeframes.contains(existing.timeframe) ? existing.timeframe : '1h';
       if (existing.value != '0') {
@@ -9346,7 +10533,8 @@ class _AlertEditorSheetState extends State<_AlertEditorSheet> {
     return 'technical';
   }
 
-  void _save() {
+  Future<void> _save() async {
+    await SubscriptionPlanStore.load();
     final coin = _resolvedCoin;
     if (coin.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -9354,6 +10542,15 @@ class _AlertEditorSheetState extends State<_AlertEditorSheet> {
       );
       return;
     }
+
+    if (!SubscriptionPlanStore.canUseAlertType(alertType)) {
+      if (!mounted) return;
+      Navigator.pop(context);
+      return;
+    }
+
+    final resolvedCoin = await resolveCoinForCurrentPlan(context, coin, showDialogs: true);
+    if (resolvedCoin == null || !mounted) return;
 
     if (alertType != 'MACD' && alertType != 'News' && _valueController.text.trim().isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -9364,7 +10561,7 @@ class _AlertEditorSheetState extends State<_AlertEditorSheet> {
 
     final alert = AlertRecord(
       id: widget.initial?.id ?? DateTime.now().microsecondsSinceEpoch.toString(),
-      coin: coin,
+      coin: resolvedCoin,
       alertType: alertType,
       condition: condition,
       value: _valueController.text.trim().isEmpty ? '0' : _valueController.text.trim(),
@@ -9449,7 +10646,7 @@ class _AlertEditorSheetState extends State<_AlertEditorSheet> {
               initialValue: alertType,
               dropdownColor: const Color(0xFF1E1E1E),
               decoration: _inputDecoration(),
-              items: _types.map((t) => DropdownMenuItem(value: t, child: Text(t))).toList(),
+              items: _allowedTypes.map((t) => DropdownMenuItem(value: t, child: Text(t))).toList(),
               onChanged: (v) => setState(() => alertType = v ?? 'Price'),
             ),
             const SizedBox(height: 16),

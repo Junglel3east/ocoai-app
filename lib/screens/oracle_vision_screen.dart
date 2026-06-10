@@ -175,6 +175,11 @@ class _OracleVisionScreenState extends State<OracleVisionScreen> with TickerProv
     required OraclePulseDirection direction,
     required int convictionPct,
   }) async {
+    await SubscriptionPlanStore.load();
+    if (!SubscriptionPlanStore.canGenerateTradeSetup(widget.trades)) {
+      if (mounted) showTradeSetupLimitPrompt(context);
+      return;
+    }
     final resolved = await resolveCoinForCurrentPlan(context, coin);
     if (resolved == null || !mounted) return;
     Navigator.push(

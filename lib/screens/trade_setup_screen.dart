@@ -10,11 +10,13 @@ part of '../main.dart';
 
 class TradeSetupScreen extends StatefulWidget {
   final String coin;
+  final List<Map<String, dynamic>> trades;
   final Function(Map<String, dynamic>) onTradeSetupGenerated;
 
   const TradeSetupScreen({
     super.key,
     required this.coin,
+    required this.trades,
     required this.onTradeSetupGenerated,
   });
 
@@ -103,6 +105,11 @@ class _TradeSetupScreenState extends State<TradeSetupScreen> {
   }
 
   Future<void> generateSetup() async {
+    await SubscriptionPlanStore.load();
+    if (!SubscriptionPlanStore.canGenerateTradeSetup(widget.trades)) {
+      if (mounted) showTradeSetupLimitPrompt(context);
+      return;
+    }
     final raw = useCustomCoin ? _coinController.text : selectedCoin;
     final coin = await resolveCoinForCurrentPlan(context, raw);
     if (coin == null || !mounted) return;
