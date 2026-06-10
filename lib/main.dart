@@ -5196,6 +5196,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         ..addAll(savedTrades);
     });
     _migrateAndPruneDailyAnalyses();
+    _sanitizePlaceholderReports();
     _repairTradeHistoryLinks();
     await _refreshOpenTrades();
     await DailyAnalysisStore.init();
@@ -5213,6 +5214,24 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       await AnalysisHistoryStore.saveTrades(trades);
       _homeKey.currentState?.reloadDailyAnalysesFromParent();
     }
+  }
+
+  /// Clears placeholder report text saved before async fetch completed (e.g. "Loading...").
+  void _sanitizePlaceholderReports() {
+    var changed = false;
+    for (final trade in trades) {
+      if (isPlaceholderStoredReport(trade['report']?.toString())) {
+        trade.remove('report');
+        changed = true;
+      }
+    }
+    for (final item in history) {
+      if (isPlaceholderStoredReport(item['report']?.toString())) {
+        item.remove('report');
+        changed = true;
+      }
+    }
+    if (changed && mounted) setState(() {});
   }
 
   /// Backfill missing tradeId/report links so every Trade Performance row can open.
@@ -5234,9 +5253,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       if (hid != null) usedHistoryIds.add(hid);
 
       final report = existing['report']?.toString() ?? '';
-      if (report.trim().isEmpty) continue;
+      if (isPlaceholderStoredReport(report)) continue;
 
-      if ((trade['report']?.toString().trim().isEmpty ?? true)) {
+      final tradeReport = trade['report']?.toString() ?? '';
+      if (isPlaceholderStoredReport(tradeReport)) {
         trade['report'] = report;
         changed = true;
       }
@@ -5292,6 +5312,11 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   }
 
   void addTradeSetupResult(Map<String, dynamic> payload) {
+    final reportText = payload['report']?.toString() ?? '';
+    if (isPlaceholderStoredReport(reportText)) {
+      debugPrint('[TradeSetup] Skipping save — report not ready or placeholder.');
+      return;
+    }
     final now = DateTime.now();
     // String id avoids Hive int precision loss; same id on trade + history row.
     final tradeId = now.millisecondsSinceEpoch.toString();
@@ -6897,7 +6922,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _analysisHistoryCard(BuildContext context, Map<String, dynamic> item) {
     final snap = Map<String, dynamic>.from(item);
     final subtitle = snap['time'].toString();
-    final hasReport = snap['report']?.toString().trim().isNotEmpty ?? false;
+    final hasReport = !isPlaceholderStoredReport(snap['report']?.toString());
 
     return Padding(
       key: ValueKey('history_${snap['id']}_${snap['tradeId'] ?? ''}'),
@@ -9221,9 +9246,11 @@ class _ReviewReportScreenState extends State<ReviewReportScreen> {
       reviewText = null;
     });
 
-    if (storedReport.trim().isEmpty) {
+    if (isPlaceholderStoredReport(storedReport)) {
       setState(() {
-        errorMessage = "No stored report found for this item.";
+        errorMessage = isTradeSetup
+            ? 'No saved report for this trade — run Trade Setup again to generate a fresh report.'
+            : 'No stored report found for this item.';
         loading = false;
       });
       return;
@@ -9672,12 +9699,13 @@ class _TradeSetupResultScreenState extends State<TradeSetupResultScreen> {
       );
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
-        _saveTradeSetupIfNeeded();
+        final fetchedReport = (data['report'] ?? 'No report').toString();
         setState(() {
-          report = data['report'] ?? "No report";
+          report = fetchedReport;
           loading = false;
           _ensureChartController();
         });
+        _saveTradeSetupIfNeeded(fetchedReport);
       } else {
         debugPrint('[TradeSetup] HTTP ${response.statusCode}: ${response.body}');
         setState(() {
@@ -9694,17 +9722,18 @@ class _TradeSetupResultScreenState extends State<TradeSetupResultScreen> {
     }
   }
 
-  void _saveTradeSetupIfNeeded() {
+  void _saveTradeSetupIfNeeded(String reportText) {
     if (_saved) return;
+    if (isPlaceholderStoredReport(reportText)) return;
     _saved = true;
-    final parsed = parseCitadelTradeLevels(report);
+    final parsed = parseCitadelTradeLevels(reportText);
     _entry = parsed.entry;
     _tp1 = parsed.tp1;
     _tp2 = parsed.tp2;
     _sl = parsed.sl;
     widget.onTradeSetupGenerated({
       "coin": resolvedCoin,
-      "report": report,
+      "report": reportText,
       "timeframe": widget.timeframe,
       "direction": widget.direction,
       "entry": _entry,

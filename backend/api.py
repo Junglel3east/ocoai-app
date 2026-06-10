@@ -5348,6 +5348,11 @@ async def review(request: ReviewRequest, http_request: Request):
     previous_report = request.previous_report.strip()
     if not previous_report:
         raise HTTPException(status_code=400, detail="previous_report is required.")
+    if previous_report.lower() in {"loading...", "loading", "no report", "no report."}:
+        raise HTTPException(
+            status_code=400,
+            detail="previous_report is a placeholder — regenerate the original analysis first.",
+        )
 
     market = fetch_market_snapshot(coin)
     req_id = getattr(http_request.state, "request_id", "?")

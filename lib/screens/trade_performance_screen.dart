@@ -6,6 +6,17 @@ part of '../main.dart';
 
 
 
+/// True when a saved report is a UI placeholder — not valid for Review/Open.
+bool isPlaceholderStoredReport(String? report) {
+  final t = report?.trim() ?? '';
+  if (t.isEmpty) return true;
+  final lower = t.toLowerCase();
+  return lower == 'loading...' ||
+      lower == 'loading' ||
+      lower == 'no report' ||
+      lower == 'no report.';
+}
+
 /// Compares ids after Hive reload (int, String, num, precision loss).
 
 bool _historyIdsMatch(dynamic a, dynamic b) {
@@ -73,6 +84,10 @@ Map<String, dynamic>? resolveHistoryItemForTrade(
   Map<String, dynamic>? pick(Map<String, dynamic> item) {
 
     if (isExcluded(item)) return null;
+
+    final report = item['report']?.toString() ?? '';
+
+    if (isPlaceholderStoredReport(report)) return null;
 
     return Map<String, dynamic>.from(item);
 
@@ -148,7 +163,7 @@ Map<String, dynamic>? resolveHistoryItemForTrade(
 
   final report = trade['report']?.toString() ?? '';
 
-  if (report.trim().isNotEmpty) {
+  if (!isPlaceholderStoredReport(report)) {
 
     return {
 
@@ -376,7 +391,7 @@ class TradePerformanceScreen extends StatelessWidget {
 
                   final report = item?['report']?.toString().trim() ?? '';
 
-                  if (item == null || report.isEmpty) {
+                  if (item == null || isPlaceholderStoredReport(report)) {
 
                     _snack(context, 'No saved report for this trade — run Trade Setup again to refresh.');
 
@@ -416,7 +431,7 @@ class TradePerformanceScreen extends StatelessWidget {
 
                   final report = item?['report']?.toString().trim() ?? '';
 
-                  if (item == null || report.isEmpty) {
+                  if (item == null || isPlaceholderStoredReport(report)) {
 
                     _snack(context, 'No saved report for this trade — run Trade Setup again to refresh.');
 
