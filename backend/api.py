@@ -25,7 +25,7 @@ Endpoints (lib/main.dart):
   POST /execute_trade — Oracle Citadel trade execution (Flutter Send to Citadel)
   GET  /daily_analyses — today's scheduled Home daily analysis batch (BTC, ETH, SOL, XRP)
 
-Price chain (analysis): Mobula → CoinGecko (aggressive) → Binance Spot/Futures
+Price chain (analysis): Mobula → CoinGecko Pro → CoinGecko free → Binance Spot/Futures → BloFin (Citadel-linked fallback)
 Derivatives (/analyze): funding, OI, long/short ratio, liquidations (Binance Futures)
 Trade levels format (Oracle Citadel / Flutter parsing):
   Entry at $X, TP1 (40%) at $X, TP2 (60%) at $X, SL at $X (R:R X.X:1)
@@ -86,6 +86,10 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 MOBULA_API_KEY = (os.getenv("MOBULA_API_KEY") or "").strip()
 MOBULA_API_BASE_URL = os.getenv("MOBULA_API_BASE_URL", "https://api.mobula.io/api/1").rstrip("/")
 MOBULA_DEMO_API_BASE_URL = "https://demo-api.mobula.io/api/1"
+# CoinGecko Pro — fast CEX reference when MOBULA_API_KEY + key set on Railway
+COINGECKO_PRO_API_KEY = (os.getenv("COINGECKO_PRO_API_KEY") or "").strip()
+COINGECKO_PUBLIC_API_BASE = "https://api.coingecko.com/api/v3"
+COINGECKO_PRO_API_BASE = "https://pro-api.coingecko.com/api/v3"
 # Grok HTTP client timeouts (requests tuple: connect, read).
 GROK_CONNECT_TIMEOUT = int(os.getenv("GROK_CONNECT_TIMEOUT", "20"))
 GROK_TIMEOUT = int(os.getenv("GROK_TIMEOUT", "120"))
@@ -398,6 +402,25 @@ def normalize_analyze_mode(raw: Optional[str], *, default: str = "analysis") -> 
 # ---------------------------------------------------------------------------
 
 
+def _coingecko_api_base() -> str:
+    return COINGECKO_PRO_API_BASE if COINGECKO_PRO_API_KEY else COINGECKO_PUBLIC_API_BASE
+
+
+def _coingecko_request_headers(*, no_cache: bool = False) -> dict[str, str]:
+    headers: dict[str, str] = {"Accept": "application/json"}
+    if COINGECKO_PRO_API_KEY:
+        headers["x-cg-pro-api-key"] = COINGECKO_PRO_API_KEY
+    if no_cache:
+        headers.update(
+            {
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            }
+        )
+    return headers
+
+
 def refresh_coingecko_symbol_index(force: bool = False) -> None:
     global _COINGECKO_CACHE_LOADED_AT
 
@@ -406,9 +429,10 @@ def refresh_coingecko_symbol_index(force: bool = False) -> None:
         return
 
     try:
+        cg_base = _coingecko_api_base()
         for page in (1, 2):
             response = requests.get(
-                "https://api.coingecko.com/api/v3/coins/markets",
+                f"{cg_base}/coins/markets",
                 params={
                     "vs_currency": "usd",
                     "order": "market_cap_desc",
@@ -416,6 +440,7 @@ def refresh_coingecko_symbol_index(force: bool = False) -> None:
                     "page": page,
                     "sparkline": "false",
                 },
+                headers=_coingecko_request_headers(),
                 timeout=REQUEST_TIMEOUT,
             )
             if response.status_code != 200:
@@ -441,8 +466,9 @@ def resolve_coingecko_id(symbol: str) -> Optional[str]:
 
     try:
         response = requests.get(
-            "https://api.coingecko.com/api/v3/search",
+            f"{_coingecko_api_base()}/search",
             params={"query": upper},
+            headers=_coingecko_request_headers(),
             timeout=REQUEST_TIMEOUT,
         )
         if response.status_code != 200:
@@ -650,7 +676,7 @@ def format_mobula_market_prompt_block(market: dict[str, Any]) -> str:
 
 def format_market_data_fallback_note(market: dict[str, Any]) -> str:
     """When Mobula misses, tell the model not to invent on-chain stats."""
-    if market.get("source") in {"mobula", "blofin", "blofin_demo"}:
+    if market.get("source") in {"mobula", "blofin", "blofin_demo", "coingecko_pro"}:
         return ""
     return (
         "═══ ON-CHAIN / MOBULA ═══\n"
@@ -658,6 +684,76 @@ def format_market_data_fallback_note(market: dict[str, Any]) -> str:
         "Infer liquidity from structure + Binance derivatives only; state 'on-chain depth unverified' once in "
         "**Liquidity & Sentiment** if relevant.\n\n"
     )
+
+
+def _compact_usd_label(val: Any) -> str:
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return "n/a"
+    if v >= 1e9:
+        return f"${v / 1e9:.2f}B"
+    if v >= 1e6:
+        return f"${v / 1e6:.1f}M"
+    if v >= 1e3:
+        return f"${v / 1e3:.1f}K"
+    return format_usd(v)
+
+
+def format_live_price_banner(market: dict[str, Any]) -> str:
+    """Single-line live price + source for prompts (Mobula / CoinGecko Pro / fallbacks)."""
+    price = format_usd(float(market["price"]))
+    change = float(market.get("change_24h_pct") or 0)
+    source = market.get("source", "unknown")
+
+    if source == "mobula":
+        liq = _compact_usd_label(market.get("liquidity_usd"))
+        on_vol = float(market.get("on_chain_volume_usd") or 0)
+        off_vol = float(market.get("off_chain_volume_usd") or 0)
+        vol_note = ""
+        if on_vol > 0 or off_vol > 0:
+            vol_note = (
+                f" | On-chain vol: {_compact_usd_label(on_vol)}"
+                f" | CEX vol: {_compact_usd_label(off_vol)}"
+            )
+        return f"LIVE PRICE from Mobula: {price} | 24h {change:+.2f}% | Liquidity: {liq}{vol_note}"
+
+    if source == "coingecko_pro":
+        vol = _compact_usd_label(market.get("volume_24h_usd"))
+        return f"LIVE PRICE from CoinGecko Pro: {price} | 24h {change:+.2f}% | CEX Volume: {vol}"
+
+    if source == "coingecko":
+        vol = _compact_usd_label(market.get("volume_24h_usd"))
+        return f"LIVE PRICE from CoinGecko: {price} | 24h {change:+.2f}% | Volume: {vol}"
+
+    if source in {"blofin", "blofin_demo"}:
+        label = "BloFin Demo" if source == "blofin_demo" else "BloFin"
+        return f"LIVE PRICE from {label}: {price} | 24h {change:+.2f}% | Citadel-linked mark"
+
+    if source in {"binance_spot", "binance_futures"}:
+        label = "Binance Spot" if source == "binance_spot" else "Binance Futures"
+        vol = _compact_usd_label(market.get("volume_24h_usd"))
+        vol_suffix = f" | Volume: {vol}" if vol != "n/a" else ""
+        return f"LIVE PRICE from {label}: {price} | 24h {change:+.2f}%{vol_suffix}"
+
+    return f"LIVE PRICE ({source}): {price} | 24h {change:+.2f}%"
+
+
+def format_coingecko_pro_prompt_block(market: dict[str, Any]) -> str:
+    """CoinGecko Pro / public CEX context when Mobula is unavailable."""
+    source = market.get("source")
+    if source not in {"coingecko_pro", "coingecko"}:
+        return ""
+
+    vol = market.get("volume_24h_usd")
+    label = "COINGECKO PRO" if source == "coingecko_pro" else "COINGECKO"
+    lines = [
+        f"═══ {label} LIVE CEX REFERENCE — RELIABLE SPOT/PERP ANCHOR ═══",
+        f"CEX 24h volume: {_compact_usd_label(vol)} | Use for CEX-led flow read when Mobula absent.",
+        "MANDATORY: Weight CEX volume + Binance derivatives (funding/OI/L-S/liqs) in **Liquidity & Sentiment**.",
+        "Do NOT invent DEX pool depth — state CEX-led flow explicitly when on-chain data is missing.",
+    ]
+    return "\n".join(lines) + "\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -729,13 +825,6 @@ def fetch_coingecko_market(
 
     try:
         # Aggressive cache-bust: headers + unique query param per request (proxies/CDNs)
-        headers: dict[str, str] = {}
-        if no_cache:
-            headers = {
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0",
-            }
         params: dict[str, str] = {
             "ids": coin_id,
             "vs_currencies": "usd",
@@ -746,9 +835,9 @@ def fetch_coingecko_market(
             params["_"] = str(cache_bust_ms or int(time.time() * 1000))
 
         response = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price",
+            f"{_coingecko_api_base()}/simple/price",
             params=params,
-            headers=headers,
+            headers=_coingecko_request_headers(no_cache=no_cache),
             timeout=REQUEST_TIMEOUT,
         )
         if response.status_code != 200:
@@ -759,11 +848,12 @@ def fetch_coingecko_market(
         if price <= 0:
             return None
 
+        cg_source = "coingecko_pro" if COINGECKO_PRO_API_KEY else "coingecko"
         return {
             "price": price,
             "change_24h_pct": float(payload.get("usd_24h_change") or 0),
             "volume_24h_usd": float(payload.get("usd_24h_vol") or 0),
-            "source": "coingecko",
+            "source": cg_source,
             "coin_id": coin_id,
         }
     except Exception as exc:
@@ -890,14 +980,59 @@ def fetch_blofin_live_price(
 
 def fetch_live_price_for_analysis(coin: str, user_id: Optional[str] = None) -> dict[str, Any]:
     """
-    Fresh price for AI analysis/trade setup: BloFin (when user linked), then Mobula,
-    CoinGecko (aggressive), then Binance.
-    Does not change prompts or report section format — only enriches market context when Mobula hits.
+    Fresh price for AI analysis/trade setup:
+    1. Mobula (on-chain liquidity, real volume, DEX data)
+    2. CoinGecko Pro when COINGECKO_PRO_API_KEY is set (else public CoinGecko)
+    3. Binance Spot/Futures free fallbacks
+    4. BloFin mark price when Citadel-linked (execution parity last resort)
     """
     upper = coin.upper()
     refresh_coingecko_symbol_index(force=True)
 
     fetched_at = time.time()
+
+    mobula = fetch_mobula_price(upper)
+    if mobula:
+        age_ms = (time.time() - fetched_at) * 1000
+        logger.info(
+            "live_price_for_ai coin=%s source=mobula price=%.6f liquidity=%.0f age_ms=%.0f",
+            upper,
+            mobula["price"],
+            mobula.get("liquidity_usd") or 0,
+            age_ms,
+        )
+        return {"coin": upper, "fetched_at": fetched_at, **mobula}
+
+    cg_label = "coingecko_pro" if COINGECKO_PRO_API_KEY else "coingecko"
+    logger.warning(
+        "live_price_for_ai coin=%s mobula_miss — trying %s",
+        upper,
+        cg_label,
+    )
+    snapshot = fetch_coingecko_market_aggressive(upper)
+    if snapshot:
+        age_ms = (time.time() - fetched_at) * 1000
+        logger.info(
+            "live_price_for_ai coin=%s source=%s price=%.6f age_ms=%.0f",
+            upper,
+            snapshot.get("source", cg_label),
+            snapshot["price"],
+            age_ms,
+        )
+        return {"coin": upper, "fetched_at": fetched_at, **snapshot}
+
+    logger.warning("live_price_for_ai coin=%s %s_miss — falling back to binance", upper, cg_label)
+    symbol = binance_usdt_symbol(coin)
+    for fetcher in (fetch_binance_spot, fetch_binance_futures):
+        snap = fetcher(symbol)
+        if snap:
+            logger.info(
+                "live_price_for_ai coin=%s source=%s price=%.6f",
+                upper,
+                snap["source"],
+                snap["price"],
+            )
+            return {"coin": upper, "fetched_at": time.time(), **snap}
 
     blofin_record = _citadel_blofin_linked_record(user_id)
     if blofin_record:
@@ -912,56 +1047,13 @@ def fetch_live_price_for_analysis(coin: str, user_id: Optional[str] = None) -> d
         if blofin:
             age_ms = (time.time() - fetched_at) * 1000
             logger.info(
-                "live_price_for_ai coin=%s source=%s price=%.6f age_ms=%.0f",
+                "live_price_for_ai coin=%s source=%s price=%.6f age_ms=%.0f (citadel fallback)",
                 upper,
                 blofin["source"],
                 blofin["price"],
                 age_ms,
             )
             return {"coin": upper, "fetched_at": fetched_at, **blofin}
-
-        logger.warning(
-            "live_price_for_ai coin=%s blofin_miss user=%s — falling back to mobula/coingecko",
-            upper,
-            (user_id or "")[:16],
-        )
-
-    mobula = fetch_mobula_price(upper)
-    if mobula:
-        age_ms = (time.time() - fetched_at) * 1000
-        logger.info(
-            "live_price_for_ai coin=%s source=mobula price=%.6f liquidity=%.0f age_ms=%.0f",
-            upper,
-            mobula["price"],
-            mobula.get("liquidity_usd") or 0,
-            age_ms,
-        )
-        return {"coin": upper, "fetched_at": fetched_at, **mobula}
-
-    logger.warning("live_price_for_ai coin=%s mobula_miss — trying coingecko", upper)
-    snapshot = fetch_coingecko_market_aggressive(upper)
-    if snapshot:
-        age_ms = (time.time() - fetched_at) * 1000
-        logger.info(
-            "live_price_for_ai coin=%s source=coingecko price=%.6f age_ms=%.0f",
-            upper,
-            snapshot["price"],
-            age_ms,
-        )
-        return {"coin": upper, "fetched_at": fetched_at, **snapshot}
-
-    logger.warning("live_price_for_ai coin=%s coingecko_miss — falling back to binance", upper)
-    symbol = binance_usdt_symbol(coin)
-    for fetcher in (fetch_binance_spot, fetch_binance_futures):
-        snap = fetcher(symbol)
-        if snap:
-            logger.info(
-                "live_price_for_ai coin=%s source=%s price=%.6f",
-                upper,
-                snap["source"],
-                snap["price"],
-            )
-            return {"coin": upper, "fetched_at": time.time(), **snap}
 
     raise HTTPException(
         status_code=502,
@@ -1249,7 +1341,7 @@ def format_derivatives_prompt_block(derivatives: dict[str, Any]) -> str:
     else:
         liq_val = "quiet — no meaningful recent force orders"
 
-    return f"""═══ LIVE DERIVATIVES — BINANCE FUTURES (leverage positioning read; NEVER list as four sentences) ═══
+    return f"""═══ LIVE DERIVATIVES — BINANCE FUTURES (perp positioning read; NEVER list as four sentences) ═══
 Funding: {funding_val} → {derivatives['funding_label']}
 Open Interest: {oi_val} → {derivatives['oi_label']}
 Long/Short accounts (5m): {ls_val} → {derivatives['ls_label']}
@@ -1258,7 +1350,7 @@ Recent liquidations: {liq_val} → {derivatives['liq_label']}
 TRADER INSTRUCTION — synthesize into **Liquidity & Sentiment** as ONE story:
 • Who is paying whom (funding)? Is OI rising with trend (conviction) or against it (shorts/longs adding)?
 • Are accounts lopsided (L/S) into a level where stops cluster? Did liqs mark exhaustion or fuel continuation?
-• Map to order flow: squeeze setup, cascade risk, counter crowded extension, liquidity grab, or stand aside until reset.
+• Map to positioning: squeeze setup, cascade risk, counter crowded extension, liquidity grab, or stand aside until reset.
 • Good: "Shorts are paying to hold the book while OI bleeds off the highs — long liqs already printed;
   only short breakdown while Daily VWAP caps."
 • Bad: four separate clauses restating each metric.
@@ -3349,7 +3441,7 @@ def ensure_disclaimer(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Prompts — veteran desk analyst (maximum conviction)
+# Prompts — leverage trader voice (maximum conviction)
 # ---------------------------------------------------------------------------
 
 
@@ -3412,10 +3504,10 @@ SCALP DOCTRINE (mandatory when proposing a scalp):
 • PRICE: Entry at live spot or named limit at OB/FVG/Daily VWAP — ≤0.8% drift majors, ≤1.2% high-beta alts.
 • TRIGGER: Precise event — Daily VWAP reclaim/reject, EMA 5/20 displacement, liquidity sweep + reclaim,
   BOS/CHOCH retest, inducement grab + mitigation, RSI through 50 with volume expansion. Vague momentum = NO SCALP.
-• ORDER FLOW / DERIVATIVES: Funding extreme + L/S skew + liq prints = who is trapped; counter crowded side or
+• DERIVATIVES / POSITIONING: Funding extreme + L/S skew + liq prints = who is trapped; counter crowded side or
   ride the cascade. OI rising into breakout = real; OI flat on rip = suspect.
-• SL: Beyond sweep wick / micro structure / Daily VWAP failure — majors ~0.12–0.55%. State invalidation in
-  price AND time ("dead after 12× 5m bars").
+• SL: Beyond sweep wick / micro structure / Daily VWAP failure — majors ~0.12–0.55% at default {BLOFIN_DEFAULT_LEVERAGE}x.
+  State invalidation in price AND time ("dead after 12× 5m bars").
 • TP1 (40% of position): Nearest liquidity pool / partial fill of FVG — ≥{MIN_RR_TP1:.1f}:1 R:R
   (target {TARGET_RR_TP1:.1f}:1+). TP2 (60% of position): Extension into next HTF pool only.
 • PSYCH: Note FOMO trap, chase risk, or "no edge until X clears" when applicable.
@@ -3426,7 +3518,7 @@ SCALP DOCTRINE (mandatory when proposing a scalp):
 ═══════════════════════════════════════
 SCALP PROTOCOL (auto: scalp / quick move / scalping / short-term / ≤45m TF)
 ═══════════════════════════════════════
-On scalp intent: surgical entry, Daily VWAP battlefield, order-flow + derivatives filter, micro SL,
+On scalp intent: surgical entry, Daily VWAP battlefield, derivatives + liquidity filter, micro SL,
 ≥{MIN_RR_TP1:.1f}:1 R:R on TP1. Best scalp available or explicit flat — half-measures are for tourists.
 """
 
@@ -3439,8 +3531,8 @@ IDENTITY: Direct, confident, technical but conversational — like a veteran lev
 board live. Maximum conviction. Zero fluff. Real money on every word. Call the trade, name the invalidation,
 or command FLAT.
 
-VOICE: Crisp clauses. Active verbs. Price-specific. Psychology-aware. Stream-trader energy — not hedge-fund
-desk, not tutorial, not influencer hype.
+VOICE: Crisp clauses. Active verbs. Price-specific. Psychology-aware. Stream-trader energy — not institutional
+jargon, not tutorial, not influencer hype.
 
 TONE EXEMPLAR (match this cadence):
 "BTC 1D reclaiming Daily VWAP with strong bid absorption + funding flipping positive. Clear liquidity sweep
@@ -3452,9 +3544,10 @@ FORBIDDEN (instant credibility kill):
 "consider", "potentially", "somewhat", "moderately", metric laundry lists, separate sentences for
 funding/OI/L-S/liqs, chatbot warmth, tutorial tone.
 BANNED JARGON — never use: "session VWAP", "previous session", "tape", "regime", "fade", "macro tape",
-"weighted momentum", "Oracle flow", "balanced session", "institutional desk", "macro tone".
+"weighted momentum", "Oracle flow", "balanced session", "institutional desk", "macro tone", "order flow footprint",
+"footprint", "delta profile", "auction market".
 USE INSTEAD: Daily VWAP, Previous Day VWAP, liquidity sweep, inducement, order block, FVG, BOS, CHOCH,
-mitigation, displacement, reclaiming, sweeping, liquidity grab, bid/offer absorption, crowded longs/shorts.
+mitigation, displacement, reclaiming, sweeping, liquidity grab, previous highs/lows, crowded longs/shorts.
 
 REQUIRED LEXICON (woven naturally): liquidity sweep, inducement, order block, FVG (fair value gap),
 BOS (break of structure), CHOCH, mitigation, displacement, reclaiming, sweeping, previous highs/lows,
@@ -3469,6 +3562,16 @@ RULE 0 — LIVE PRICE (ZERO TOLERANCE)
 • **Asset**: EXACT coin | live price | 24h % from prompt.
 • Entry / TP1 / TP2 / SL anchored to live NOW. State drift % vs spot when entry is a limit.
 • Long: SL < Entry < TP1 ≤ TP2. Short: TP2 ≤ TP1 < Entry < SL. Wrong geometry → fix or omit levels.
+
+═══════════════════════════════════════
+RULE 0.5 — LEVERAGE (PERMANENT — ALL TRADE SETUPS & R:R)
+═══════════════════════════════════════
+Always base every Trade Setup, risk calculation, and R:R on the user's chosen leverage.
+• If Oracle Citadel is linked (user_id in prompt) and leverage is configured, use that exact leverage.
+• Otherwise default to {BLOFIN_DEFAULT_LEVERAGE}x leverage.
+Adjust stop distance, position size commentary, and targets realistically for the chosen leverage.
+At {BLOFIN_DEFAULT_LEVERAGE}x+: tighter invalidation beyond sweep/OB — wide stops on high leverage are account killers.
+Be conservative and professional.
 
 ═══════════════════════════════════════
 RULE 1 — RISK:REWARD & LEVEL PRECISION (NON-NEGOTIABLE)
@@ -3508,8 +3611,8 @@ recent liquidations. Mobula may add liquidity/volume context.
 **Liquidity & Sentiment** — ONE authoritative paragraph:
   Tell the positioning story: Who is crowded? Who just got liquidated? Is OI rising with price
   (new money) or rising against price (shorts adding)? Is funding paying shorts to hold the book?
-  Are liqs fueling continuation or marking exhaustion? Tie to order flow (stop runs, cascade risk,
-  squeeze setup, liquidity grab). Read like a leverage trader sizing a perp — never "Funding is X. OI is Y."
+  Are liqs fueling continuation or marking exhaustion? Tie to stop runs, cascade risk,
+  squeeze setup, liquidity grab. Read like a leverage trader sizing a perp — never "Funding is X. OI is Y."
 
 **Confluence Summary** — EXACTLY one sentence. Grade STRONG / MODERATE / WEAK. Fuse structure + VWAP +
   momentum + derivatives + liquidity when available.
@@ -3602,7 +3705,7 @@ MODE: MARKET ANALYSIS — VERDICT FIRST, LEVELS WHEN EARNED
 
 
 # ---------------------------------------------------------------------------
-# Oracle Trader AI Chat — veteran desk (POST /chat only)
+# Oracle Trader AI Chat (POST /chat only)
 # ---------------------------------------------------------------------------
 
 _CHAT_COIN_PATTERN = re.compile(
@@ -3631,33 +3734,43 @@ def build_chat_market_context_note(coin: str) -> tuple[str, list[str]]:
     Returns (context block, limitation notes) — never raises; safe for chat.
     """
     upper = coin.upper()
-    lines: list[str] = [f"═══ LIVE DESK DATA — {upper} (server-fed, use in your answer) ═══"]
+    lines: list[str] = [
+        f"═══ LIVE ORACLE DATA — {upper} (Oracle Desk / Chat — server-fed, weave into prose) ═══"
+    ]
     limitations: list[str] = []
 
     mobula = fetch_mobula_price(upper)
     price: Optional[float] = None
     if mobula:
         price = float(mobula["price"])
-        lines.append(
-            f"Price: {format_usd(price)} | 24h {mobula['change_24h_pct']:+.2f}% | source: Mobula (depth-weighted)"
-        )
+        lines.append(format_live_price_banner(mobula))
         if mobula.get("liquidity_usd"):
-            lines.append(f"DEX liquidity: ${mobula['liquidity_usd']:,.0f}")
-        if mobula.get("on_chain_volume_usd") or mobula.get("off_chain_volume_usd"):
+            lines.append(f"Pool liquidity depth: {_compact_usd_label(mobula['liquidity_usd'])}")
+        on_vol = float(mobula.get("on_chain_volume_usd") or 0)
+        off_vol = float(mobula.get("off_chain_volume_usd") or 0)
+        if on_vol > 0 or off_vol > 0:
+            total = on_vol + off_vol
+            on_pct = 100.0 * on_vol / total if total > 0 else 0
             lines.append(
-                f"Volume 24h — on-chain: ${float(mobula.get('on_chain_volume_usd') or 0):,.0f} | "
-                f"off-chain: ${float(mobula.get('off_chain_volume_usd') or 0):,.0f}"
+                f"Volume delta: {on_pct:.0f}% on-chain / {100.0 - on_pct:.0f}% CEX — "
+                "weight conviction by which side leads flow."
             )
     else:
         limitations.append(f"Mobula live quote unavailable for {upper}")
-        try:
-            snap = fetch_market_snapshot(upper)
-            price = float(snap["price"])
-            lines.append(
-                f"Price: {format_usd(price)} | 24h {snap['change_24h_pct']:+.2f}% | source: {snap.get('source', 'fallback')}"
-            )
-        except HTTPException:
-            limitations.append(f"No live price feed for {upper} — analyze from principles; ask user for symbol/chart")
+        cg_snap = fetch_coingecko_market_aggressive(upper)
+        if cg_snap:
+            price = float(cg_snap["price"])
+            lines.append(format_live_price_banner(cg_snap))
+            lines.append(format_coingecko_pro_prompt_block(cg_snap).strip())
+        else:
+            try:
+                snap = fetch_market_snapshot(upper)
+                price = float(snap["price"])
+                lines.append(format_live_price_banner(snap))
+            except HTTPException:
+                limitations.append(
+                    f"No live price feed for {upper} — analyze from principles; ask user for symbol/chart"
+                )
 
     try:
         deriv = fetch_derivatives_snapshot(upper, spot_price=price)
@@ -3710,7 +3823,7 @@ actionable value.
 
 VOICE: Sharp, professional, relatable — like an experienced leverage trader on a live call. Short paragraphs.
 Price-specific when possible. Zero fluff. Zero excuses. No influencer hype. No tutorial voice.
-AVOID hedge-fund jargon: "regime", "tape", "fade", "session". Use Daily VWAP and Previous Day VWAP.
+AVOID institutional jargon: "regime", "tape", "fade", "session", "order flow footprint". Use Daily VWAP and Previous Day VWAP.
 
 FORBIDDEN OPENERS / FILLER:
 "I can't", "I'm unable", "I don't have access" (without prior value), "might", "could", "maybe",
@@ -3719,7 +3832,7 @@ FORBIDDEN OPENERS / FILLER:
 REQUIRED BEHAVIOR:
 • LEAD WITH THE CALL: bias, edge, or flat — then support it (MTF, Daily VWAP, structure, derivatives).
 • LEVERAGE MASTERY: funding, OI, long/short ratio, liquidation cascades, squeeze/cascade, crowded side,
-  order flow, stop runs, liquidity pools, liquidity sweeps, inducement, mitigation.
+  stop runs, liquidity pools, liquidity sweeps, inducement, mitigation. Default {BLOFIN_DEFAULT_LEVERAGE}x unless Citadel leverage specified.
 • TECHNICAL DEPTH: Daily VWAP, Previous Day VWAP, weekly/monthly VWAP, order blocks, FVGs, BOS/CHOCH,
   premium/discount, previous highs/lows, displacement, HTF/LTF alignment, macro risk-on/off for alts.
 • LEVELS (when user wants a trade): Entry at $X, TP1 (40%) at $X, TP2 (60%) at $X, SL at $X (R:R X.X:1).
@@ -3730,7 +3843,7 @@ REQUIRED BEHAVIOR:
   — 1–2 sharp follow-up questions (specific, not generic), AND
   — 1 concrete next step (e.g. "pull 15m for trigger", "watch funding flip", "stand aside until Daily VWAP reclaim").
 • ALTERNATIVES: when main idea is weak, offer Plan A / Plan B (e.g. breakout long vs short into resistance).
-• Server-fed [LIVE DESK DATA] blocks are authoritative when present — weave into prose, not bullet dumps.
+• Server-fed [LIVE ORACLE DATA] blocks are authoritative when present — weave into prose, not bullet dumps.
 • Do NOT append the formal report disclaimer unless user asks for a full written report.
 • Chat format: conversational markdown OK; no mandatory report headings unless user requests a full report.
 
@@ -3819,6 +3932,33 @@ trader language — fuse technicals + derivatives + liquidity.
 """
 
 
+def resolve_prompt_leverage(
+    *,
+    user_id: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+) -> float:
+    """Citadel-linked users default to configured leverage; else 5x unless client prompt specifies."""
+    if system_prompt:
+        for pattern in (
+            r"leverage[^\d]{0,12}(\d{1,3})\s*x",
+            r"(\d{1,3})\s*x\s*leverage",
+            r"leverage\s*[:=]\s*(\d{1,3})",
+        ):
+            match = re.search(pattern, system_prompt, re.IGNORECASE)
+            if match:
+                try:
+                    lev = float(match.group(1))
+                    if 1.0 <= lev <= 100.0:
+                        return lev
+                except (TypeError, ValueError):
+                    pass
+
+    if user_id and _citadel_blofin_linked_record(user_id):
+        return float(BLOFIN_DEFAULT_LEVERAGE)
+
+    return float(BLOFIN_DEFAULT_LEVERAGE)
+
+
 def build_analyze_user_prompt(
     *,
     coin: str,
@@ -3829,6 +3969,8 @@ def build_analyze_user_prompt(
     scalp_mode: bool = False,
     derivatives: Optional[dict[str, Any]] = None,
     vision_confluence_pct: Optional[float] = None,
+    user_id: Optional[str] = None,
+    system_prompt: Optional[str] = None,
 ) -> str:
     price = float(market["price"])
     change_pct = float(market["change_24h_pct"])
@@ -3843,9 +3985,14 @@ def build_analyze_user_prompt(
 
     derivatives_block = format_derivatives_prompt_block(derivatives)
     mobula_block = format_mobula_market_prompt_block(market)
+    coingecko_block = format_coingecko_pro_prompt_block(market)
     market_fallback_note = format_market_data_fallback_note(market)
+    live_price_banner = format_live_price_banner(market)
+    prompt_leverage = resolve_prompt_leverage(user_id=user_id, system_prompt=system_prompt)
     has_mobula = market.get("source") == "mobula"
     has_blofin = market.get("source") in {"blofin", "blofin_demo"}
+    has_cg_pro = market.get("source") == "coingecko_pro"
+    citadel_linked = bool(user_id and _citadel_blofin_linked_record(user_id))
 
     scalp_banner = ""
     if scalp_mode:
@@ -3869,6 +4016,7 @@ Weak edge → "NO SCALP — STAY FLAT" and OMIT **TRADE LEVELS**.
         age_sec = max(0.0, time.time() - float(fetched_at))
         source_note = {
             "mobula": "Mobula depth-weighted live feed",
+            "coingecko_pro": "CoinGecko Pro (authenticated, cache-busted)",
             "coingecko": "CoinGecko aggressive pull (cache-busted)",
             "binance_spot": "Binance spot 24h ticker",
             "binance_futures": "Binance futures 24h ticker",
@@ -3882,15 +4030,23 @@ Weak edge → "NO SCALP — STAY FLAT" and OMIT **TRADE LEVELS**.
 
     mode_label = "TRADE SETUP (execution-ready)" if mode == "tradesetup" else "MARKET ANALYSIS"
     mobula_priority = (
-        "MOBULA DATA IS LIVE — liquidity, on-chain vs CEX volume, and pool depth MUST shape bias, "
-        "Liquidity & Sentiment, and your trade card. Lead with on-chain/liquidity read when relevant."
+        "MOBULA DATA IS LIVE — liquidity, on-chain vs CEX volume delta, and pool depth MUST shape bias, "
+        "Liquidity & Sentiment, conviction %, and your trade card. Lead with on-chain/liquidity read."
         if has_mobula
         else (
-            "BLOFIN MARK PRICE IS LIVE — user-linked exchange tick; anchor Entry/TP/SL to this mark for "
-            "execution parity with Oracle Citadel. Cross-check structure + derivatives."
-            if has_blofin
-            else "No Mobula tick — do not fabricate on-chain stats; lean on derivatives + structure."
+            "COINGECKO PRO IS LIVE — fast CEX reference; fuse CEX volume + Binance derivatives for conviction."
+            if has_cg_pro
+            else (
+                "BLOFIN MARK PRICE IS LIVE — Citadel-linked tick; anchor Entry/TP/SL for execution parity."
+                if has_blofin
+                else "No Mobula tick — do not fabricate on-chain stats; lean on CEX volume + derivatives + structure."
+            )
         )
+    )
+    leverage_line = (
+        f"ACTIVE LEVERAGE FOR THIS SETUP: {prompt_leverage:.0f}x"
+        + (" (Oracle Citadel linked — honor configured leverage)" if citadel_linked else " (default)")
+        + f". Size SL distance and R:R realistically for {prompt_leverage:.0f}x — conservative and professional."
     )
     mode_close = (
         "TRADE SETUP MODE: One shot. **TRADE LEVELS** required unless flat — then execution card explains "
@@ -3903,9 +4059,13 @@ Weak edge → "NO SCALP — STAY FLAT" and OMIT **TRADE LEVELS**.
     vision_block = ""
     if vision_confluence_pct is not None:
         vision_block = f"""
-═══ ORACLE VISION PULSE (honor when grading confluence + levels) ═══
+═══ ORACLE VISION PULSE — DATA-BACKED CONFLUENCE (re-score before shipping levels) ═══
 Vision read: {vision_confluence_pct:.0f}% {direction} confluence on {timeframe}.
-Align Entry/SL/TP1/TP2 with this bias unless structure + Daily VWAP clearly veto. Call the veto if you fade it.
+WEIGHTING: Re-grade conviction using Mobula liquidity + on-chain/CEX volume delta + Binance derivatives.
+• Thin liquidity vs volume → haircut conviction 5–15%. Volume delta confirms direction → add 5–10%.
+• Funding/OI/L-S fights Vision bias → call the veto explicitly; do not rubber-stamp the pulse.
+• Trade levels must be sharp at {prompt_leverage:.0f}x: tight invalidation beyond sweep/OB, TP1 ≥ {MIN_RR_TP1:.1f}:1 R:R.
+Align Entry/SL/TP1/TP2 with Vision unless Daily VWAP + structure clearly veto — name the veto.
 """
 
     return f"""Generate a premium, high-conviction On-Chain Oracle AI report — sharp leverage trader on stream.
@@ -3919,10 +4079,12 @@ below previous lows — strong LONG bias here."
 ═══════════════════════════════════════════════════════════
 AUTHORITATIVE LIVE PRICE — RULE 0 (ZERO TOLERANCE)
 ═══════════════════════════════════════════════════════════
+{live_price_banner}
 CURRENT LIVE PRICE: {price_str} (raw: {price_raw} USD)
 24h CHANGE: {change_pct:+.2f}%
 SOURCE: {market.get('source', 'unknown')}
-{freshness_line}MANDATORY:
+{freshness_line}{leverage_line}
+MANDATORY:
 • **Asset** line EXACTLY: {coin.upper()} | {price_str} | {change_pct:+.2f}%
 • Every Entry / TP1 (40%) / TP2 (60%) / SL vs {price_str} NOW — limits must name structure (OB, FVG, Daily VWAP, pool).
 • **TRADE LEVELS** one-liner MUST use: Entry at $X, TP1 (40%) at $X, TP2 (60%) at $X, SL at $X (R:R X.X:1)
@@ -3937,9 +4099,10 @@ Direction: {direction_instruction(direction)}
 24h Volume (aggregate): {volume_text}
 
 ═══ LIVE MARKET DATA — ORDER OF AUTHORITY (synthesize; never list metrics alone) ═══
-{mobula_block}{market_fallback_note}{derivatives_block}
-Cross-check: Mobula liquidity/volume mix ↔ funding/OI/L-S/liqs ↔ Daily VWAP/structure on {timeframe}.
-**Liquidity & Sentiment** opens with liquidity/trap/slippage read when Mobula present, then derivatives story.
+{mobula_block}{coingecko_block}{market_fallback_note}{derivatives_block}
+Cross-check: Mobula liquidity + volume delta ↔ CoinGecko CEX vol ↔ funding/OI/L-S/liqs ↔ Daily VWAP/structure on {timeframe}.
+**Liquidity & Sentiment** opens with liquidity/trap/slippage read (Mobula or CEX volume), then derivatives story.
+Oracle Vision / Desk conviction must be data-backed — no generic % without citing liquidity or positioning.
 
 ═══ ANALYTICAL DEPTH CHECKLIST (Key Drivers — tight stream-trader prose) ═══
 • MTF: Weekly/Daily/4h → {timeframe} → LTF trigger. ALIGNED or CONFLICTED — name HTF veto if present.
@@ -3947,10 +4110,11 @@ Cross-check: Mobula liquidity/volume mix ↔ funding/OI/L-S/liqs ↔ Daily VWAP/
 • Structure: order blocks, FVGs, BOS/CHOCH, inducement, mitigation, displacement, previous highs/lows,
   previous highs/lows, liquidity sweeps, liquidity grabs.
 • Derivatives woven into story — funding flip, OI build, crowded side, liq cascade fuel (never metric dump).
-• BTC/ETH lead for alts when relevant — not "macro tape".
+• BTC/ETH lead for alts when relevant — not macro jargon.
 • Psychology: chase/FOMO/revenge only when price invites the mistake.
 • BANNED words: session VWAP, previous session, tape, regime, fade, macro tape, weighted momentum,
-  Oracle flow, balanced session. USE: Daily VWAP, Previous Day VWAP, liquidity sweep, reclaiming, sweeping.
+  Oracle flow, balanced session, order flow footprint. USE: Daily VWAP, Previous Day VWAP, liquidity sweep,
+  previous highs/lows, reclaiming, sweeping, inducement, mitigation.
 
 {mode_close}
 **If I Were to Trade Today...** = execution card (Trigger | Entry | Invalidation | Time box | Size | Flip | Plan B).
@@ -4458,6 +4622,8 @@ async def _handle_analyze(
             scalp_mode=scalp_mode,
             derivatives=derivatives,
             vision_confluence_pct=request.vision_confluence_pct,
+            user_id=user_id,
+            system_prompt=request.system_prompt,
         )
 
         logger.info(
