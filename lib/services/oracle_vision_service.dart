@@ -34,10 +34,36 @@ abstract final class OracleVisionService {
       history: history,
       timeframe: timeframe,
       watchlistOnly: watchlistOnly,
+      bias: bundle.bias,
+      change24h: bundle.change24h,
     );
     return OracleVisionSnapshot(
       heatZones: heatZones,
       opportunities: opportunities,
+    );
+  }
+
+  /// Macro filter: long conviction cap during strongly bearish Dailies, unless
+  /// the coin shows very strong reversal evidence (deep green against the dump).
+  static const int _kCounterTrendConvictionCap = 45;
+  static const double _kReversalEvidencePct = 3.5;
+
+  /// Higher-timeframe (Daily) trend read from the live bias bundle + majors' 24h tape.
+  static ({bool strongBearish, bool bearish, bool strongBullish}) macroTrend(
+    OracleDeskBias bias,
+    Map<String, double> change24h,
+  ) {
+    final btc = change24h['BTC'] ?? 0;
+    final eth = change24h['ETH'] ?? 0;
+    final majors = btc * 0.6 + eth * 0.4;
+    final bearishKind = bias.kind == OracleDeskBiasKind.bearish;
+    final bullishKind = bias.kind == OracleDeskBiasKind.bullish;
+    return (
+      strongBearish:
+          (bearishKind && (bias.avgMomentum <= -1.0 || majors <= -1.5)) || majors <= -2.5,
+      bearish: bearishKind || majors <= -0.8,
+      strongBullish:
+          (bullishKind && (bias.avgMomentum >= 1.0 || majors >= 1.5)) || majors >= 2.5,
     );
   }
 
@@ -71,6 +97,8 @@ abstract final class OracleVisionService {
       'XRP',
     };
 
+    final macro = macroTrend(bias, change24h);
+
     final zones = <LiquidationHeatZone>[];
     for (final coin in pool) {
       final ch = change24h[coin];
@@ -78,15 +106,36 @@ abstract final class OracleVisionService {
       final abs = ch.abs();
       if (abs < 0.35) continue;
 
-      final kind = ch <= -0.85
+      // Squeeze/liq detection stays — but balanced with the Daily trend: a mild
+      // bounce inside a dump is bear-rally fuel, not a short-squeeze long.
+      var kind = ch <= -0.85
           ? LiquidationZoneKind.longLiqRisk
           : ch >= 0.85
               ? LiquidationZoneKind.shortSqueeze
               : ch < 0
                   ? LiquidationZoneKind.longLiqRisk
                   : LiquidationZoneKind.shortSqueeze;
+      if (macro.strongBearish &&
+          kind == LiquidationZoneKind.shortSqueeze &&
+          ch < _kReversalEvidencePct) {
+        kind = LiquidationZoneKind.longLiqRisk;
+      }
+      if (macro.strongBullish &&
+          kind == LiquidationZoneKind.longLiqRisk &&
+          ch > -_kReversalEvidencePct) {
+        kind = LiquidationZoneKind.shortSqueeze;
+      }
 
-      final conviction = (62 + abs * 5.5 + (bias.confidencePct * 0.08)).round().clamp(65, 96);
+      final direction = kind == LiquidationZoneKind.shortSqueeze
+          ? OraclePulseDirection.long
+          : OraclePulseDirection.short;
+      var conviction = (62 + abs * 5.5 + (bias.confidencePct * 0.08)).round().clamp(65, 96);
+      final counterTrend = (macro.strongBearish && direction.isLong) ||
+          (macro.strongBullish && !direction.isLong);
+      if (counterTrend) {
+        conviction = conviction.clamp(0, _kCounterTrendConvictionCap);
+      }
+
       zones.add(
         LiquidationHeatZone(
           coin: coin,
@@ -95,9 +144,7 @@ abstract final class OracleVisionService {
           change24hPct: ch,
           convictionPct: conviction,
           whyZone: _whyZoneText(coin, ch, kind),
-          direction: kind == LiquidationZoneKind.shortSqueeze
-              ? OraclePulseDirection.long
-              : OraclePulseDirection.short,
+          direction: direction,
         ),
       );
     }
@@ -112,12 +159,16 @@ abstract final class OracleVisionService {
       zones.add(
         LiquidationHeatZone(
           coin: coin,
-          kind: LiquidationZoneKind.shortSqueeze,
+          kind: macro.strongBearish
+              ? LiquidationZoneKind.longLiqRisk
+              : LiquidationZoneKind.shortSqueeze,
           heat: 0.45,
           change24hPct: 0,
-          convictionPct: 68,
-          whyZone: 'Awaiting live liq cluster refresh — $coin on radar.',
-          direction: OraclePulseDirection.long,
+          convictionPct: macro.strongBearish ? 58 : 68,
+          whyZone: macro.strongBearish
+              ? 'Daily bias bearish — $coin on radar for downside liq clusters.'
+              : 'Awaiting live liq cluster refresh — $coin on radar.',
+          direction: macro.strongBearish ? OraclePulseDirection.short : OraclePulseDirection.long,
         ),
       );
     }
@@ -143,9 +194,12 @@ abstract final class OracleVisionService {
     required List<Map<String, dynamic>> history,
     required String timeframe,
     required bool watchlistOnly,
+    required OracleDeskBias bias,
+    required Map<String, double> change24h,
   }) {
     final wl = watchlist.map((c) => c.trim().toUpperCase()).where((c) => c.isNotEmpty).toSet();
     final tfNorm = _normalizeTimeframe(timeframe);
+    final macro = macroTrend(bias, change24h);
 
     double tfBoost(String coin) {
       var boost = 0.0;
@@ -169,11 +223,48 @@ abstract final class OracleVisionService {
       }
     }
 
+    // HTF trend discipline: counter-trend cards get capped conviction + caution
+    // copy instead of high-conviction spam during a one-sided Daily.
+    list = list.map((o) {
+      final ch = change24h[o.coin] ?? 0;
+      if (macro.strongBearish && o.direction.isLong && ch < _kReversalEvidencePct) {
+        return OraclePulseOpportunity(
+          coin: o.coin,
+          direction: o.direction,
+          convictionPct: o.convictionPct.clamp(0, _kCounterTrendConvictionCap),
+          whyNow:
+              'Caution — Daily bias bearish, counter-trend long. Needs a sweep + reclaim of previous lows before sizing.',
+          signalTimeframe: o.signalTimeframe,
+        );
+      }
+      if (macro.strongBullish && !o.direction.isLong && ch > -_kReversalEvidencePct) {
+        return OraclePulseOpportunity(
+          coin: o.coin,
+          direction: o.direction,
+          convictionPct: o.convictionPct.clamp(0, _kCounterTrendConvictionCap),
+          whyNow:
+              'Caution — Daily bias bullish, counter-trend short. Needs a rejection from previous highs before sizing.',
+          signalTimeframe: o.signalTimeframe,
+        );
+      }
+      return o;
+    }).toList();
+
     list.sort((a, b) {
       final scoreA = a.convictionPct + tfBoost(a.coin);
       final scoreB = b.convictionPct + tfBoost(b.coin);
       return scoreB.compareTo(scoreA);
     });
+
+    // Only surface strong setups aligned with the higher timeframe; keep capped
+    // caution cards as filler so the board never goes empty.
+    if (macro.strongBearish || macro.strongBullish) {
+      bool alignedWithTrend(OraclePulseOpportunity o) =>
+          macro.strongBearish ? !o.direction.isLong : o.direction.isLong;
+      final aligned = list.where(alignedWithTrend).toList();
+      final caution = list.where((o) => !alignedWithTrend(o)).toList();
+      list = [...aligned, ...caution.take(aligned.length >= 3 ? 1 : 3 - aligned.length)];
+    }
 
     if (list.length < 4) {
       final seen = list.map((o) => o.coin).toSet();
@@ -181,9 +272,11 @@ abstract final class OracleVisionService {
         if (seen.contains(coin)) continue;
         list.add(OraclePulseOpportunity(
           coin: coin,
-          direction: OraclePulseDirection.long,
-          convictionPct: 66,
-          whyNow: 'Watchlist priority on $tfNorm — run Trade Setup for a fresh Oracle read.',
+          direction: macro.strongBearish ? OraclePulseDirection.short : OraclePulseDirection.long,
+          convictionPct: macro.strongBearish || macro.strongBullish ? 58 : 66,
+          whyNow: macro.strongBearish
+              ? 'Daily bias bearish — favor shorts or stand down. Run Trade Setup for a fresh Oracle read.'
+              : 'Watchlist priority on $tfNorm — run Trade Setup for a fresh Oracle read.',
           signalTimeframe: timeframe,
         ));
         seen.add(coin);

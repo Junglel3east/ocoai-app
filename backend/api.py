@@ -3663,6 +3663,23 @@ RULE 4 — CONVICTION, PSYCHOLOGY & EDGE CASES
 • WEAK / conflicted / no catalyst → NO **TRADE LEVELS**. "Stand down" is a position.
 
 ═══════════════════════════════════════
+RULE 4.5 — ORACLE VISION / PULSE: HIGHER-TIMEFRAME TREND DISCIPLINE
+═══════════════════════════════════════
+Vision-sourced setups answer to the higher timeframe FIRST. No exceptions.
+• ALWAYS check Daily + 4H bias BEFORE assigning high conviction. A lower-TF signal that fights
+  Daily/4H structure is a counter-trend trade — grade it like one.
+• Clear bearish trend (price below Daily VWAP, lower highs/lower lows, heavy selling volume):
+  heavily reduce LONG conviction. Favor shorts — or call "No Trade / Caution" when nothing aligns.
+• MACRO FILTER: When the Daily bias is strongly bearish, LONG conviction is CAPPED at 45% MAX —
+  unless very strong liquidity reversal evidence prints (sweep + reclaim of previous lows,
+  aggressive bid absorption, funding reset/flip). Mirror logic for shorts in strongly bullish Dailies.
+• NEVER stamp high-conviction longs across the board during a market dump. A dump is a short
+  board or a stand-down board — not a discount rack.
+• Short squeeze heat and long liquidation clusters remain valid signals — but they are context,
+  not a trade by themselves. Balance squeeze/liq reads against the Daily + 4H trend before grading.
+• High conviction (70%+) is reserved for setups ALIGNED with the higher-timeframe trend.
+
+═══════════════════════════════════════
 RULE 5 — DISCLAIMER (terminal — exact text)
 ═══════════════════════════════════════
 {DISCLAIMER}
@@ -4143,11 +4160,21 @@ Weak edge → "NO SCALP — STAY FLAT" and OMIT **TRADE LEVELS**.
         vision_block = f"""
 ═══ ORACLE VISION PULSE — DATA-BACKED CONFLUENCE (re-score before shipping levels) ═══
 Vision read: {vision_confluence_pct:.0f}% {direction} confluence on {timeframe}.
+HTF FIRST (mandatory): Establish Daily + 4H bias BEFORE grading this pulse. A {timeframe} signal that
+fights Daily/4H structure is counter-trend — grade it like one, never rubber-stamp it.
+TREND FILTER:
+• Clear bearish HTF (price below Daily VWAP, lower highs/lower lows, heavy sell volume) → heavily
+  reduce LONG conviction; favor the short side or call "No Trade / Caution" outright.
+• MACRO CAP: Daily strongly bearish → LONG conviction capped at 45% MAX unless very strong liquidity
+  reversal evidence (sweep + reclaim of previous lows, aggressive bid absorption, funding reset/flip).
+• A market dump is not a discount rack — do NOT print high-conviction longs across the board.
+• Squeeze heat / long-liq clusters are context, not a trade — weigh them against the HTF trend.
+• 70%+ conviction is reserved for setups aligned with the Daily + 4H trend.
 WEIGHTING: Re-grade conviction using Mobula liquidity + on-chain/CEX volume delta + Binance derivatives.
 • Thin liquidity vs volume → haircut conviction 5–15%. Volume delta confirms direction → add 5–10%.
 • Funding/OI/L-S fights Vision bias → call the veto explicitly; do not rubber-stamp the pulse.
 • Trade levels must be sharp at {prompt_leverage:.0f}x: tight invalidation beyond sweep/OB, TP1 ≥ {MIN_RR_TP1:.1f}:1 R:R.
-Align Entry/SL/TP1/TP2 with Vision unless Daily VWAP + structure clearly veto — name the veto.
+Align Entry/SL/TP1/TP2 with Vision unless Daily VWAP + structure (or the HTF trend filter) veto — name the veto.
 """
 
     return f"""Generate a premium, high-conviction On-Chain Oracle AI report — sharp leverage trader on stream.
