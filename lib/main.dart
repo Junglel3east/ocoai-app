@@ -322,6 +322,409 @@ String buildTradingViewHTML(String symbol, {String? tvSymbol}) {
     ''';
 }
 
+/// ───────────────────────────────────────────────────────────────────────────
+/// TRADE SETUP CHART — focused execution chart (Lightweight Charts).
+/// Shows ONLY: Heikin Ashi candles, Daily VWAP, Prev Day VWAP,
+/// Fib 0.382/0.5/0.618/0.786 from the working swing, Entry, TP1, TP2, SL.
+/// Candle data proxied via backend /klines (Binance geo-block safe).
+/// ───────────────────────────────────────────────────────────────────────────
+
+String _jsNum(double? v) => (v != null && v > 0) ? v.toString() : 'null';
+
+String buildTradeSetupChartHTML(
+  String symbol, {
+  required String timeframe,
+  double? entry,
+  double? tp1,
+  double? tp2,
+  double? sl,
+}) {
+  final sym = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
+  final tf = timeframe.trim();
+  return '''
+<html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
+<style>
+  html, body { margin:0; padding:0; height:100%; width:100%; overflow:hidden; background:#0F0F0F; touch-action:none; }
+  #chart { height:100%; width:100%; }
+  #legend {
+    position:absolute; top:10px; left:12px; z-index:5; pointer-events:none;
+    font-family:-apple-system,'Segoe UI',Roboto,sans-serif;
+  }
+  #legend .sym {
+    color:#EAEAEA; font-size:13px; font-weight:700; letter-spacing:0.4px;
+    text-shadow:0 0 12px rgba(0,191,255,0.55);
+  }
+  #legend .sub { color:#7A8A99; font-size:10px; letter-spacing:0.6px; margin-top:2px; }
+  #live {
+    display:inline-block; width:6px; height:6px; border-radius:50%; background:#00E676;
+    box-shadow:0 0 8px rgba(0,230,118,0.9); margin-right:5px; vertical-align:middle;
+    animation:pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.35;} }
+  #err {
+    position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+    color:#8899AA; font-family:-apple-system,'Segoe UI',Roboto,sans-serif; font-size:13px;
+  }
+</style>
+</head>
+<body>
+<div id="chart"></div>
+<div id="legend">
+  <div class="sym">$sym/USDT &middot; $tf</div>
+  <div class="sub"><span id="live"></span>HEIKIN ASHI &middot; VWAP &middot; FIB &middot; LEVELS</div>
+</div>
+<div id="err">Chart data unavailable — pull back and retry.</div>
+<script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+(function() {
+  var ENTRY = ${_jsNum(entry)};
+  var TP1   = ${_jsNum(tp1)};
+  var TP2   = ${_jsNum(tp2)};
+  var SL    = ${_jsNum(sl)};
+  var KLINES_URL = '$kBackendBaseUrl/klines?coin=$sym&interval=$tf&limit=300';
+
+  var chart = LightweightCharts.createChart(document.getElementById('chart'), {
+    autoSize: true,
+    layout: {
+      background: { type: 'solid', color: '#0F0F0F' },
+      textColor: '#9E9E9E',
+      fontFamily: "-apple-system,'Segoe UI',Roboto,sans-serif"
+    },
+    grid: {
+      vertLines: { color: 'rgba(42,52,65,0.35)' },
+      horzLines: { color: 'rgba(42,52,65,0.35)' }
+    },
+    rightPriceScale: { borderColor: '#1F2733', scaleMargins: { top: 0.12, bottom: 0.08 } },
+    timeScale: { borderColor: '#1F2733', timeVisible: true, secondsVisible: false, rightOffset: 6 },
+    crosshair: {
+      mode: LightweightCharts.CrosshairMode.Normal,
+      vertLine: { color: 'rgba(0,191,255,0.45)', labelBackgroundColor: '#00BFFF' },
+      horzLine: { color: 'rgba(0,191,255,0.45)', labelBackgroundColor: '#00BFFF' }
+    },
+    handleScroll: true,
+    handleScale: true
+  });
+
+  function precisionFor(p) {
+    if (p >= 1000) return 2;
+    if (p >= 1) return p >= 100 ? 2 : 4;
+    if (p >= 0.01) return 6;
+    return 8;
+  }
+
+  function toHeikinAshi(rows) {
+    var out = [];
+    var prevO = null, prevC = null;
+    for (var i = 0; i < rows.length; i++) {
+      var t = rows[i][0], o = rows[i][1], h = rows[i][2], l = rows[i][3], c = rows[i][4];
+      var haC = (o + h + l + c) / 4;
+      var haO = (prevO === null) ? (o + c) / 2 : (prevO + prevC) / 2;
+      out.push({
+        time: t,
+        open: haO,
+        high: Math.max(h, haO, haC),
+        low: Math.min(l, haO, haC),
+        close: haC
+      });
+      prevO = haO; prevC = haC;
+    }
+    return out;
+  }
+
+  // Daily-anchored VWAP line (resets each UTC day) + previous day final VWAP.
+  function dailyVwap(rows) {
+    var line = [], pv = 0, vol = 0, day = null, prevFinal = null, lastVwap = null;
+    for (var i = 0; i < rows.length; i++) {
+      var t = rows[i][0], h = rows[i][2], l = rows[i][3], c = rows[i][4], v = rows[i][5];
+      var d = Math.floor(t / 86400);
+      if (day !== null && d !== day) { prevFinal = lastVwap; pv = 0; vol = 0; }
+      day = d;
+      pv += ((h + l + c) / 3) * v;
+      vol += v;
+      lastVwap = vol > 0 ? pv / vol : c;
+      line.push({ time: t, value: lastVwap });
+    }
+    return { line: line, prevFinal: prevFinal, current: lastVwap };
+  }
+
+  // Fib retracement from the working swing (last 120 bars).
+  function fibLevels(rows) {
+    var look = rows.slice(-120);
+    if (!look.length) return [];
+    var hi = -Infinity, lo = Infinity, hiIdx = 0, loIdx = 0;
+    for (var i = 0; i < look.length; i++) {
+      if (look[i][2] > hi) { hi = look[i][2]; hiIdx = i; }
+      if (look[i][3] < lo) { lo = look[i][3]; loIdx = i; }
+    }
+    var range = hi - lo;
+    if (range <= 0) return [];
+    var up = hiIdx > loIdx; // swing low → high = retracement measured down from high
+    return [0.382, 0.5, 0.618, 0.786].map(function(r) {
+      return { ratio: r, price: up ? hi - range * r : lo + range * r };
+    });
+  }
+
+  function priceLine(series, price, color, title, style, width) {
+    if (price === null || !isFinite(price) || price <= 0) return;
+    series.createPriceLine({
+      price: price,
+      color: color,
+      lineWidth: width || 1,
+      lineStyle: style,
+      axisLabelVisible: true,
+      title: title
+    });
+  }
+
+  fetch(KLINES_URL)
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var rows = data && data.klines;
+      if (!rows || !rows.length) throw new Error('empty');
+      var last = rows[rows.length - 1][4];
+      var prec = precisionFor(last);
+      var minMove = Math.pow(10, -prec);
+
+      var candles = chart.addCandlestickSeries({
+        upColor: '#26A69A', downColor: '#EF5350',
+        borderUpColor: '#26A69A', borderDownColor: '#EF5350',
+        wickUpColor: '#26A69A', wickDownColor: '#EF5350',
+        priceFormat: { type: 'price', precision: prec, minMove: minMove }
+      });
+      candles.setData(toHeikinAshi(rows));
+
+      var vwap = dailyVwap(rows);
+      var vwapSeries = chart.addLineSeries({
+        color: '#C792EA', lineWidth: 2,
+        title: 'Daily VWAP', lastValueVisible: true, priceLineVisible: false,
+        crosshairMarkerVisible: false,
+        priceFormat: { type: 'price', precision: prec, minMove: minMove }
+      });
+      vwapSeries.setData(vwap.line);
+      var Solid = LightweightCharts.LineStyle.Solid;
+      var Dashed = LightweightCharts.LineStyle.Dashed;
+      var Dotted = LightweightCharts.LineStyle.Dotted;
+
+      priceLine(candles, vwap.prevFinal, '#7E57C2', 'Prev Day VWAP', Dashed, 1);
+
+      var fibs = fibLevels(rows);
+      for (var i = 0; i < fibs.length; i++) {
+        priceLine(candles, fibs[i].price, 'rgba(255,179,0,0.85)', 'Fib ' + fibs[i].ratio, Dotted, 1);
+      }
+
+      priceLine(candles, ENTRY, '#00BFFF', 'ENTRY', Solid, 2);
+      priceLine(candles, TP1, '#00E676', 'TP1 (40%)', Dashed, 2);
+      priceLine(candles, TP2, '#00C853', 'TP2 (60%)', Dashed, 2);
+      priceLine(candles, SL, '#FF5252', 'SL', Solid, 2);
+
+      chart.timeScale().fitContent();
+
+      // Light live refresh — updates candles + VWAP only (lines are static levels).
+      setInterval(function() {
+        fetch(KLINES_URL)
+          .then(function(r) { return r.json(); })
+          .then(function(d2) {
+            var r2 = d2 && d2.klines;
+            if (!r2 || !r2.length) return;
+            candles.setData(toHeikinAshi(r2));
+            vwapSeries.setData(dailyVwap(r2).line);
+          })
+          .catch(function() {});
+      }, 30000);
+    })
+    .catch(function() {
+      document.getElementById('err').style.display = 'flex';
+    });
+})();
+</script>
+</body></html>
+''';
+}
+
+WebViewController createTradeSetupChartController(
+  String symbol, {
+  required String timeframe,
+  double? entry,
+  double? tp1,
+  double? tp2,
+  double? sl,
+}) {
+  late final PlatformWebViewControllerCreationParams params;
+  if (WebViewPlatform.instance is WebKitWebViewPlatform) {
+    params = WebKitWebViewControllerCreationParams(
+      allowsInlineMediaPlayback: true,
+      mediaTypesRequiringUserAction: const <PlaybackMediaTypes>{},
+    );
+  } else {
+    params = const PlatformWebViewControllerCreationParams();
+  }
+
+  final controller = WebViewController.fromPlatformCreationParams(params)
+    ..setJavaScriptMode(JavaScriptMode.unrestricted)
+    ..setBackgroundColor(const Color(0xFF0F0F0F));
+
+  if (controller.platform is AndroidWebViewController) {
+    final android = controller.platform as AndroidWebViewController;
+    android.setMediaPlaybackRequiresUserGesture(true);
+    android.setMixedContentMode(MixedContentMode.compatibilityMode);
+  }
+
+  controller.loadHtmlString(buildTradeSetupChartHTML(
+    symbol,
+    timeframe: timeframe,
+    entry: entry,
+    tp1: tp1,
+    tp2: tp2,
+    sl: sl,
+  ));
+  return controller;
+}
+
+/// Trade Setup chart panel — glowing frame + expand to fullscreen (same focused chart).
+class TradeSetupChartPanel extends StatelessWidget {
+  final String symbol;
+  final String timeframe;
+  final WebViewController controller;
+  final double height;
+  final double? entry;
+  final double? tp1;
+  final double? tp2;
+  final double? sl;
+
+  const TradeSetupChartPanel({
+    super.key,
+    required this.symbol,
+    required this.timeframe,
+    required this.controller,
+    this.height = 420,
+    this.entry,
+    this.tp1,
+    this.tp2,
+    this.sl,
+  });
+
+  void _openFullScreen(BuildContext context) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        fullscreenDialog: true,
+        builder: (_) => TradeSetupFullScreenChart(
+          symbol: symbol,
+          timeframe: timeframe,
+          entry: entry,
+          tp1: tp1,
+          tp2: tp2,
+          sl: sl,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: height,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.22)),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xFF00BFFF).withValues(alpha: 0.10),
+            blurRadius: 18,
+            spreadRadius: 1,
+          ),
+        ],
+      ),
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(9),
+              child: RepaintBoundary(
+                child: WebViewWidget(
+                  controller: controller,
+                  gestureRecognizers: kTradingViewGestureRecognizers,
+                ),
+              ),
+            ),
+          ),
+          Positioned(
+            top: 6,
+            right: 6,
+            child: _FullScreenChartButton(onPressed: () => _openFullScreen(context)),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Full-screen Trade Setup chart — same focused rendering, maximum viewport.
+class TradeSetupFullScreenChart extends StatefulWidget {
+  final String symbol;
+  final String timeframe;
+  final double? entry;
+  final double? tp1;
+  final double? tp2;
+  final double? sl;
+
+  const TradeSetupFullScreenChart({
+    super.key,
+    required this.symbol,
+    required this.timeframe,
+    this.entry,
+    this.tp1,
+    this.tp2,
+    this.sl,
+  });
+
+  @override
+  State<TradeSetupFullScreenChart> createState() => _TradeSetupFullScreenChartState();
+}
+
+class _TradeSetupFullScreenChartState extends State<TradeSetupFullScreenChart> {
+  late final WebViewController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = createTradeSetupChartController(
+      widget.symbol,
+      timeframe: widget.timeframe,
+      entry: widget.entry,
+      tp1: widget.tp1,
+      tp2: widget.tp2,
+      sl: widget.sl,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sym = widget.symbol.trim().toUpperCase();
+    return Scaffold(
+      backgroundColor: const Color(0xFF0F0F0F),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF1A1A1A),
+        title: Text('$sym/USDT · ${widget.timeframe}'),
+        automaticallyImplyLeading: false,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.close),
+            tooltip: 'Close',
+            onPressed: () => Navigator.of(context).pop(),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: WebViewWidget(
+          controller: _controller,
+          gestureRecognizers: kTradingViewGestureRecognizers,
+        ),
+      ),
+    );
+  }
+}
+
 /// Embedded chart with expand-to-fullscreen control (Analysis, Trade Setup, etc.).
 class TradingViewChartPanel extends StatefulWidget {
   final String symbol;
@@ -9363,7 +9766,15 @@ class _TradeSetupResultScreenState extends State<TradeSetupResultScreen> {
   }
 
   void _ensureChartController() {
-    _chartController ??= createTradingViewController(resolvedCoin);
+    // Focused execution chart: HA candles + Daily/Prev VWAP + 4 fibs + Entry/TP1/TP2/SL only.
+    _chartController ??= createTradeSetupChartController(
+      resolvedCoin,
+      timeframe: widget.timeframe,
+      entry: _entry,
+      tp1: _tp1,
+      tp2: _tp2,
+      sl: _sl,
+    );
   }
 
   Future<void> _fetchTradeSetup() async {
@@ -9392,12 +9803,13 @@ class _TradeSetupResultScreenState extends State<TradeSetupResultScreen> {
       );
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
+        report = data['report'] ?? "No report";
+        // Parse Entry/TP1/TP2/SL BEFORE building the chart so the levels render on it.
+        _saveTradeSetupIfNeeded();
         setState(() {
-          report = data['report'] ?? "No report";
           loading = false;
           _ensureChartController();
         });
-        _saveTradeSetupIfNeeded();
       } else {
         debugPrint('[TradeSetup] HTTP ${response.statusCode}: ${response.body}');
         setState(() {
@@ -9477,9 +9889,14 @@ class _TradeSetupResultScreenState extends State<TradeSetupResultScreen> {
               child: Column(
                 children: [
                   if (_chartController != null)
-                    TradingViewChartPanel(
+                    TradeSetupChartPanel(
                       symbol: resolvedCoin,
+                      timeframe: widget.timeframe,
                       controller: _chartController!,
+                      entry: _entry,
+                      tp1: _tp1,
+                      tp2: _tp2,
+                      sl: _sl,
                     ),
                   const SizedBox(height: _AppSpacing.section),
                   Text(report, style: const TextStyle(fontSize: 16, height: 1.65)),

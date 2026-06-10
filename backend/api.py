@@ -43,6 +43,7 @@ import os
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import re
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -4716,6 +4717,81 @@ async def list_coins(limit: int = 150) -> dict[str, Any]:
     refresh_coingecko_symbol_index()
     symbols = list(_SYMBOL_TO_COINGECKO_ID.keys())[: max(1, min(limit, 250))]
     return {"success": True, "coins": symbols, "count": len(symbols)}
+
+
+# ---------------------------------------------------------------------------
+# Klines proxy — Trade Setup chart (Lightweight Charts in Flutter WebView)
+# Binance is geo-blocked client-side in some regions; the server proxies OHLCV.
+# ---------------------------------------------------------------------------
+
+_KLINES_VALID_INTERVALS = {
+    "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w",
+}
+_KLINES_INTERVAL_ALIASES = {"10m": "15m", "20m": "30m", "1D": "1d", "60": "1h", "240": "4h"}
+_KLINES_CACHE: dict[str, tuple[float, list[list[float]]]] = {}
+_KLINES_CACHE_TTL = 30.0
+_KLINES_CACHE_LOCK = threading.Lock()
+
+
+def fetch_binance_klines(symbol: str, interval: str, limit: int) -> Optional[list[list[float]]]:
+    """OHLCV from Binance spot, futures fallback. Rows: [openTimeSec, o, h, l, c, vol]."""
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    for url in (
+        "https://api.binance.com/api/v3/klines",
+        "https://fapi.binance.com/fapi/v1/klines",
+    ):
+        try:
+            response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if response.status_code != 200:
+                continue
+            raw = response.json()
+            if not isinstance(raw, list) or not raw:
+                continue
+            return [
+                [
+                    float(row[0]) / 1000.0,
+                    float(row[1]),
+                    float(row[2]),
+                    float(row[3]),
+                    float(row[4]),
+                    float(row[5]),
+                ]
+                for row in raw
+            ]
+        except Exception as exc:
+            logger.debug("klines_miss url=%s symbol=%s err=%s", url, symbol, exc)
+    return None
+
+
+@app.get("/klines")
+async def get_klines(coin: str, interval: str = "1h", limit: int = 300) -> dict[str, Any]:
+    """OHLCV candles for the Trade Setup chart. Cached 30s per coin+interval."""
+    upper = (coin or "").strip().upper()
+    if not upper:
+        raise HTTPException(status_code=400, detail="coin is required.")
+    iv = _KLINES_INTERVAL_ALIASES.get(interval.strip(), interval.strip().lower())
+    iv = _KLINES_INTERVAL_ALIASES.get(iv, iv)
+    if iv not in _KLINES_VALID_INTERVALS:
+        iv = "1h"
+    n = max(50, min(int(limit), 500))
+    cache_key = f"{upper}:{iv}:{n}"
+
+    with _KLINES_CACHE_LOCK:
+        cached = _KLINES_CACHE.get(cache_key)
+        if cached and (time.time() - cached[0]) < _KLINES_CACHE_TTL:
+            return {"success": True, "coin": upper, "interval": iv, "klines": cached[1], "cached": True}
+
+    rows = await asyncio.to_thread(fetch_binance_klines, binance_usdt_symbol(upper), iv, n)
+    if not rows:
+        raise HTTPException(status_code=502, detail=f"Unable to fetch klines for {upper}.")
+
+    with _KLINES_CACHE_LOCK:
+        _KLINES_CACHE[cache_key] = (time.time(), rows)
+        if len(_KLINES_CACHE) > 200:
+            oldest = min(_KLINES_CACHE.items(), key=lambda kv: kv[1][0])[0]
+            _KLINES_CACHE.pop(oldest, None)
+
+    return {"success": True, "coin": upper, "interval": iv, "klines": rows, "cached": False}
 
 
 async def _handle_analyze(
