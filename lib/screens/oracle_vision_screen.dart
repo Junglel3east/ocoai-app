@@ -1,4 +1,7 @@
 // Oracle Vision — main analysis hub (replaces Analyze tab).
+//
+// 2026 redesign: hero with pulsing title + live BTC price + macro bias orb,
+// prominent #1/#2 hot zones, premium conviction-bar opportunity cards.
 
 part of '../main.dart';
 
@@ -64,7 +67,11 @@ abstract final class _OracleVisionLiveCopy {
       _ => 1,
     };
     final flow = (_seed('${opp.coin}${opp.direction.name}$timeframe') % 3);
-    return (opp.convictionPct + boost + flow).clamp(67, 96);
+    // Trend-discipline: capped caution cards (≤45%) keep their cap on display.
+    if (opp.convictionPct <= 45) {
+      return (opp.convictionPct + flow - 1).clamp(30, 45);
+    }
+    return (opp.convictionPct + boost + flow).clamp(50, 96);
   }
 
   static String opportunityWhy(OraclePulseOpportunity opp, String timeframe) {
@@ -88,6 +95,19 @@ abstract final class _OracleVisionLiveCopy {
   }
 }
 
+String _visionUsd(double value) {
+  if (value >= 1000) {
+    final digits = value.round().toString();
+    final withCommas = digits.replaceAllMapped(
+      RegExp(r'(\d)(?=(\d{3})+$)'),
+      (m) => '${m[1]},',
+    );
+    return '\$$withCommas';
+  }
+  if (value >= 1) return '\$${value.toStringAsFixed(2)}';
+  return '\$${value.toStringAsFixed(4)}';
+}
+
 class OracleVisionScreen extends StatefulWidget {
   final List<String> watchlist;
   final List<Map<String, dynamic>> trades;
@@ -109,6 +129,7 @@ class OracleVisionScreen extends StatefulWidget {
 class _OracleVisionScreenState extends State<OracleVisionScreen> with TickerProviderStateMixin {
   List<LiquidationHeatZone> _heatZones = const [];
   List<OraclePulseOpportunity> _opportunities = const [];
+  OracleDeskBias _bias = OracleDeskBias.loading;
   bool _loading = true;
   String? _error;
 
@@ -116,17 +137,34 @@ class _OracleVisionScreenState extends State<OracleVisionScreen> with TickerProv
   bool _watchlistOnly = false;
   late final AnimationController _heatmapPulse;
 
+  /// Live BTC hero price — 7s poll through the shared Mobula → CoinGecko Pro cache.
+  double? _btcPrice;
+  double? _btcChange24h;
+  Timer? _btcPollTimer;
+
   @override
   void initState() {
     super.initState();
     _heatmapPulse = AnimationController(vsync: this, duration: const Duration(milliseconds: 2800))..repeat(reverse: true);
     _loadVision();
+    _pollBtcPrice();
+    _btcPollTimer = Timer.periodic(const Duration(seconds: 7), (_) => _pollBtcPrice());
   }
 
   @override
   void dispose() {
+    _btcPollTimer?.cancel();
     _heatmapPulse.dispose();
     super.dispose();
+  }
+
+  Future<void> _pollBtcPrice() async {
+    final quote = await _HomeLivePriceCache.fetch('BTC');
+    if (!mounted || quote == null) return;
+    setState(() {
+      _btcPrice = quote.price;
+      _btcChange24h = quote.change24hPct ?? _btcChange24h;
+    });
   }
 
   Future<void> _loadVision() async {
@@ -146,6 +184,8 @@ class _OracleVisionScreenState extends State<OracleVisionScreen> with TickerProv
       setState(() {
         _heatZones = snap.heatZones;
         _opportunities = snap.opportunities;
+        _bias = snap.bias;
+        _btcChange24h ??= snap.change24h['BTC'];
         _loading = false;
       });
     } catch (_) {
@@ -176,8 +216,9 @@ class _OracleVisionScreenState extends State<OracleVisionScreen> with TickerProv
     required int convictionPct,
   }) async {
     await SubscriptionPlanStore.load();
+    if (!mounted) return;
     if (!SubscriptionPlanStore.canGenerateTradeSetup(widget.trades)) {
-      if (mounted) showTradeSetupLimitPrompt(context);
+      showTradeSetupLimitPrompt(context);
       return;
     }
     final resolved = await resolveCoinForCurrentPlan(context, coin);
@@ -233,16 +274,24 @@ class _OracleVisionScreenState extends State<OracleVisionScreen> with TickerProv
               crossAxisAlignment: CrossAxisAlignment.stretch,
               mainAxisSize: MainAxisSize.min,
               children: [
-                _visionHeader(
-                  accent,
-                  priceCoin: _heatZones.isNotEmpty
-                      ? _heatZones.first.coin
-                      : (_opportunities.isNotEmpty ? _opportunities.first.coin : 'BTC'),
-                ),
+                _visionHero(accent),
                 const SizedBox(height: _AppSpacing.section),
                 _liquidationHeatmapSection(),
                 const SizedBox(height: _AppSpacing.section),
                 _opportunitiesHeader(),
+                const SizedBox(height: 14),
+                _VisionFiltersBar(
+                  timeframe: _timeframe,
+                  watchlistOnly: _watchlistOnly,
+                  onTimeframeChanged: (tf) {
+                    setState(() => _timeframe = tf);
+                    _loadVision();
+                  },
+                  onWatchlistOnlyChanged: (v) {
+                    setState(() => _watchlistOnly = v);
+                    _loadVision();
+                  },
+                ),
                 const SizedBox(height: 14),
                 if (_loading)
                   const Padding(
@@ -271,19 +320,6 @@ class _OracleVisionScreenState extends State<OracleVisionScreen> with TickerProv
                   const SizedBox(height: 12),
                   Text(_error!, style: const TextStyle(fontSize: 12, color: Color(0xFFFFB74D))),
                 ],
-                const SizedBox(height: _AppSpacing.section),
-                _VisionFiltersBar(
-                  timeframe: _timeframe,
-                  watchlistOnly: _watchlistOnly,
-                  onTimeframeChanged: (tf) {
-                    setState(() => _timeframe = tf);
-                    _loadVision();
-                  },
-                  onWatchlistOnlyChanged: (v) {
-                    setState(() => _watchlistOnly = v);
-                    _loadVision();
-                  },
-                ),
               ],
             ),
           ),
@@ -292,7 +328,9 @@ class _OracleVisionScreenState extends State<OracleVisionScreen> with TickerProv
     );
   }
 
-  Widget _visionHeader(Color accent, {required String priceCoin}) {
+  // ─── Hero: pulsing title + live BTC price + macro bias orb ─────────────────
+
+  Widget _visionHero(Color accent) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -313,27 +351,164 @@ class _OracleVisionScreenState extends State<OracleVisionScreen> with TickerProv
               ),
             ),
             const Spacer(),
-            Icon(Icons.visibility_outlined, color: accent.withValues(alpha: 0.75), size: 24),
+            _VisionLiveDot(color: accent),
+            const SizedBox(width: 6),
+            Text(
+              'LIVE',
+              style: TextStyle(fontSize: 10, fontWeight: FontWeight.w900, letterSpacing: 1.2, color: accent),
+            ),
           ],
         ),
         const SizedBox(height: 10),
-        ShaderMask(
-          shaderCallback: (bounds) => LinearGradient(
-            colors: [Colors.white, accent.withValues(alpha: 0.9)],
-          ).createShader(bounds),
-          child: const Text(
-            'Oracle Vision',
-            style: TextStyle(fontSize: 32, fontWeight: FontWeight.w800, letterSpacing: -0.9, color: Colors.white),
-          ),
+        AnimatedBuilder(
+          animation: _heatmapPulse,
+          builder: (context, _) {
+            final t = _heatmapPulse.value;
+            return ShaderMask(
+              shaderCallback: (bounds) => LinearGradient(
+                colors: [Colors.white, accent.withValues(alpha: 0.75 + t * 0.25)],
+              ).createShader(bounds),
+              child: Text(
+                'Oracle Vision',
+                style: TextStyle(
+                  fontSize: 34,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: -0.9,
+                  color: Colors.white,
+                  shadows: [
+                    Shadow(color: accent.withValues(alpha: 0.25 + t * 0.3), blurRadius: 14 + t * 10),
+                  ],
+                ),
+              ),
+            );
+          },
         ),
-        const SizedBox(height: 6),
+        const SizedBox(height: 4),
         Text(
           'Live macro read · high-conviction setups',
           style: TextStyle(fontSize: 14, color: Colors.grey[500], height: 1.35),
         ),
-        OracleLivePriceStrip(coin: priceCoin),
+        const SizedBox(height: 14),
+        AnimatedBuilder(
+          animation: _heatmapPulse,
+          builder: (context, _) {
+            final t = _heatmapPulse.value;
+            final biasColor = _biasColor(_bias.kind);
+            return Container(
+              padding: const EdgeInsets.fromLTRB(18, 16, 16, 16),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(22),
+                gradient: const LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [Color(0xFF161B26), Color(0xFF0B0C12), Color(0xFF08080A)],
+                ),
+                border: Border.all(color: accent.withValues(alpha: 0.22)),
+                boxShadow: [
+                  BoxShadow(color: accent.withValues(alpha: 0.07 + t * 0.07), blurRadius: 26),
+                  BoxShadow(color: biasColor.withValues(alpha: 0.05 + t * 0.05), blurRadius: 20),
+                ],
+              ),
+              child: Row(
+                children: [
+                  Expanded(child: _btcHeroBlock(accent)),
+                  const SizedBox(width: 12),
+                  _MacroBiasOrb(bias: _bias, pulse: t),
+                ],
+              ),
+            );
+          },
+        ),
       ],
     );
+  }
+
+  Widget _btcHeroBlock(Color accent) {
+    final change = _btcChange24h;
+    final up = (change ?? 0) >= 0;
+    final changeColor = up ? const Color(0xFF00E676) : const Color(0xFFFF5252);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Container(
+              width: 22,
+              height: 22,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: const RadialGradient(
+                  colors: [Color(0xFFF7931A), Color(0x33F7931A)],
+                ),
+                border: Border.all(color: const Color(0xFFF7931A).withValues(alpha: 0.6)),
+              ),
+              child: const Center(
+                child: Text('₿', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w900, color: Colors.white)),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              'BITCOIN · LIVE',
+              style: TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 1.3,
+                color: Colors.grey[500],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        FittedBox(
+          fit: BoxFit.scaleDown,
+          alignment: Alignment.centerLeft,
+          child: Text(
+            _btcPrice != null ? _visionUsd(_btcPrice!) : '— — —',
+            style: const TextStyle(
+              fontSize: 32,
+              fontWeight: FontWeight.w800,
+              letterSpacing: -1.0,
+              color: Colors.white,
+              height: 1.05,
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        if (change != null)
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(20),
+              color: changeColor.withValues(alpha: 0.12),
+              border: Border.all(color: changeColor.withValues(alpha: 0.45)),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(up ? Icons.north_east : Icons.south_east, size: 13, color: changeColor),
+                const SizedBox(width: 4),
+                Text(
+                  '${up ? '+' : ''}${change.toStringAsFixed(2)}% · 24h',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w800, color: changeColor),
+                ),
+              ],
+            ),
+          )
+        else
+          Text('Syncing live feed…', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+      ],
+    );
+  }
+
+  static Color _biasColor(OracleDeskBiasKind kind) {
+    switch (kind) {
+      case OracleDeskBiasKind.bullish:
+        return const Color(0xFF00E676);
+      case OracleDeskBiasKind.bearish:
+        return const Color(0xFFFF5252);
+      case OracleDeskBiasKind.neutral:
+        return const Color(0xFF00D4FF);
+    }
   }
 
   Widget _opportunitiesHeader() {
@@ -349,6 +524,66 @@ class _OracleVisionScreenState extends State<OracleVisionScreen> with TickerProv
           ),
         ),
         Icon(Icons.bolt, color: cyan.withValues(alpha: 0.7), size: 22),
+      ],
+    );
+  }
+}
+
+/// Macro bias orb — Bullish / Bearish / Neutral with confidence %.
+class _MacroBiasOrb extends StatelessWidget {
+  final OracleDeskBias bias;
+  final double pulse;
+
+  const _MacroBiasOrb({required this.bias, required this.pulse});
+
+  @override
+  Widget build(BuildContext context) {
+    final color = _OracleVisionScreenState._biasColor(bias.kind);
+    final label = switch (bias.kind) {
+      OracleDeskBiasKind.bullish => 'Bullish',
+      OracleDeskBiasKind.bearish => 'Bearish',
+      OracleDeskBiasKind.neutral => 'Neutral',
+    };
+    final icon = switch (bias.kind) {
+      OracleDeskBiasKind.bullish => Icons.trending_up_rounded,
+      OracleDeskBiasKind.bearish => Icons.trending_down_rounded,
+      OracleDeskBiasKind.neutral => Icons.trending_flat_rounded,
+    };
+    final calibrating = bias.confidencePct <= 0;
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 68,
+          height: 68,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            gradient: RadialGradient(
+              colors: [
+                color.withValues(alpha: 0.5 + pulse * 0.15),
+                color.withValues(alpha: 0.1),
+                Colors.transparent,
+              ],
+              stops: const [0.0, 0.65, 1.0],
+            ),
+            border: Border.all(color: color.withValues(alpha: 0.55 + pulse * 0.25), width: 1.4),
+            boxShadow: [
+              BoxShadow(color: color.withValues(alpha: 0.25 + pulse * 0.25), blurRadius: 18 + pulse * 10),
+            ],
+          ),
+          child: Icon(icon, size: 30, color: Colors.white.withValues(alpha: 0.95)),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          label.toUpperCase(),
+          style: TextStyle(fontSize: 11, fontWeight: FontWeight.w900, letterSpacing: 1.0, color: color),
+        ),
+        const SizedBox(height: 2),
+        Text(
+          calibrating ? 'syncing…' : '${bias.confidencePct}% conf',
+          style: TextStyle(fontSize: 10, fontWeight: FontWeight.w700, color: Colors.grey[500]),
+        ),
       ],
     );
   }
@@ -413,23 +648,25 @@ class _LiquidationHeatmapPanel extends StatelessWidget {
                   Row(
                     children: [
                       _VisionLiveDot(color: const Color(0xFFFF6E40)),
-                      const SizedBox(width: 6),
+                      const SizedBox(width: 8),
                       Expanded(
                         child: Text(
-                          'Liquidation Heatmap — Hot Zones Right Now',
+                          'Hot Zones Right Now',
                           style: TextStyle(
-                            fontSize: 14,
+                            fontSize: 16,
                             fontWeight: FontWeight.w800,
-                            letterSpacing: -0.2,
+                            letterSpacing: -0.3,
                             color: Colors.grey[100],
                           ),
                         ),
                       ),
+                      Icon(Icons.local_fire_department_rounded,
+                          color: const Color(0xFFFF6E40).withValues(alpha: 0.8), size: 20),
                     ],
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    'Pinned liq clusters · $timeframe structure',
+                    'Liquidation heatmap · pinned liq clusters · $timeframe structure',
                     style: TextStyle(fontSize: 11, color: Colors.grey[600], height: 1.25),
                   ),
                   const SizedBox(height: 8),
@@ -469,14 +706,14 @@ class _LiquidationHeatmapPanel extends StatelessWidget {
                         );
                       },
                     ),
-                    const SizedBox(height: 8),
+                    const SizedBox(height: 10),
                     SizedBox(
-                      height: 112,
+                      height: 148,
                       child: ListView.separated(
                         scrollDirection: Axis.horizontal,
                         physics: const BouncingScrollPhysics(),
                         itemCount: display.length,
-                        separatorBuilder: (_, __) => const SizedBox(width: 8),
+                        separatorBuilder: (_, __) => const SizedBox(width: 10),
                         itemBuilder: (context, i) {
                           final z = display[i];
                           return _HeatZoneDetailCard(
@@ -670,90 +907,135 @@ class _HeatZoneDetailCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final color = zone.kind == LiquidationZoneKind.longLiqRisk
-        ? const Color(0xFFFF5252)
-        : const Color(0xFF00E676);
+    final isLongLiq = zone.kind == LiquidationZoneKind.longLiqRisk;
+    final color = isLongLiq ? const Color(0xFFFF5252) : const Color(0xFF00E676);
     final isLong = zone.direction.isLong;
     final conviction = _OracleVisionLiveCopy.heatConviction(zone, timeframe);
     final why = _OracleVisionLiveCopy.heatWhyZone(zone, timeframe);
+    final hot = rank <= 2; // #1 and #2 zones get the prominent treatment
 
     return SizedBox(
-      width: 220,
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(14),
-        child: Stack(
-          children: [
-            Positioned.fill(
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [color.withValues(alpha: 0.14), const Color(0xFF12141C)],
-                  ),
-                ),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Text('#$rank', style: TextStyle(fontSize: 10, fontWeight: FontWeight.w800, color: color)),
-                      const SizedBox(width: 6),
-                      Text(zone.coin, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w800)),
-                      const Spacer(),
-                      Text(
-                        '$conviction%',
-                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.w900, color: color),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 3),
-                  Text(
-                    'Why This Zone',
-                    style: TextStyle(fontSize: 9, fontWeight: FontWeight.w700, letterSpacing: 1, color: Colors.grey[600]),
-                  ),
-                  const SizedBox(height: 2),
-                  Expanded(
-                    child: Text(
-                      why,
-                      maxLines: 3,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 10, height: 1.3, color: Colors.grey[400]),
-                    ),
-                  ),
-                  SizedBox(
-                    height: 30,
-                    width: double.infinity,
-                    child: FilledButton(
-                      onPressed: onGenerate,
-                      style: FilledButton.styleFrom(
-                        backgroundColor: const Color(0xFF00BFFF),
-                        foregroundColor: Colors.black,
-                        padding: EdgeInsets.zero,
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                      ),
-                      child: Text(
-                        isLong ? 'Long Setup' : 'Short Setup',
-                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w800),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            Positioned.fill(
-              child: IgnorePointer(
+      width: hot ? 268 : 212,
+      child: Container(
+        decoration: hot
+            ? BoxDecoration(
+                borderRadius: BorderRadius.circular(14),
+                boxShadow: [BoxShadow(color: color.withValues(alpha: 0.22), blurRadius: 16)],
+              )
+            : null,
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(14),
+          child: Stack(
+            children: [
+              Positioned.fill(
                 child: DecoratedBox(
                   decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(color: color.withValues(alpha: 0.28)),
+                    gradient: LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [
+                        color.withValues(alpha: hot ? 0.22 : 0.14),
+                        const Color(0xFF12141C),
+                      ],
+                    ),
                   ),
                 ),
               ),
-            ),
-          ],
+              Padding(
+                padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(6),
+                            color: color.withValues(alpha: hot ? 0.25 : 0.12),
+                            border: Border.all(color: color.withValues(alpha: 0.5)),
+                          ),
+                          child: Text(
+                            hot ? '#$rank HOT' : '#$rank',
+                            style: TextStyle(fontSize: 9, fontWeight: FontWeight.w900, color: color),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(zone.coin,
+                            style: TextStyle(fontSize: hot ? 16 : 14, fontWeight: FontWeight.w800)),
+                        const Spacer(),
+                        Text(
+                          '$conviction%',
+                          style: TextStyle(fontSize: hot ? 14 : 12, fontWeight: FontWeight.w900, color: color),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 3),
+                    Row(
+                      children: [
+                        Text(
+                          'WHY THIS ZONE',
+                          style: TextStyle(
+                              fontSize: 8.5, fontWeight: FontWeight.w800, letterSpacing: 1, color: Colors.grey[600]),
+                        ),
+                        const SizedBox(width: 5),
+                        Text(
+                          isLongLiq ? '· LONG LIQ RISK' : '· SHORT SQUEEZE',
+                          style: TextStyle(
+                              fontSize: 8.5,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: 0.6,
+                              color: color.withValues(alpha: 0.85)),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 2),
+                    Expanded(
+                      child: Text(
+                        why,
+                        maxLines: hot ? 4 : 3,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            fontSize: hot ? 11 : 10,
+                            height: 1.3,
+                            color: hot ? Colors.grey[300] : Colors.grey[400]),
+                      ),
+                    ),
+                    SizedBox(
+                      height: 30,
+                      width: double.infinity,
+                      child: FilledButton(
+                        onPressed: onGenerate,
+                        style: FilledButton.styleFrom(
+                          backgroundColor: const Color(0xFF00BFFF),
+                          foregroundColor: Colors.black,
+                          padding: EdgeInsets.zero,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                        child: Text(
+                          isLong ? 'Long Setup' : 'Short Setup',
+                          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w800),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(
+                        color: color.withValues(alpha: hot ? 0.55 : 0.28),
+                        width: hot ? 1.3 : 1.0,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -859,6 +1141,12 @@ class _VisionOpportunityCardState extends State<_VisionOpportunityCard> with Sin
     final dirColor = isLong ? const Color(0xFF00E676) : const Color(0xFFFF5252);
     final coinColor = _coinColor(opp.coin);
     const cyan = Color(0xFF00D4FF);
+    final conviction = widget.displayConviction;
+    final convictionColor = conviction >= 70
+        ? dirColor
+        : conviction >= 55
+            ? cyan
+            : const Color(0xFFFFB74D);
 
     return AnimatedBuilder(
       animation: _glow,
@@ -868,9 +1156,9 @@ class _VisionOpportunityCardState extends State<_VisionOpportunityCard> with Sin
           padding: const EdgeInsets.only(bottom: 14),
           child: Container(
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(20),
+              borderRadius: BorderRadius.circular(22),
               boxShadow: [
-                BoxShadow(color: dirColor.withValues(alpha: pulse), blurRadius: 26),
+                BoxShadow(color: dirColor.withValues(alpha: pulse), blurRadius: 28),
                 BoxShadow(color: cyan.withValues(alpha: pulse * 0.45), blurRadius: 18),
               ],
             ),
@@ -879,7 +1167,7 @@ class _VisionOpportunityCardState extends State<_VisionOpportunityCard> with Sin
         );
       },
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(20),
+        borderRadius: BorderRadius.circular(22),
         child: Stack(
           children: [
             Positioned.fill(
@@ -898,11 +1186,12 @@ class _VisionOpportunityCardState extends State<_VisionOpportunityCard> with Sin
               ),
             ),
             Padding(
-              padding: const EdgeInsets.fromLTRB(18, 16, 18, 16),
+              padding: const EdgeInsets.fromLTRB(18, 16, 18, 18),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Container(
                         width: 52,
@@ -938,26 +1227,96 @@ class _VisionOpportunityCardState extends State<_VisionOpportunityCard> with Sin
                                 ),
                               ],
                             ),
-                            const SizedBox(height: 8),
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
-                              decoration: BoxDecoration(
-                                borderRadius: BorderRadius.circular(20),
-                                color: cyan.withValues(alpha: 0.12),
-                                border: Border.all(color: cyan.withValues(alpha: 0.4)),
-                                boxShadow: [BoxShadow(color: cyan.withValues(alpha: 0.15), blurRadius: 10)],
-                              ),
-                              child: Text(
-                                '${widget.displayConviction}% conviction · ${widget.timeframe}',
-                                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w800, color: cyan),
-                              ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '${widget.timeframe} signal',
+                              style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: Colors.grey[600]),
                             ),
                           ],
                         ),
                       ),
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              _VisionLiveDot(color: dirColor),
+                              const SizedBox(width: 5),
+                              Text(
+                                'LIVE',
+                                style: TextStyle(
+                                  fontSize: 9,
+                                  fontWeight: FontWeight.w900,
+                                  letterSpacing: 1.1,
+                                  color: dirColor.withValues(alpha: 0.9),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
                     ],
                   ),
                   const SizedBox(height: 14),
+                  // Conviction: big % + animated visual bar
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      Text(
+                        '$conviction%',
+                        style: TextStyle(
+                          fontSize: 28,
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: -0.8,
+                          color: convictionColor,
+                          height: 1,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 2),
+                        child: Text(
+                          'CONVICTION',
+                          style: TextStyle(
+                            fontSize: 9,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 1.2,
+                            color: Colors.grey[600],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 7),
+                  TweenAnimationBuilder<double>(
+                    tween: Tween(begin: 0, end: conviction / 100),
+                    duration: const Duration(milliseconds: 900),
+                    curve: Curves.easeOutCubic,
+                    builder: (context, value, _) => ClipRRect(
+                      borderRadius: BorderRadius.circular(4),
+                      child: Stack(
+                        children: [
+                          Container(height: 6, color: Colors.black.withValues(alpha: 0.45)),
+                          FractionallySizedBox(
+                            widthFactor: value.clamp(0.0, 1.0),
+                            child: Container(
+                              height: 6,
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  colors: [convictionColor.withValues(alpha: 0.55), convictionColor],
+                                ),
+                                boxShadow: [
+                                  BoxShadow(color: convictionColor.withValues(alpha: 0.5), blurRadius: 8),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 13),
                   Text(
                     widget.displayWhy,
                     style: TextStyle(fontSize: 13, height: 1.45, color: Colors.grey[400]),
@@ -965,10 +1324,10 @@ class _VisionOpportunityCardState extends State<_VisionOpportunityCard> with Sin
                   const SizedBox(height: 16),
                   SizedBox(
                     width: double.infinity,
-                    height: 48,
+                    height: 50,
                     child: FilledButton.icon(
                       onPressed: widget.onGenerate,
-                      icon: const Icon(Icons.auto_graph, size: 20),
+                      icon: const Icon(Icons.auto_awesome, size: 19),
                       label: const Text(
                         'Generate Trade Setup',
                         style: TextStyle(fontSize: 15, fontWeight: FontWeight.w800),
@@ -989,7 +1348,7 @@ class _VisionOpportunityCardState extends State<_VisionOpportunityCard> with Sin
               child: IgnorePointer(
                 child: DecoratedBox(
                   decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(20),
+                    borderRadius: BorderRadius.circular(22),
                     border: Border.all(color: dirColor.withValues(alpha: 0.25)),
                   ),
                 ),

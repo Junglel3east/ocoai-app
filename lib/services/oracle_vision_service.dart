@@ -40,6 +40,8 @@ abstract final class OracleVisionService {
     return OracleVisionSnapshot(
       heatZones: heatZones,
       opportunities: opportunities,
+      bias: bundle.bias,
+      change24h: bundle.change24h,
     );
   }
 
@@ -324,9 +326,13 @@ class LiquidationHeatZone {
 class OracleVisionSnapshot {
   final List<LiquidationHeatZone> heatZones;
   final List<OraclePulseOpportunity> opportunities;
+  final OracleDeskBias bias;
+  final Map<String, double> change24h;
 
   const OracleVisionSnapshot({
     required this.heatZones,
     required this.opportunities,
+    required this.bias,
+    required this.change24h,
   });
 }
