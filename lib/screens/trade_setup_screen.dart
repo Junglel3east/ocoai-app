@@ -162,79 +162,75 @@ class _TradeSetupScreenState extends State<TradeSetupScreen> {
           ),
           Positioned.fill(
             child: TabRootBody(
-              child: LayoutBuilder(
-                builder: (context, constraints) {
-                  return RepaintBoundary(
-                    child: _premiumTabScrollBody(
-                      minHeight: constraints.maxHeight,
-                      children: [
-                        Text(
-                          'Configure your setup',
-                          style: TextStyle(fontSize: 14, height: 1.45, color: Colors.grey[500]),
-                        ),
-                        OracleLivePriceStrip(
-                          coin: useCustomCoin ? _coinController.text.trim().toUpperCase() : selectedCoin,
-                        ),
-                        const SizedBox(height: _AppSpacing.section),
-                        _formSection(
-                          label: 'Coin Symbol',
-                          child: _useFallbackCoinDropdown
-                              ? _buildCoinSymbolFallback()
-                              : TextField(
-                                  readOnly: true,
-                                  controller: _coinController,
-                                  onTap: _openCoinSymbolSearch,
-                                  textCapitalization: TextCapitalization.characters,
-                                  decoration: const InputDecoration(
-                                    hintText: 'Tap to search symbols',
-                                    suffixIcon: Icon(Icons.search, color: Color(0xFF00BFFF)),
-                                  ),
-                                ),
-                        ),
-                        const SizedBox(height: _AppSpacing.item),
-                        _formSection(
-                          label: 'Timeframe',
-                          child: DropdownButton<String>(
-                            value: selectedTimeframe,
-                            isExpanded: true,
-                            items: ["5m", "10m", "15m", "20m", "30m", "1h", "2h", "4h", "8h", "1d"]
-                                .map((tf) => DropdownMenuItem(value: tf, child: Text(tf)))
-                                .toList(),
-                            onChanged: (v) => setState(() => selectedTimeframe = v!),
-                          ),
-                        ),
-                        const SizedBox(height: _AppSpacing.item),
-                        _formSection(
-                          label: 'Direction',
-                          child: DropdownButton<String>(
-                            value: selectedDirection,
-                            isExpanded: true,
-                            items: const [
-                              DropdownMenuItem(value: "Smart Direction", child: Text("Smart Direction")),
-                              DropdownMenuItem(value: "Long Only", child: Text("Long Only")),
-                              DropdownMenuItem(value: "Short Only", child: Text("Short Only")),
-                            ],
-                            onChanged: (v) => setState(() => selectedDirection = v!),
-                          ),
-                        ),
-                        const SizedBox(height: _AppSpacing.section),
-                        _ScaleTap(
-                          onTap: () => generateSetup(),
-                          child: ElevatedButton(
-                            onPressed: generateSetup,
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: Colors.amber,
-                              foregroundColor: Colors.black,
-                              minimumSize: const Size.fromHeight(54),
-                            ),
-                            child: const Text("Generate Trade Setup"),
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                      ],
+              child: SingleChildScrollView(
+                physics: const BouncingScrollPhysics(),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      'Configure your setup',
+                      style: TextStyle(fontSize: 14, height: 1.45, color: Colors.grey[500]),
                     ),
-                  );
-                },
+                    OracleLivePriceStrip(
+                      coin: useCustomCoin ? _coinController.text.trim().toUpperCase() : selectedCoin,
+                    ),
+                    const SizedBox(height: _AppSpacing.section),
+                    _formSection(
+                      label: 'Coin Symbol',
+                      child: _useFallbackCoinDropdown
+                          ? _buildCoinSymbolFallback()
+                          : TextField(
+                              readOnly: true,
+                              controller: _coinController,
+                              onTap: _openCoinSymbolSearch,
+                              textCapitalization: TextCapitalization.characters,
+                              decoration: const InputDecoration(
+                                hintText: 'Tap to search symbols',
+                                suffixIcon: Icon(Icons.search, color: Color(0xFF00BFFF)),
+                              ),
+                            ),
+                    ),
+                    const SizedBox(height: _AppSpacing.item),
+                    _formSection(
+                      label: 'Timeframe',
+                      child: DropdownButton<String>(
+                        value: selectedTimeframe,
+                        isExpanded: true,
+                        items: ["5m", "10m", "15m", "20m", "30m", "1h", "2h", "4h", "8h", "1d"]
+                            .map((tf) => DropdownMenuItem(value: tf, child: Text(tf)))
+                            .toList(),
+                        onChanged: (v) => setState(() => selectedTimeframe = v!),
+                      ),
+                    ),
+                    const SizedBox(height: _AppSpacing.item),
+                    _formSection(
+                      label: 'Direction',
+                      child: DropdownButton<String>(
+                        value: selectedDirection,
+                        isExpanded: true,
+                        items: const [
+                          DropdownMenuItem(value: "Smart Direction", child: Text("Smart Direction")),
+                          DropdownMenuItem(value: "Long Only", child: Text("Long Only")),
+                          DropdownMenuItem(value: "Short Only", child: Text("Short Only")),
+                        ],
+                        onChanged: (v) => setState(() => selectedDirection = v!),
+                      ),
+                    ),
+                    const SizedBox(height: _AppSpacing.section),
+                    _ScaleTap(
+                      onTap: () => generateSetup(),
+                      child: ElevatedButton(
+                        onPressed: generateSetup,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.amber,
+                          foregroundColor: Colors.black,
+                          minimumSize: const Size.fromHeight(54),
+                        ),
+                        child: const Text("Generate Trade Setup"),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),

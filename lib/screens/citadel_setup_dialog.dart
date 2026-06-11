@@ -1020,14 +1020,16 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
     Navigator.of(context).pop();
   }
 
-  void _showSnackOnParent(String message) {
-    final parent = widget.parentContext;
-    if (!parent.mounted) return;
-    ScaffoldMessenger.of(parent).showSnackBar(
+  void _showSnackOnParent(String message, {bool useParent = false}) {
+    final target = useParent ? widget.parentContext : context;
+    if (!target.mounted) return;
+    ScaffoldMessenger.of(target).showSnackBar(
       SnackBar(
         content: Text(message),
         behavior: SnackBarBehavior.floating,
         backgroundColor: _kCitadelGreen,
+        elevation: 12,
+        margin: const EdgeInsets.fromLTRB(16, 0, 16, 20),
       ),
     );
   }
@@ -1092,7 +1094,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
 
       if (!mounted) return;
       _safePopDialog();
-      _showSnackOnParent('Oracle Citadel settings saved');
+      _showSnackOnParent('Oracle Citadel settings saved', useParent: true);
     } on OracleCitadelException catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1121,13 +1123,15 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
     final showConnected = _isExchangeLinked && _lastConnectedAt != null;
     final maxH = MediaQuery.sizeOf(context).height * 0.88;
 
-    return PopScope(
-      canPop: !_saving,
-      child: Dialog(
-        backgroundColor: _kCitadelSurface,
-        insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        child: ConstrainedBox(
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      body: PopScope(
+        canPop: !_saving,
+        child: Dialog(
+          backgroundColor: _kCitadelSurface,
+          insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          child: ConstrainedBox(
           constraints: BoxConstraints(maxWidth: 440, maxHeight: maxH),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -1398,6 +1402,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
               ),
             ],
           ),
+        ),
         ),
       ),
     );
