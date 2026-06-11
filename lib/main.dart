@@ -8529,7 +8529,7 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
               'Unlimited Trade Setups',
               'AI Chat (limited)',
               'All timeframes',
-              'Advanced custom alerts',
+              'Oracle Vision (Live High-Conviction Opportunities)',
             ],
             isCurrent: _currentPlan == 'Premium',
             badge: null,
@@ -10400,6 +10400,130 @@ class AlertsStore {
   }
 }
 
+/// Premium dark placeholder — Advanced Alerts (Home AppBar bell).
+class _AdvancedAlertsPlaceholder extends StatelessWidget {
+  const _AdvancedAlertsPlaceholder();
+
+  @override
+  Widget build(BuildContext context) {
+    const accent = Color(0xFF00BFFF);
+    return Scaffold(
+      backgroundColor: const Color(0xFF0F0F0F),
+      appBar: AppBar(
+        elevation: 0,
+        backgroundColor: const Color(0xFF0F0F0F),
+        title: const Text('Advanced Alerts'),
+      ),
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          const OracleProfileBackdrop(
+            centeredOrb: true,
+            orbHeight: kProfileBackgroundOrbHeight,
+            orbOpacity: kProfileBackgroundOrbOpacity * 0.82,
+          ),
+          SafeArea(
+            child: Center(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 32),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(24),
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: RadialGradient(
+                          colors: [
+                            accent.withValues(alpha: 0.24),
+                            accent.withValues(alpha: 0.05),
+                          ],
+                        ),
+                        border: Border.all(color: accent.withValues(alpha: 0.38)),
+                        boxShadow: [
+                          BoxShadow(
+                            color: accent.withValues(alpha: 0.2),
+                            blurRadius: 36,
+                            spreadRadius: 2,
+                          ),
+                        ],
+                      ),
+                      child: const Icon(Icons.notifications_active_rounded, color: accent, size: 46),
+                    ),
+                    const SizedBox(height: 30),
+                    const Text(
+                      'Oracle Alert Engine',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800, letterSpacing: -0.4),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      'Institutional-grade price, technical, and news alerts — precision-tuned for the Oracle trader.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 14, height: 1.55, color: Colors.grey[500]),
+                    ),
+                    const SizedBox(height: 28),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [
+                            accent.withValues(alpha: 0.18),
+                            const Color(0xFF1A1A1A),
+                          ],
+                        ),
+                        borderRadius: BorderRadius.circular(24),
+                        border: Border.all(color: accent.withValues(alpha: 0.32)),
+                        boxShadow: [
+                          BoxShadow(
+                            color: accent.withValues(alpha: 0.12),
+                            blurRadius: 16,
+                          ),
+                        ],
+                      ),
+                      child: const Text(
+                        'COMING SOON',
+                        style: TextStyle(
+                          color: accent,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 12,
+                          letterSpacing: 1.2,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 34),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      alignment: WrapAlignment.center,
+                      children: ['Price', 'RSI', 'MACD', 'Volume', 'VWAP', 'News']
+                          .map(
+                            (label) => Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.04),
+                                borderRadius: BorderRadius.circular(20),
+                                border: Border.all(color: Colors.grey[800]!),
+                              ),
+                              child: Text(
+                                label,
+                                style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                              ),
+                            ),
+                          )
+                          .toList(),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class AlertsScreen extends StatefulWidget {
   const AlertsScreen({super.key});
 
@@ -10576,192 +10700,7 @@ class _AlertsScreenState extends State<AlertsScreen> with SingleTickerProviderSt
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFF0F0F0F),
-      appBar: AppBar(
-        elevation: 0,
-        backgroundColor: const Color(0xFF0F0F0F),
-        title: const Text('Smart Alerts'),
-        actions: [
-          IconButton(
-            tooltip: 'Check alerts',
-            onPressed: _simulateTriggerCheck,
-            icon: const Icon(Icons.refresh_rounded, color: Color(0xFF00BFFF)),
-          ),
-          Padding(
-            padding: const EdgeInsets.only(right: 14),
-            child: Center(
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF00BFFF).withValues(alpha: 0.15),
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.35)),
-                ),
-                child: Text(
-                  '$_activeCount Active',
-                  style: const TextStyle(color: Color(0xFF00BFFF), fontWeight: FontWeight.w600, fontSize: 12),
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        backgroundColor: const Color(0xFF00BFFF),
-        foregroundColor: Colors.black,
-        elevation: 6,
-        onPressed: _openCreateSheet,
-        icon: const Icon(Icons.add_alert_rounded),
-        label: const Text('Create New Alert', style: TextStyle(fontWeight: FontWeight.bold)),
-      ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator(color: Color(0xFF00BFFF)))
-          : Column(
-              children: [
-                SizeTransition(
-                  sizeFactor: CurvedAnimation(parent: _bannerController, curve: Curves.easeOutCubic),
-                  alignment: Alignment.topCenter,
-                  child: FadeTransition(
-                    opacity: CurvedAnimation(parent: _bannerController, curve: Curves.easeOut),
-                    child: _bannerMessage == null
-                        ? const SizedBox.shrink()
-                        : Container(
-                            width: double.infinity,
-                            margin: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                            decoration: BoxDecoration(
-                              gradient: LinearGradient(
-                                colors: [
-                                  const Color(0xFF00BFFF).withValues(alpha: 0.25),
-                                  const Color(0xFF006994).withValues(alpha: 0.35),
-                                ],
-                              ),
-                              borderRadius: BorderRadius.circular(14),
-                              border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.5)),
-                            ),
-                            child: Row(
-                              children: [
-                                const Icon(Icons.notifications_active, color: Color(0xFF00BFFF), size: 22),
-                                const SizedBox(width: 10),
-                                Expanded(
-                                  child: Text(
-                                    _bannerMessage!,
-                                    style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
-                                  ),
-                                ),
-                                IconButton(
-                                  visualDensity: VisualDensity.compact,
-                                  onPressed: () {
-                                    _bannerController.reverse().then((_) {
-                                      if (mounted) setState(() => _bannerMessage = null);
-                                    });
-                                  },
-                                  icon: const Icon(Icons.close, size: 18),
-                                ),
-                              ],
-                            ),
-                          ),
-                  ),
-                ),
-                Expanded(
-                  child: ListView(
-                    physics: const BouncingScrollPhysics(),
-                    padding: const EdgeInsets.fromLTRB(16, 4, 16, 96),
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.all(18),
-                        decoration: BoxDecoration(
-                          gradient: LinearGradient(
-                            begin: Alignment.topLeft,
-                            end: Alignment.bottomRight,
-                            colors: [
-                              const Color(0xFF1A1A1A),
-                              const Color(0xFF121212),
-                              const Color(0xFF00BFFF).withValues(alpha: 0.08),
-                            ],
-                          ),
-                          borderRadius: BorderRadius.circular(18),
-                          border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
-                        ),
-                        child: Row(
-                          children: [
-                            Container(
-                              padding: const EdgeInsets.all(12),
-                              decoration: BoxDecoration(
-                                color: const Color(0xFF00BFFF).withValues(alpha: 0.18),
-                                borderRadius: BorderRadius.circular(14),
-                              ),
-                              child: const Icon(Icons.shield_outlined, color: Color(0xFF00BFFF), size: 28),
-                            ),
-                            const SizedBox(width: 14),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  const Text(
-                                    'Pro Alert Engine',
-                                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-                                  ),
-                                  const SizedBox(height: 4),
-                                  Text(
-                                    'Price, technicals, and news — never miss a move.',
-                                    style: TextStyle(fontSize: 12, color: Colors.grey[500], height: 1.4),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 22),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text('Active Alerts', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                          Text(
-                            '${_alerts.length} total',
-                            style: TextStyle(fontSize: 12, color: Colors.grey[600]),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-                      if (_alerts.isEmpty)
-                        _AppEmptyState(
-                          icon: Icons.notifications_active_outlined,
-                          title: 'No alerts yet',
-                          subtitle: 'Create price, RSI, MACD, or news alerts to stay ahead of the market.',
-                        )
-                      else
-                        ...List.generate(_alerts.length, (index) {
-                          final alert = _alerts[index];
-                          return TweenAnimationBuilder<double>(
-                            key: ValueKey(alert.id),
-                            tween: Tween(begin: 0, end: 1),
-                            duration: Duration(milliseconds: 280 + (index * 40).clamp(0, 200)),
-                            curve: Curves.easeOutCubic,
-                            builder: (context, value, child) => Opacity(
-                              opacity: value,
-                              child: Transform.translate(
-                                offset: Offset(0, (1 - value) * 12),
-                                child: child,
-                              ),
-                            ),
-                            child: _AlertCard(
-                              alert: alert,
-                              coinColor: _coinColor(alert.coin),
-                              typeIcon: _typeIcon(alert.alertType),
-                              onTap: () => _openEditSheet(alert),
-                              onDelete: () => _deleteAlert(alert.id),
-                            ),
-                          );
-                        }),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-    );
+    return const _AdvancedAlertsPlaceholder();
   }
 }
 
