@@ -31,11 +31,14 @@ import 'services/notification_service.dart';
 import 'services/citadel_positions_service.dart';
 import 'services/oracle_desk_service.dart';
 import 'services/oracle_vision_service.dart';
+import 'services/auth_service.dart';
 import 'services/user_profile_store.dart';
 import 'screens/edit_profile_screen.dart';
+import 'screens/login_screen.dart';
 import 'screens/profile_screen.dart' show kProfileBackgroundOrbHeight, kProfileBackgroundOrbOpacity;
 import 'widgets/ai_chat_entry.dart';
 import 'widgets/background_illustration.dart';
+import 'widgets/community_links_section.dart';
 part 'screens/quick_analyze_screen.dart';
 part 'screens/oracle_vision_screen.dart';
 part 'screens/trade_setup_screen.dart';
@@ -918,6 +921,7 @@ abstract final class SubscriptionPlanStore {
     currentPlan = plan;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_planKey, plan);
+    await UserProfileStore.saveTier(plan);
   }
 
   static Future<bool> isHomeChatFabHidden() async {
@@ -4250,14 +4254,48 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
     Future<void>.delayed(const Duration(milliseconds: 2400), _goHome);
   }
 
-  void _goHome() {
+  void _navigateTo(Widget screen) {
     if (!mounted) return;
     Navigator.of(context).pushReplacement(
       PageRouteBuilder<void>(
-        pageBuilder: (_, __, ___) => const MainScreen(),
+        pageBuilder: (_, __, ___) => screen,
         transitionsBuilder: (_, animation, __, child) =>
             FadeTransition(opacity: animation, child: child),
         transitionDuration: const Duration(milliseconds: 450),
+      ),
+    );
+  }
+
+  Future<void> _goHome() async {
+    if (!mounted) return;
+    await AuthService.init();
+
+    if (await AuthService.hasValidSession()) {
+      _navigateTo(const MainScreen());
+      return;
+    }
+
+    if (await AuthService.tryBiometricUnlock()) {
+      if (!mounted) return;
+      _navigateTo(const MainScreen());
+      return;
+    }
+
+    final rememberedEmail = await AuthService.getRememberedEmail();
+    if (!mounted) return;
+    _navigateTo(
+      LoginScreen(
+        prefillEmail: rememberedEmail,
+        onSuccess: (ctx) {
+          Navigator.of(ctx).pushReplacement(
+            PageRouteBuilder<void>(
+              pageBuilder: (_, __, ___) => const MainScreen(),
+              transitionsBuilder: (_, animation, __, child) =>
+                  FadeTransition(opacity: animation, child: child),
+              transitionDuration: const Duration(milliseconds: 450),
+            ),
+          );
+        },
       ),
     );
   }
@@ -8095,6 +8133,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     onTap: () => _open(context, const SubscriptionPlanScreen()),
                   ),
                   const SizedBox(height: _AppSpacing.item),
+                  const _SectionHeader(title: 'Community'),
+                  const CommunityLinksSection(),
+                  const SizedBox(height: _AppSpacing.item),
                   const _SectionHeader(title: 'App'),
                   _ProfileMenuTile(
                     icon: Icons.settings_outlined,
@@ -8228,6 +8269,7 @@ class _AccountScreenState extends State<AccountScreen> {
           const _SectionHeader(title: 'Profile Details'),
           _AccountField(label: 'Display Name', value: UserProfileStore.displayName),
           _AccountField(label: 'Email', value: UserProfileStore.email),
+          _AccountField(label: 'Plan Tier', value: UserProfileStore.tier),
           _AccountField(label: 'Member Since', value: UserProfileStore.memberSince),
           _AccountField(label: 'Timezone', value: UserProfileStore.timezone),
           const SizedBox(height: _AppSpacing.section),
@@ -8241,6 +8283,36 @@ class _AccountScreenState extends State<AccountScreen> {
                 foregroundColor: Colors.black,
               ),
               child: const Text('Edit Profile'),
+            ),
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            height: 50,
+            child: OutlinedButton(
+              onPressed: () async {
+                await AuthService.signOut();
+                if (!context.mounted) return;
+                Navigator.of(context).pushAndRemoveUntil(
+                  PageRouteBuilder<void>(
+                    pageBuilder: (_, __, ___) => LoginScreen(
+                      onSuccess: (ctx) {
+                        Navigator.of(ctx).pushReplacement(
+                          MaterialPageRoute<void>(builder: (_) => const MainScreen()),
+                        );
+                      },
+                    ),
+                    transitionsBuilder: (_, animation, __, child) =>
+                        FadeTransition(opacity: animation, child: child),
+                  ),
+                  (_) => false,
+                );
+              },
+              style: OutlinedButton.styleFrom(
+                foregroundColor: const Color(0xFFFF5252),
+                side: BorderSide(color: const Color(0xFFFF5252).withValues(alpha: 0.45)),
+              ),
+              child: const Text('Sign Out'),
             ),
           ),
         ],
@@ -8397,7 +8469,7 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
               'Advanced custom alerts',
             ],
             isCurrent: _currentPlan == 'Premium',
-            badge: 'Most Popular',
+            badge: null,
             showUpgradeButton: true,
             onUpgrade: () => _upgrade('Premium'),
           ),
@@ -8416,7 +8488,7 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
               'Oracle Desk (Advanced Performance + Personal Command Center)',
             ],
             isCurrent: _currentPlan == 'Expert',
-            badge: 'Top Tier',
+            badge: 'MOST POPULAR',
             showUpgradeButton: true,
             onUpgrade: () => _upgrade('Expert'),
           ),

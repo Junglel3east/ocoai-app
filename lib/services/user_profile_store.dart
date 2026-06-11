@@ -10,6 +10,7 @@ abstract final class UserProfileStore {
   static const _timezoneKey = 'profile_timezone';
   static const _memberSinceKey = 'profile_member_since';
   static const _avatarPathKey = 'profile_avatar_path';
+  static const _tierKey = 'profile_tier';
   static const String _avatarFileName = 'profile_avatar.jpg';
 
   static const String defaultDisplayName = 'Oracle Trader';
@@ -21,6 +22,7 @@ abstract final class UserProfileStore {
   static String email = defaultEmail;
   static String timezone = defaultTimezone;
   static String memberSince = 'January 2026';
+  static String tier = 'Free';
   static String? avatarPath;
 
   static Future<void> load() async {
@@ -29,6 +31,7 @@ abstract final class UserProfileStore {
     email = prefs.getString(_emailKey) ?? defaultEmail;
     timezone = prefs.getString(_timezoneKey) ?? defaultTimezone;
     memberSince = prefs.getString(_memberSinceKey) ?? memberSince;
+    tier = prefs.getString(_tierKey) ?? tier;
     if (!prefs.containsKey(_memberSinceKey)) {
       memberSince = 'January 2026';
       await prefs.setString(_memberSinceKey, memberSince);
@@ -42,6 +45,23 @@ abstract final class UserProfileStore {
         await prefs.remove(_avatarPathKey);
       }
     }
+  }
+
+  static Future<void> saveTier(String value) async {
+    tier = value.trim().isEmpty ? 'Free' : value.trim();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_tierKey, tier);
+  }
+
+  static Future<void> setMemberSinceNow() async {
+    final now = DateTime.now();
+    const months = [
+      'January', 'February', 'March', 'April', 'May', 'June',
+      'July', 'August', 'September', 'October', 'November', 'December',
+    ];
+    memberSince = '${months[now.month - 1]} ${now.year}';
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_memberSinceKey, memberSince);
   }
 
   static Future<void> save({
