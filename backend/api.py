@@ -109,6 +109,7 @@ CITADEL_ENCRYPTION_KEY = (os.getenv("CITADEL_ENCRYPTION_KEY") or "").strip()
 # Mount a Railway volume at /data and set CITADEL_DATA_DIR=/data so keys survive redeploys.
 _CITADEL_DATA_DIR = Path(os.getenv("CITADEL_DATA_DIR", str(_BACKEND_DIR / "data")))
 _CITADEL_KEYS_FILE = _CITADEL_DATA_DIR / "exchange_keys.json"
+_APP_API_KEYS_FILE = _CITADEL_DATA_DIR / "app_api_keys.json"
 
 # Home "Daily Analysis" — auto-generated BTC/ETH/SOL/XRP batch (7:30 AM America/Chicago).
 DAILY_ANALYSIS_ENABLED = os.getenv("DAILY_ANALYSIS_ENABLED", "true").strip().lower() in {
@@ -332,6 +333,35 @@ class ExchangeKeysRequest(BaseModel):
             return None
         if isinstance(value, str):
             return value.strip().lower() or None
+        return value
+
+
+class AppApiKeyRegisterRequest(BaseModel):
+    """Register or refresh the App API Key → user_id mapping (Flutter secure storage key)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    user_id: str = Field(..., min_length=1, max_length=128)
+    app_api_key: Optional[str] = Field(
+        None,
+        max_length=512,
+        validation_alias=AliasChoices("app_api_key", "app_key"),
+    )
+
+    @field_validator("user_id", mode="before")
+    @classmethod
+    def _strip_user_id(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("app_api_key", mode="before")
+    @classmethod
+    def _strip_app_key(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value.strip() or None
         return value
 
 
@@ -1692,6 +1722,98 @@ def _save_citadel_key_store(store: dict[str, Any]) -> None:
         raise OSError(f"citadel key file missing after write: {_CITADEL_KEYS_FILE}")
 
 
+def _load_app_api_key_store() -> dict[str, str]:
+    """Maps app_api_key → user_id for X-API-Key auth on analyze/trade-setup."""
+    if not _APP_API_KEYS_FILE.is_file():
+        return {}
+    try:
+        raw = json.loads(_APP_API_KEYS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k).strip(): str(v).strip() for k, v in raw.items() if k and v}
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("app_api_key_store_read_failed path=%s err=%s", _APP_API_KEYS_FILE, exc)
+        return {}
+
+
+def _save_app_api_key_store(store: dict[str, str]) -> None:
+    _CITADEL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = _APP_API_KEYS_FILE.with_suffix(".json.tmp")
+    payload = json.dumps(store, indent=2)
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(_APP_API_KEYS_FILE)
+
+
+def register_app_api_key(user_id: str, app_api_key: str) -> dict[str, Any]:
+    """Persist App API Key → user_id; sync into Citadel exchange record when present."""
+    uid = (user_id or "").strip()
+    key = (app_api_key or "").strip()
+    if not uid or not key:
+        raise ValueError("user_id and app_api_key are required")
+
+    store = _load_app_api_key_store()
+    store[key] = uid
+    _save_app_api_key_store(store)
+
+    citadel = _load_citadel_key_store()
+    record = citadel.get(uid)
+    if isinstance(record, dict):
+        record = dict(record)
+        record["app_api_key"] = key
+        citadel[uid] = record
+        _save_citadel_key_store(citadel)
+
+    return {"user_id": uid, "app_api_key": key, "registered": True}
+
+
+def resolve_user_id_from_app_key(app_api_key: str) -> Optional[str]:
+    key = (app_api_key or "").strip()
+    if not key:
+        return None
+    uid = _load_app_api_key_store().get(key)
+    if uid:
+        return uid
+    # Fallback: legacy Citadel rows keyed by user_id with matching app_api_key field.
+    for uid_candidate, record in _load_citadel_key_store().items():
+        if not isinstance(record, dict):
+            continue
+        stored = (record.get("app_api_key") or "").strip()
+        if stored and stored == key:
+            register_app_api_key(str(uid_candidate), key)
+            return str(uid_candidate)
+    return None
+
+
+def resolve_analyze_user_id(
+    request: AnalyzeRequest,
+    http_request: Request,
+) -> Optional[str]:
+    """Identify user from body user_id and/or X-API-Key header."""
+    header_app_key = (
+        http_request.headers.get("X-API-Key") or http_request.headers.get("x-api-key") or ""
+    ).strip()
+    body_user_id = (request.user_id or "").strip() or None
+
+    if not header_app_key:
+        return body_user_id
+
+    resolved = resolve_user_id_from_app_key(header_app_key)
+    if resolved:
+        if body_user_id and body_user_id != resolved:
+            logger.warning(
+                "analyze_user_id_mismatch header_resolved=%s body=%s",
+                resolved,
+                body_user_id,
+            )
+        return resolved
+
+    if body_user_id:
+        register_app_api_key(body_user_id, header_app_key)
+        return body_user_id
+
+    return None
+
+
 def resolve_citadel_exchange_profile(
     exchange: Optional[str],
     use_demo_mode: bool,
@@ -1824,6 +1946,7 @@ def save_exchange_keys_record(
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     _save_citadel_key_store(store)
+    register_app_api_key(user_id, app_api_key)
 
     # Verify round-trip encrypt/decrypt and on-disk persistence (no secrets in logs).
     reloaded = _load_citadel_key_store()
@@ -5144,7 +5267,7 @@ async def _handle_analyze(
 
     try:
         # Live market (BloFin when linked, else Mobula/CG/Binance) → prompts unchanged structurally
-        user_id = (request.user_id or "").strip() or None
+        user_id = resolve_analyze_user_id(request, http_request)
         market = fetch_live_price_for_analysis(coin, user_id=user_id)
 
         scalp_mode = is_scalp_context(
@@ -5783,6 +5906,45 @@ async def _handle_exchange_keys_status(http_request: Request) -> JSONResponse:
 @app.get("/api/exchange_keys/status/")
 async def exchange_keys_status(http_request: Request) -> JSONResponse:
     return await _handle_exchange_keys_status(http_request)
+
+
+@app.post("/app_api_key/register")
+@app.post("/app_api_key/register/")
+@app.post("/api/app_api_key/register")
+@app.post("/api/app_api_key/register/")
+async def app_api_key_register(
+    request: AppApiKeyRegisterRequest,
+    http_request: Request,
+) -> dict[str, Any]:
+    """
+    Register the Flutter App API Key (secure storage) for this user_id.
+    X-API-Key header may substitute for body app_api_key.
+    """
+    req_id = getattr(http_request.state, "request_id", "?")
+    header_app_key = (
+        http_request.headers.get("X-API-Key") or http_request.headers.get("x-api-key") or ""
+    ).strip()
+    user_id = request.user_id.strip()
+    app_api_key = (request.app_api_key or header_app_key).strip()
+
+    if not user_id or not app_api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="user_id and app_api_key are required (body or X-API-Key header).",
+        )
+    if header_app_key and request.app_api_key and header_app_key != request.app_api_key:
+        raise HTTPException(
+            status_code=403,
+            detail="X-API-Key header does not match app_api_key in body.",
+        )
+
+    try:
+        result = register_app_api_key(user_id, app_api_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    logger.info("app_api_key_registered request_id=%s user_id=%s", req_id, user_id)
+    return {"success": True, "request_id": req_id, **result}
 
 
 @app.post("/exchange_keys")

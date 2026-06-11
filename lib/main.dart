@@ -17,6 +17,7 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
@@ -31,6 +32,7 @@ import 'services/notification_service.dart';
 import 'services/citadel_positions_service.dart';
 import 'services/oracle_desk_service.dart';
 import 'services/oracle_vision_service.dart';
+import 'services/app_api_key_service.dart';
 import 'services/auth_service.dart';
 import 'services/social_links.dart';
 import 'services/user_profile_store.dart';
@@ -944,6 +946,10 @@ abstract final class OracleCitadelStore {
     final prefs = await SharedPreferences.getInstance();
     userId = prefs.getString(_userIdKey) ?? 'demo_user';
     apiKey = prefs.getString(_apiKeyKey) ?? '';
+    final secureKey = await AppApiKeyService.getKey();
+    if (secureKey != null && secureKey.isNotEmpty) {
+      apiKey = secureKey;
+    }
     defaultRiskPercent = prefs.getDouble(_riskPercentKey) ?? 1.0;
     if (defaultRiskPercent < 1.0) defaultRiskPercent = 1.0;
     if (defaultRiskPercent > 100.0) defaultRiskPercent = 100.0;
@@ -1139,10 +1145,7 @@ class _OracleLivePriceStripState extends State<OracleLivePriceStrip> {
 }
 
 abstract final class OracleCitadelService {
-  static Map<String, String> _authHeaders() => {
-        'Content-Type': 'application/json',
-        'X-API-Key': OracleCitadelStore.apiKey,
-      };
+  static Future<Map<String, String>> _authHeaders() => AppApiKeyService.backendHeaders();
 
   static String? _parseUserMessage(http.Response response) {
     try {
@@ -1171,7 +1174,7 @@ abstract final class OracleCitadelService {
     final response = await http
         .post(
           uri,
-          headers: _authHeaders(),
+          headers: await _authHeaders(),
           body: jsonEncode({
             'user_id': userId,
             'app_api_key': OracleCitadelStore.apiKey,
@@ -1202,7 +1205,7 @@ abstract final class OracleCitadelService {
     );
     try {
       final response = await http
-          .get(uri, headers: _authHeaders())
+          .get(uri, headers: await _authHeaders())
           .timeout(const Duration(seconds: 15));
 
       Map<String, dynamic> body = {};
@@ -1281,7 +1284,7 @@ abstract final class OracleCitadelService {
     );
 
     final response = await http
-        .post(uri, headers: _authHeaders(), body: jsonEncode(payload))
+        .post(uri, headers: await _authHeaders(), body: jsonEncode(payload))
         .timeout(const Duration(seconds: 90));
 
     Map<String, dynamic> body = {};
@@ -1341,7 +1344,7 @@ abstract final class OracleCitadelService {
     );
 
     final response = await http
-        .post(uri, headers: _authHeaders(), body: jsonEncode(payload))
+        .post(uri, headers: await _authHeaders(), body: jsonEncode(payload))
         .timeout(const Duration(seconds: 90));
 
     Map<String, dynamic> body = {};
@@ -4256,6 +4259,8 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
   Future<void> _goHome() async {
     if (!mounted) return;
     await AuthService.init();
+    await AppApiKeyService.ensureKey();
+    await OracleCitadelStore.load();
 
     if (await AuthService.hasValidSession()) {
       _navigateTo(const MainScreen());
@@ -9890,6 +9895,7 @@ Future<http.Response> _postAnalyzeWithRetry({
   Object? lastError;
   final uri = Uri.parse('$kBackendBaseUrl/analyze');
   final body = jsonEncode(payload);
+  final authHeaders = await AppApiKeyService.backendHeaders();
   debugPrint('[HTTP POST] $uri mode=${payload['mode']} coin=${payload['coin']}');
 
   for (int i = 0; i < attempts; i++) {
@@ -9898,7 +9904,7 @@ Future<http.Response> _postAnalyzeWithRetry({
           .post(
             uri,
             headers: {
-              "Content-Type": "application/json",
+              ...authHeaders,
               "Cache-Control": "no-cache, no-store, must-revalidate",
               "Pragma": "no-cache",
               "Expires": "0",

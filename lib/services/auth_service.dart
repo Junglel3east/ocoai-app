@@ -6,6 +6,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'app_api_key_service.dart';
 import 'user_profile_store.dart';
 
 /// Local email/password auth with secure storage and optional biometrics.
@@ -116,6 +117,10 @@ abstract final class AuthService {
 
     await _storage.write(key: _sessionKey, value: 'true');
     await _syncProfileFromStorage();
+    final email = await _storage.read(key: _registeredEmailKey);
+    if (email != null && email.isNotEmpty) {
+      await AppApiKeyService.ensureKey(email: email);
+    }
     return true;
   }
 
@@ -259,6 +264,7 @@ abstract final class AuthService {
       timezone: UserProfileStore.timezone,
     );
     await UserProfileStore.saveTier(await _currentTier());
+    await AppApiKeyService.ensureKey(email: email);
   }
 
   static Future<void> _syncProfileFromStorage() async {

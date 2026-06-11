@@ -20,8 +20,6 @@ const String _kCitadelBlofinExchangeId = 'blofin';
 // ─── Legal & exchange guidance copy ─────────────────────────────────────────
 
 const String kCitadelSetupTagline = 'Live trade execution on your exchange';
-const String kCitadelLiveExecutionNotice =
-    'All trades will be executed as LIVE trades on the selected exchange.';
 
 const String kCitadelLegalDisclaimer =
     'Oracle Citadel is a non-custodial LIVE execution tool. Unless you explicitly '
@@ -36,7 +34,8 @@ const String kCitadelLegalDisclaimer =
     'By connecting an exchange you confirm that you understand these risks, that live '
     'execution is the default, that you comply with applicable laws in your jurisdiction, '
     'and that you will never enable withdrawal or transfer permissions on API keys used '
-    'with this app.';
+    'with this app.\n\n'
+    'Demo Mode uses testnet/fake funds. Live trading uses real money and carries full risk of loss.';
 
 const String _kCitadelPrimaryRecommendedTitle = 'Kraken (Recommended)';
 const String _kCitadelPrimaryRecommendedReason =
@@ -68,10 +67,7 @@ Future<void> _citadelLinkExchangeKeys({
   final response = await http
       .post(
         uri,
-        headers: {
-          'Content-Type': 'application/json',
-          'X-API-Key': OracleCitadelStore.apiKey,
-        },
+        headers: await AppApiKeyService.backendHeaders(),
         body: jsonEncode({
           'user_id': userId,
           'app_api_key': OracleCitadelStore.apiKey,
@@ -258,6 +254,62 @@ class _CitadelLegalDisclaimerCard extends StatelessWidget {
                 ),
               ),
             ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Note near exchange API fields — demo vs live key separation.
+class _CitadelDemoKeysNotice extends StatelessWidget {
+  const _CitadelDemoKeysNotice();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF00BFFF).withValues(alpha: 0.06),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.28)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.info_outline_rounded, color: Color(0xFF00BFFF), size: 18),
+              SizedBox(width: 8),
+              Text(
+                'Demo vs Live API Keys',
+                style: TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w700,
+                  color: Color(0xFF00BFFF),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text.rich(
+            TextSpan(
+              style: TextStyle(fontSize: 12, height: 1.5, color: Colors.grey[400]),
+              children: const [
+                TextSpan(text: 'Demo Mode is enabled by default when using demo keys.\n'),
+                TextSpan(
+                  text: 'Demo keys and Live keys are completely different.\n',
+                  style: TextStyle(
+                    fontStyle: FontStyle.italic,
+                    color: Color(0xFF00BFFF),
+                  ),
+                ),
+                TextSpan(
+                  text: 'Please generate separate keys for Demo vs Live trading on your exchange.',
+                ),
+              ],
+            ),
           ),
         ],
       ),
@@ -916,7 +968,6 @@ class _CitadelSetupDialog extends StatefulWidget {
 
 class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
   late final TextEditingController _userIdController;
-  late final TextEditingController _apiKeyController;
   late final TextEditingController _exchangeKeyController;
   late final TextEditingController _exchangeSecretController;
   late final TextEditingController _riskController;
@@ -930,22 +981,42 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
   String _connectedExchangeLabel = 'Exchange';
   DateTime? _lastConnectedAt;
   double _leverage = 5;
+  String _appApiKey = '';
 
   @override
   void initState() {
     super.initState();
     _userIdController = TextEditingController(text: OracleCitadelStore.userId);
-    _apiKeyController = TextEditingController(text: OracleCitadelStore.apiKey);
     _exchangeKeyController = TextEditingController();
     _exchangeSecretController = TextEditingController();
     _riskController = TextEditingController(
       text: OracleCitadelStore.defaultRiskPercent.toString(),
     );
     _leverage = OracleCitadelStore.defaultLeverage;
+    _exchangeKeyController.addListener(_syncDemoModeFromExchangeKeys);
+    _exchangeSecretController.addListener(_syncDemoModeFromExchangeKeys);
     _loadCitadelUiPrefs();
   }
 
+  bool _looksLikeDemoExchangeKeys() {
+    final key = _exchangeKeyController.text.trim().toLowerCase();
+    final secret = _exchangeSecretController.text.trim().toLowerCase();
+    if (key.isEmpty && secret.isEmpty) return false;
+    const markers = ['demo', 'testnet', 'sandbox', 'paper'];
+    final combined = '$key $secret';
+    return markers.any(combined.contains);
+  }
+
+  Future<void> _syncDemoModeFromExchangeKeys() async {
+    if (!mounted || _saving || !_looksLikeDemoExchangeKeys()) return;
+    if (_useDemoMode) return;
+    setState(() => _useDemoMode = true);
+    await OracleCitadelStore.saveDemoMode(true);
+    await _persistCitadelUiPrefs();
+  }
+
   Future<void> _loadCitadelUiPrefs() async {
+    await AppApiKeyService.ensureKey();
     await OracleCitadelStore.load();
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;
@@ -974,6 +1045,8 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
       _connectedExchangeLabel = label;
       _lastConnectedAt = lastConnected;
       _leverage = OracleCitadelStore.defaultLeverage;
+      _appApiKey = OracleCitadelStore.apiKey;
+      _userIdController.text = OracleCitadelStore.userId;
     });
   }
 
@@ -1007,8 +1080,9 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
 
   @override
   void dispose() {
+    _exchangeKeyController.removeListener(_syncDemoModeFromExchangeKeys);
+    _exchangeSecretController.removeListener(_syncDemoModeFromExchangeKeys);
     _userIdController.dispose();
-    _apiKeyController.dispose();
     _exchangeKeyController.dispose();
     _exchangeSecretController.dispose();
     _riskController.dispose();
@@ -1042,17 +1116,31 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
     final risk = double.tryParse(_riskController.text.trim()) ?? 1.0;
 
     try {
+      await AppApiKeyService.ensureKey();
+      await OracleCitadelStore.load();
       await OracleCitadelStore.saveLeverage(_leverage);
       await OracleCitadelStore.saveDemoMode(_useDemoMode);
       await OracleCitadelStore.save(
         userId: _userIdController.text,
-        apiKey: _apiKeyController.text,
+        apiKey: OracleCitadelStore.apiKey,
         riskPercent: risk,
+      );
+      await AppApiKeyService.syncUserId(OracleCitadelStore.userId);
+      await AppApiKeyService.registerWithBackend(
+        userId: OracleCitadelStore.userId,
+        apiKey: OracleCitadelStore.apiKey,
       );
       if (!mounted) return;
 
       final exchangeKey = _exchangeKeyController.text.trim();
       final exchangeSecret = _exchangeSecretController.text.trim();
+      if (_looksLikeDemoExchangeKeys()) {
+        if (!_useDemoMode) {
+          setState(() => _useDemoMode = true);
+        }
+        await OracleCitadelStore.saveDemoMode(true);
+        await _persistCitadelUiPrefs();
+      }
       if (exchangeKey.isNotEmpty && exchangeSecret.isNotEmpty) {
         await _persistCitadelUiPrefs();
         if (!mounted) return;
@@ -1068,7 +1156,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
         if (!verified) {
           throw OracleCitadelException(
             'Keys were sent but the server could not verify them. '
-            'Confirm your App API Key matches the value above, then Save & Connect again.',
+            'Try Save & Connect again, or contact support if this persists.',
           );
         }
         final label = _useDemoMode ? 'BloFin' : 'Exchange API';
@@ -1188,16 +1276,6 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      Text(
-                        kCitadelLiveExecutionNotice,
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                          color: Colors.orange[100],
-                          height: 1.45,
-                        ),
-                      ),
-                      const SizedBox(height: 14),
                       if (showConnected) ...[
                         _CitadelConnectionStatusCard(
                           exchangeLabel: _displayExchangeLabel,
@@ -1219,12 +1297,9 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                       const SizedBox(height: 12),
                       _CitadelSetupField(label: 'User ID', controller: _userIdController, enabled: !_saving),
                       const SizedBox(height: 12),
-                      _CitadelSetupField(
-                        label: 'App API Key (X-API-Key)',
-                        controller: _apiKeyController,
-                        obscure: true,
-                        enabled: !_saving,
-                      ),
+                      _CitadelAppApiKeyCard(apiKey: _appApiKey, enabled: !_saving),
+                      const SizedBox(height: 12),
+                      const _CitadelDemoKeysNotice(),
                       const SizedBox(height: 12),
                       _CitadelSetupField(
                         label: 'Exchange API Key',
@@ -1414,6 +1489,70 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
           ),
         ),
         ),
+      ),
+    );
+  }
+}
+
+/// Read-only App API Key with copy — generated automatically on first launch / login.
+class _CitadelAppApiKeyCard extends StatelessWidget {
+  final String apiKey;
+  final bool enabled;
+
+  const _CitadelAppApiKeyCard({required this.apiKey, this.enabled = true});
+
+  @override
+  Widget build(BuildContext context) {
+    final displayKey = apiKey.isNotEmpty ? apiKey : 'Generating…';
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 14, 12, 14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0A0A0A),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.grey[800]!),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'App API Key (X-API-Key)',
+            style: TextStyle(color: Colors.grey[500], fontSize: 13),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'This is your unique App API Key. Keep it safe.',
+            style: TextStyle(fontSize: 12, height: 1.4, color: Colors.grey[600]),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: SelectableText(
+                  displayKey,
+                  style: const TextStyle(fontSize: 13, fontFamily: 'monospace', height: 1.35),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Copy App API Key',
+                onPressed: !enabled || apiKey.isEmpty
+                    ? null
+                    : () {
+                        Clipboard.setData(ClipboardData(text: apiKey));
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('App API Key copied'),
+                            behavior: SnackBarBehavior.floating,
+                            duration: Duration(seconds: 2),
+                          ),
+                        );
+                      },
+                icon: const Icon(Icons.copy_rounded, size: 20, color: Color(0xFF00BFFF)),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }
