@@ -215,12 +215,16 @@ class _OracleVisionScreenState extends State<OracleVisionScreen> with TickerProv
     required OraclePulseDirection direction,
     required int convictionPct,
   }) async {
-    await SubscriptionPlanStore.load();
-    if (!mounted) return;
-    if (!SubscriptionPlanStore.canGenerateTradeSetup(widget.trades)) {
-      showTradeSetupLimitPrompt(context);
+    final setupTf = OracleVisionService.tradeSetupTimeframe(timeframe);
+    if (!await ensureFreeTradeSetupAllowed(
+      context,
+      coin: coin,
+      timeframe: setupTf,
+      trades: widget.trades,
+    )) {
       return;
     }
+    if (!mounted) return;
     final resolved = await resolveCoinForCurrentPlan(context, coin);
     if (resolved == null || !mounted) return;
     Navigator.push(
@@ -228,7 +232,7 @@ class _OracleVisionScreenState extends State<OracleVisionScreen> with TickerProv
       _premiumPageRoute(
         (_) => TradeSetupResultScreen(
           coin: resolved,
-          timeframe: OracleVisionService.tradeSetupTimeframe(timeframe),
+          timeframe: setupTf,
           direction: direction.tradeSetupDirection,
           convictionPct: convictionPct,
           onTradeSetupGenerated: widget.onTradeSetupGenerated,

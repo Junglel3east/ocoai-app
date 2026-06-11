@@ -841,6 +841,10 @@ abstract final class SubscriptionPlanStore {
 
   static const int freeTradeSetupsPerDay = 3;
 
+  static const String freeTradeSetupTimeframe = '1d';
+
+  static const Duration freeTradeSetupWindow = Duration(hours: 24);
+
   static const int premiumChatMessagesPerDay = 10;
 
   static const _premiumChatDayKey = 'premium_chat_day';
@@ -859,20 +863,23 @@ abstract final class SubscriptionPlanStore {
     return currentCount < freeWatchlistMax;
   }
 
-  static int countTradeSetupsToday(List<Map<String, dynamic>> trades) {
-    final now = DateTime.now();
+  static bool isFreeAllowedTradeSetupTimeframe(String timeframe) {
+    final tf = timeframe.trim().toLowerCase();
+    return tf == '1d' || tf == 'daily' || tf == 'd1';
+  }
+
+  static int countTradeSetupsInWindow(List<Map<String, dynamic>> trades) {
+    final cutoff = DateTime.now().subtract(freeTradeSetupWindow);
     return trades.where((t) {
       final created = DateTime.tryParse(t['createdAt']?.toString() ?? '');
       if (created == null) return false;
-      return created.year == now.year &&
-          created.month == now.month &&
-          created.day == now.day;
+      return !created.isBefore(cutoff);
     }).length;
   }
 
   static bool canGenerateTradeSetup(List<Map<String, dynamic>> trades) {
     if (!isFree) return true;
-    return countTradeSetupsToday(trades) < freeTradeSetupsPerDay;
+    return countTradeSetupsInWindow(trades) < freeTradeSetupsPerDay;
   }
 
   static bool canUseAlertType(String type) {
@@ -3539,16 +3546,80 @@ void _showWatchlistLimitPrompt(BuildContext context) {
   );
 }
 
+/// Free tier gate — Daily TF, BTC/ETH/SOL, 3 setups / 24h. Shows upgrade prompts when blocked.
+Future<bool> ensureFreeTradeSetupAllowed(
+  BuildContext context, {
+  required String coin,
+  required String timeframe,
+  required List<Map<String, dynamic>> trades,
+}) async {
+  await SubscriptionPlanStore.load();
+  if (!SubscriptionPlanStore.isFree) return true;
+
+  if (!SubscriptionPlanStore.isFreeAllowedTradeSetupTimeframe(timeframe)) {
+    if (context.mounted) showTradeSetupTimeframeUpgradePrompt(context);
+    return false;
+  }
+
+  final coinResult = CoinAccessPolicy.evaluate(coin);
+  if (!coinResult.allowed) {
+    if (context.mounted) {
+      await resolveCoinForCurrentPlan(context, coin);
+    }
+    return false;
+  }
+
+  if (!SubscriptionPlanStore.canGenerateTradeSetup(trades)) {
+    if (context.mounted) showTradeSetupLimitPrompt(context);
+    return false;
+  }
+
+  return true;
+}
+
+void showTradeSetupTimeframeUpgradePrompt(BuildContext context) {
+  showDialog<void>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: const Color(0xFF1A1A1A),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      title: const Text('Premium Plan Required', style: TextStyle(fontWeight: FontWeight.w600)),
+      content: Text(
+        'Free plan trade setups are limited to the Daily (1D) timeframe on BTC, ETH, and SOL.\n\n'
+        'Upgrade to Premium for all timeframes and Top 150 coins, or Expert for unlimited access.',
+        style: TextStyle(height: 1.45, color: Colors.grey[400]),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx),
+          child: Text('Not Now', style: TextStyle(color: Colors.grey[500])),
+        ),
+        TextButton(
+          onPressed: () {
+            Navigator.pop(ctx);
+            Navigator.push(ctx, _premiumPageRoute((_) => const SubscriptionPlanScreen()));
+          },
+          child: const Text(
+            'View Plans',
+            style: TextStyle(color: Color(0xFF00BFFF), fontWeight: FontWeight.w600),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
 void showTradeSetupLimitPrompt(BuildContext context) {
   showDialog<void>(
     context: context,
     builder: (ctx) => AlertDialog(
       backgroundColor: const Color(0xFF1A1A1A),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      title: const Text('Daily Limit Reached', style: TextStyle(fontWeight: FontWeight.w600)),
+      title: const Text('24-Hour Limit Reached', style: TextStyle(fontWeight: FontWeight.w600)),
       content: Text(
-        'Free plan includes ${SubscriptionPlanStore.freeTradeSetupsPerDay} trade setups per day. '
-        'Upgrade to Premium for unlimited setups.',
+        'Free plan includes ${SubscriptionPlanStore.freeTradeSetupsPerDay} Daily trade setups '
+        'on BTC, ETH, and SOL every 24 hours.\n\n'
+        'Upgrade to Premium or Expert for unlimited setups and more timeframes.',
         style: TextStyle(height: 1.45, color: Colors.grey[400]),
       ),
       actions: [

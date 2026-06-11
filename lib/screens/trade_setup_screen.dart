@@ -37,6 +37,22 @@ class _TradeSetupScreenState extends State<TradeSetupScreen> {
     super.initState();
     selectedCoin = CoinAccessPolicy.normalizeCoinSymbol(widget.coin) ?? widget.coin.toUpperCase();
     _coinController.text = selectedCoin;
+    _initPlanDefaults();
+  }
+
+  Future<void> _initPlanDefaults() async {
+    await SubscriptionPlanStore.load();
+    if (!mounted) return;
+    if (SubscriptionPlanStore.isFree) {
+      setState(() => selectedTimeframe = SubscriptionPlanStore.freeTradeSetupTimeframe);
+    }
+  }
+
+  List<String> get _timeframeOptions {
+    if (SubscriptionPlanStore.isFree) {
+      return [SubscriptionPlanStore.freeTradeSetupTimeframe];
+    }
+    return const ['5m', '10m', '15m', '20m', '30m', '1h', '2h', '4h', '8h', '1d'];
   }
 
   @override
@@ -105,12 +121,16 @@ class _TradeSetupScreenState extends State<TradeSetupScreen> {
   }
 
   Future<void> generateSetup() async {
-    await SubscriptionPlanStore.load();
-    if (!SubscriptionPlanStore.canGenerateTradeSetup(widget.trades)) {
-      if (mounted) showTradeSetupLimitPrompt(context);
+    final raw = useCustomCoin ? _coinController.text : selectedCoin;
+    if (!await ensureFreeTradeSetupAllowed(
+      context,
+      coin: raw,
+      timeframe: selectedTimeframe,
+      trades: widget.trades,
+    )) {
       return;
     }
-    final raw = useCustomCoin ? _coinController.text : selectedCoin;
+    if (!mounted) return;
     final coin = await resolveCoinForCurrentPlan(context, raw);
     if (coin == null || !mounted) return;
     Navigator.push(
@@ -194,9 +214,11 @@ class _TradeSetupScreenState extends State<TradeSetupScreen> {
                     _formSection(
                       label: 'Timeframe',
                       child: DropdownButton<String>(
-                        value: selectedTimeframe,
+                        value: _timeframeOptions.contains(selectedTimeframe)
+                            ? selectedTimeframe
+                            : _timeframeOptions.first,
                         isExpanded: true,
-                        items: ["5m", "10m", "15m", "20m", "30m", "1h", "2h", "4h", "8h", "1d"]
+                        items: _timeframeOptions
                             .map((tf) => DropdownMenuItem(value: tf, child: Text(tf)))
                             .toList(),
                         onChanged: (v) => setState(() => selectedTimeframe = v!),
