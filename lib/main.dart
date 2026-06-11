@@ -7104,19 +7104,6 @@ class _HomeScreenState extends State<HomeScreen> {
         titleSpacing: 12,
         actions: [
           IconButton(
-            tooltip: 'X',
-            icon: const Text(
-              '𝕏',
-              style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.w900,
-                color: Color(0xFF00BFFF),
-                height: 1,
-              ),
-            ),
-            onPressed: () => openXProfile(context),
-          ),
-          IconButton(
             tooltip: 'YouTube',
             icon: const Icon(Icons.play_circle_outline, color: Color(0xFFFF5252)),
             onPressed: () => openYouTubePlaylist(context),
