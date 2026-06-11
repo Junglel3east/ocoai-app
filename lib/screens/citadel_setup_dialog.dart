@@ -1337,6 +1337,16 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                         '(e.g. USA, Canada, UK, EU countries have stricter regulations)',
                         style: TextStyle(fontSize: 11.5, color: Colors.grey[500], height: 1.35),
                       ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'BloFin is our launch exchange. More exchanges coming soon.',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontStyle: FontStyle.italic,
+                          color: Color(0xFF00BFFF),
+                          height: 1.4,
+                        ),
+                      ),
                       const SizedBox(height: 12),
                       const _CitadelExchangeGuidanceSection(recommended: true),
                       const _CitadelExchangeGuidanceSection(recommended: false),
