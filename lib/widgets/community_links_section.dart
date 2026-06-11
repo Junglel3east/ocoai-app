@@ -1,28 +1,12 @@
 import 'package:flutter/material.dart';
-import 'package:url_launcher/url_launcher.dart';
 
-const String kCommunityXUrl = 'https://x.com/OnChainOracleAI';
+import '../services/social_links.dart';
+
 const String kCommunityDiscordUrl = 'https://discord.gg/n36NAszBd';
-const String kCommunityYouTubePlaylistUrl =
-    'https://youtube.com/playlist?list=PLR5HNGs7bPmo';
 
 /// Glowing social / community link cards for Profile.
 class CommunityLinksSection extends StatelessWidget {
   const CommunityLinksSection({super.key});
-
-  Future<void> _open(BuildContext context, String url, String label) async {
-    final uri = Uri.parse(url);
-    if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Could not open $label'),
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
-      }
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -30,24 +14,28 @@ class CommunityLinksSection extends StatelessWidget {
       children: [
         _CommunityLinkCard(
           title: 'X / Twitter',
-          subtitle: '@OnChainOracleAI — live updates & alpha',
+          subtitle: '$kXHandle — live updates & alpha',
           accentColor: const Color(0xFF00BFFF),
           icon: const _XBrandIcon(),
-          onTap: () => _open(context, kCommunityXUrl, 'X'),
+          onTap: () => openXProfile(context),
         ),
         _CommunityLinkCard(
           title: 'Discord',
           subtitle: 'Join the Oracle trader community',
           accentColor: const Color(0xFF5865F2),
           icon: const _DiscordBrandIcon(),
-          onTap: () => _open(context, kCommunityDiscordUrl, 'Discord'),
+          onTap: () => openSocialUrls(
+            context,
+            urls: [kCommunityDiscordUrl],
+            label: 'Discord',
+          ),
         ),
         _CommunityLinkCard(
           title: 'YouTube Playlist',
           subtitle: 'Watch Oracle walkthroughs & education',
           accentColor: const Color(0xFFFF1744),
           icon: const _YouTubeBrandIcon(),
-          onTap: () => _open(context, kCommunityYouTubePlaylistUrl, 'YouTube'),
+          onTap: () => openYouTubePlaylist(context),
         ),
       ],
     );

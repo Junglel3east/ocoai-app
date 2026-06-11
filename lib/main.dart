@@ -32,6 +32,7 @@ import 'services/citadel_positions_service.dart';
 import 'services/oracle_desk_service.dart';
 import 'services/oracle_vision_service.dart';
 import 'services/auth_service.dart';
+import 'services/social_links.dart';
 import 'services/user_profile_store.dart';
 import 'screens/edit_profile_screen.dart';
 import 'screens/login_screen.dart';
@@ -78,22 +79,8 @@ Future<void> pingBackendHealth() async {
   }
 }
 
-/// Placeholder YouTube channel — replace with your channel URL when ready.
-const String kYouTubeChannelUrl = 'https://www.youtube.com/@OnChainOracleAI';
-
 /// App branding asset (full logo with icon + wordmark).
 const String kAppLogoAsset = 'assets/images/app_logo.png';
-
-Future<void> openYouTubeChannel(BuildContext context) async {
-  final uri = Uri.parse(kYouTubeChannelUrl);
-  if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
-    if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not open YouTube')),
-      );
-    }
-  }
-}
 
 /// Lets WebView claim pan/pinch/zoom gestures (avoids parent ScrollView stealing touches).
 final Set<Factory<OneSequenceGestureRecognizer>> kTradingViewGestureRecognizers = {
@@ -7112,9 +7099,22 @@ class _HomeScreenState extends State<HomeScreen> {
         titleSpacing: 12,
         actions: [
           IconButton(
+            tooltip: 'X',
+            icon: const Text(
+              '𝕏',
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.w900,
+                color: Color(0xFF00BFFF),
+                height: 1,
+              ),
+            ),
+            onPressed: () => openXProfile(context),
+          ),
+          IconButton(
             tooltip: 'YouTube',
             icon: const Icon(Icons.play_circle_outline, color: Color(0xFFFF5252)),
-            onPressed: () => openYouTubeChannel(context),
+            onPressed: () => openYouTubePlaylist(context),
           ),
           IconButton(
             tooltip: 'Alerts',
