@@ -24,6 +24,7 @@ Endpoints (lib/main.dart):
   POST /exchange_keys — Oracle Citadel exchange key storage (encrypted secret)
   POST /execute_trade — Oracle Citadel trade execution (Flutter Send to Citadel)
   GET  /daily_analyses — today's scheduled Home daily analysis batch (BTC, ETH, SOL, XRP)
+  POST /internal/cron/post_daily_x — optional Railway cron: post today's analyses to X
 
 Price chain (analysis): Mobula → CoinGecko Pro → CoinGecko free → Binance Spot/Futures → BloFin (Citadel-linked fallback)
 Derivatives (/analyze): funding, OI, long/short ratio, liquidations (Binance Futures)
@@ -58,6 +59,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+from x_daily_poster import (
+    XDailyPosterConfig,
+    post_daily_analyses_to_x,
+    post_today_from_store,
+)
 
 # ---------------------------------------------------------------------------
 # Environment — Railway Variables + optional local .env (never commit .env)
@@ -124,7 +131,15 @@ DAILY_ANALYSIS_MINUTE = int(os.getenv("DAILY_ANALYSIS_MINUTE", "30"))
 DAILY_ANALYSIS_COINS: tuple[str, ...] = ("BTC", "ETH", "SOL", "XRP")
 _DAILY_ANALYSIS_FILE = _CITADEL_DATA_DIR / "daily_analyses.json"
 _daily_scheduler_task: Optional[asyncio.Task] = None
+_x_daily_post_scheduler_task: Optional[asyncio.Task] = None
 _last_daily_run_day: Optional[str] = None
+
+# X (Twitter) — auto-post daily analysis thread after batch save (OAuth 1.0a User Context).
+_X_DAILY_CONFIG = XDailyPosterConfig()
+X_DAILY_POST_ENABLED = _X_DAILY_CONFIG.enabled
+X_CRON_SECRET = (os.getenv("X_CRON_SECRET") or os.getenv("CRON_SECRET") or "").strip()
+# Seconds after 7:30 AM Chicago before the X scheduler reads persisted analyses (batch may still be running).
+X_DAILY_POST_DELAY_SECONDS = int(os.getenv("X_DAILY_POST_DELAY_SECONDS", "120"))
 
 # BloFin Open API — demo/testnet uses a separate host from live production.
 BLOFIN_DEMO_API_BASE_URL = "https://demo-trading-openapi.blofin.com"
@@ -305,6 +320,16 @@ class ExchangeKeysRequest(BaseModel):
     risk_percent: float = Field(1.0, ge=0.1, le=100.0)
     # Optional exchange id (e.g. "blofin", "coinbase"). Demo URL only for BloFin + use_demo_mode.
     exchange: Optional[str] = Field(None, max_length=64)
+    exchange_passphrase: Optional[str] = Field(
+        None,
+        max_length=256,
+        validation_alias=AliasChoices(
+            "exchange_passphrase",
+            "api_passphrase",
+            "passphrase",
+            "blofin_passphrase",
+        ),
+    )
     use_demo_mode: bool = Field(
         False,
         validation_alias=AliasChoices("use_demo_mode", "demo_mode"),
@@ -320,6 +345,15 @@ class ExchangeKeysRequest(BaseModel):
     @field_validator("app_api_key", mode="before")
     @classmethod
     def _strip_optional_app_key(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @field_validator("exchange_passphrase", mode="before")
+    @classmethod
+    def _strip_optional_passphrase(cls, value: Any) -> Any:
         if value is None:
             return None
         if isinstance(value, str):
@@ -1904,6 +1938,8 @@ def _normalize_exchange_keys_payload(raw: dict[str, Any]) -> dict[str, Any]:
         data["exchange_api_key"] = data["api_key"]
     if not data.get("exchange_secret") and data.get("api_secret"):
         data["exchange_secret"] = data["api_secret"]
+    if not data.get("exchange_passphrase") and data.get("passphrase"):
+        data["exchange_passphrase"] = data["passphrase"]
     if "use_demo_mode" not in data and "demo_mode" in data:
         data["use_demo_mode"] = data["demo_mode"]
     return data
@@ -1929,11 +1965,19 @@ def save_exchange_keys_record(
     risk_percent: float,
     exchange: Optional[str] = None,
     use_demo_mode: bool = False,
+    exchange_passphrase: Optional[str] = None,
 ) -> dict[str, Any]:
     profile = resolve_citadel_exchange_profile(exchange, use_demo_mode)
     encrypted_secret = encrypt_secret_at_rest(exchange_secret)
     store = _load_citadel_key_store()
-    store[user_id] = {
+    prior = store.get(user_id) if isinstance(store.get(user_id), dict) else {}
+    passphrase_plain = (exchange_passphrase or "").strip()
+    if passphrase_plain:
+        encrypted_passphrase = encrypt_secret_at_rest(passphrase_plain)
+    else:
+        encrypted_passphrase = prior.get("exchange_passphrase_encrypted")
+
+    row: dict[str, Any] = {
         "user_id": user_id,
         "app_api_key": app_api_key,
         "exchange_api_key": exchange_api_key,
@@ -1945,6 +1989,9 @@ def save_exchange_keys_record(
         "api_base_url": profile["api_base_url"],
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    if encrypted_passphrase:
+        row["exchange_passphrase_encrypted"] = encrypted_passphrase
+    store[user_id] = row
     _save_citadel_key_store(store)
     register_app_api_key(user_id, app_api_key)
 
@@ -3177,9 +3224,48 @@ def _blofin_place_tpsl_take_profit(
 
 
 def _resolve_blofin_passphrase(record: dict[str, Any]) -> str:
-    """Passphrase for BloFin headers — env or optional per-user field (never logged)."""
-    stored = (record.get("exchange_passphrase") or "").strip()
-    return stored or BLOFIN_PASSPHRASE
+    """Passphrase for BloFin headers — per-user encrypted value or env fallback (never logged)."""
+    enc = (record.get("exchange_passphrase_encrypted") or "").strip()
+    if enc:
+        decrypted = decrypt_secret_at_rest(enc)
+        if decrypted:
+            return decrypted.strip()
+    return BLOFIN_PASSPHRASE
+
+
+def _blofin_verify_exchange_credentials(
+    *,
+    base_url: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    request_id: str = "?",
+) -> dict[str, Any]:
+    """Lightweight signed GET — confirms key/secret/passphrase match the target host."""
+    path = f"{BLOFIN_ACCOUNT_BALANCE_PATH}?productType=USDT-FUTURES"
+    http_status, _raw, parsed = _blofin_private_request(
+        base_url=base_url,
+        api_key=api_key,
+        api_secret=api_secret,
+        passphrase=passphrase,
+        method="GET",
+        path=path,
+        request_id=request_id,
+        log_tag="blofin_verify_keys",
+    )
+    ok = (
+        isinstance(parsed, dict)
+        and http_status == 200
+        and str(parsed.get("code")) == "0"
+    )
+    code = str(parsed.get("code", "")) if isinstance(parsed, dict) else ""
+    msg = parsed.get("msg") if isinstance(parsed, dict) else None
+    return {
+        "ok": ok,
+        "http_status": http_status,
+        "code": code,
+        "msg": msg,
+    }
 
 
 def _citadel_coin_from_inst_id(inst_id: str) -> str:
@@ -3484,7 +3570,7 @@ def _citadel_resolve_blofin_session(
             content={
                 "success": False,
                 "detail": "BloFin passphrase not configured.",
-                "user_message": "Server BloFin passphrase missing. Set BLOFIN_PASSPHRASE on Railway.",
+                "user_message": "Server BloFin passphrase missing. Re-save keys with your API Passphrase in Citadel Setup.",
                 "request_id": req_id,
             },
             headers={"X-Request-ID": req_id},
@@ -4868,6 +4954,7 @@ async def _run_daily_analysis_batch(*, reason: str = "scheduled") -> None:
         _persist_daily_analysis_batch(day, entries)
         _last_daily_run_day = day
         logger.info("daily_analysis_batch_saved day=%s count=%s", day, len(entries))
+        _schedule_x_daily_post_after_batch(day, entries)
     else:
         logger.error("daily_analysis_batch_empty day=%s reason=%s", day, reason)
 
@@ -4910,6 +4997,83 @@ async def _daily_analysis_scheduler_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
+# X (Twitter) — daily analysis thread (separate from in-app push / GET /daily_analyses)
+# ---------------------------------------------------------------------------
+
+
+async def _run_x_daily_post(day: str, entries: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
+    """Post today's analyses to X. Idempotent per day (see data/x_daily_posts.json)."""
+    if not X_DAILY_POST_ENABLED:
+        return {"skipped": True, "reason": "disabled"}
+    try:
+        if entries is not None:
+            result = await asyncio.to_thread(
+                post_daily_analyses_to_x,
+                day,
+                entries,
+                parse_trade_levels=parse_trade_levels,
+                format_usd=format_usd,
+                config=_X_DAILY_CONFIG,
+            )
+        else:
+            result = await asyncio.to_thread(
+                post_today_from_store,
+                load_store=_load_daily_analysis_store,
+                day_key=day,
+                parse_trade_levels=parse_trade_levels,
+                format_usd=format_usd,
+                config=_X_DAILY_CONFIG,
+            )
+        logger.info("x_daily_post_done day=%s result=%s", day, result)
+        return result
+    except Exception as exc:
+        logger.exception("x_daily_post_failed day=%s err=%s", day, exc)
+        return {"success": False, "day": day, "error": str(exc)}
+
+
+def _schedule_x_daily_post_after_batch(day: str, entries: list[dict[str, Any]]) -> None:
+    """Fire-and-forget X post when a daily batch is saved (does not block analysis)."""
+    if not X_DAILY_POST_ENABLED:
+        return
+    asyncio.create_task(_run_x_daily_post(day, entries))
+
+
+async def _x_daily_post_scheduler_loop() -> None:
+    """
+    Backup scheduler at the same Chicago time as daily analysis.
+    Waits X_DAILY_POST_DELAY_SECONDS so Grok batch can finish, then posts from disk.
+    """
+    posted_days: set[str] = set()
+    while True:
+        try:
+            if X_DAILY_POST_ENABLED:
+                now = datetime.now(ZoneInfo(DAILY_ANALYSIS_TZ))
+                day = _chicago_day_key(now)
+                slot_key = f"{day}:{now.hour}:{now.minute}"
+                if (
+                    now.hour == DAILY_ANALYSIS_HOUR
+                    and now.minute == DAILY_ANALYSIS_MINUTE
+                    and slot_key not in posted_days
+                ):
+                    posted_days.add(slot_key)
+                    await asyncio.sleep(max(0, X_DAILY_POST_DELAY_SECONDS))
+                    await _run_x_daily_post(day)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("x_daily_post_scheduler err=%s", exc)
+        await asyncio.sleep(30)
+
+
+def _verify_cron_secret(request: Request) -> None:
+    if not X_CRON_SECRET:
+        raise HTTPException(status_code=503, detail="X_CRON_SECRET not configured.")
+    provided = (request.headers.get("X-Cron-Secret") or "").strip()
+    if not provided or not hmac.compare_digest(provided, X_CRON_SECRET):
+        raise HTTPException(status_code=403, detail="Invalid cron secret.")
+
+
+# ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
 
@@ -4941,7 +5105,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("startup | grok_model=%s configured (key present)", GROK_MODEL)
 
-    global _daily_scheduler_task
+    global _daily_scheduler_task, _x_daily_post_scheduler_task
     _init_daily_scheduler_state()
     if DAILY_ANALYSIS_ENABLED:
         logger.info(
@@ -4956,12 +5120,35 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("startup | daily_analysis disabled (DAILY_ANALYSIS_ENABLED=false)")
 
+    if X_DAILY_POST_ENABLED:
+        logger.info(
+            "startup | x_daily_post enabled coins=%s handle=%s oauth=%s delay=%ss",
+            ",".join(_X_DAILY_CONFIG.post_coins),
+            _X_DAILY_CONFIG.handle,
+            _X_DAILY_CONFIG.oauth_ready(),
+            X_DAILY_POST_DELAY_SECONDS,
+        )
+        if not _X_DAILY_CONFIG.oauth_ready():
+            logger.warning(
+                "startup | x_daily_post missing OAuth credentials: %s",
+                ", ".join(_X_DAILY_CONFIG.missing_fields()),
+            )
+        _x_daily_post_scheduler_task = asyncio.create_task(_x_daily_post_scheduler_loop())
+    else:
+        logger.info("startup | x_daily_post disabled (X_DAILY_POST_ENABLED=false)")
+
     yield
 
     if _daily_scheduler_task is not None:
         _daily_scheduler_task.cancel()
         try:
             await _daily_scheduler_task
+        except asyncio.CancelledError:
+            pass
+    if _x_daily_post_scheduler_task is not None:
+        _x_daily_post_scheduler_task.cancel()
+        try:
+            await _x_daily_post_scheduler_task
         except asyncio.CancelledError:
             pass
     logger.info("shutdown | shutting down Grok executor")
@@ -5433,6 +5620,19 @@ async def trade_setup_api_prefix(request: AnalyzeRequest, http_request: Request)
     return await _handle_analyze(request, http_request, mode_override="tradesetup")
 
 
+@app.post("/internal/cron/post_daily_x")
+@app.post("/internal/cron/post_daily_x/")
+async def cron_post_daily_x(http_request: Request) -> dict[str, Any]:
+    """
+    Optional Railway cron trigger — posts today's persisted daily analyses to X.
+    Header: X-Cron-Secret: <X_CRON_SECRET>
+    """
+    _verify_cron_secret(http_request)
+    day = _chicago_day_key()
+    result = await _run_x_daily_post(day)
+    return {"success": result.get("success", result.get("skipped", False)), "day": day, "result": result}
+
+
 @app.get("/daily_analyses")
 @app.get("/daily_analyses/")
 @app.get("/api/daily_analyses")
@@ -5634,12 +5834,13 @@ async def _handle_exchange_keys(http_request: Request) -> JSONResponse:
 
     body_keys = sorted(raw_body.keys())
     logger.info(
-        "exchange_keys_body_keys request_id=%s keys=%s risk_percent=%s exchange=%s demo=%s",
+        "exchange_keys_body_keys request_id=%s keys=%s risk_percent=%s exchange=%s demo=%s has_passphrase=%s",
         req_id,
         body_keys,
         raw_body.get("risk_percent"),
         raw_body.get("exchange"),
         raw_body.get("use_demo_mode", raw_body.get("demo_mode")),
+        bool((raw_body.get("exchange_passphrase") or raw_body.get("passphrase") or "").strip()),
     )
 
     try:
@@ -5742,6 +5943,64 @@ async def _handle_exchange_keys(http_request: Request) -> JSONResponse:
             user_id,
         )
 
+    exchange_name = (request.exchange or "blofin").strip().lower()
+    is_blofin = "blofin" in exchange_name or not request.exchange
+    prior_record = get_citadel_user_record(user_id) or {}
+    passphrase_input = (request.exchange_passphrase or "").strip()
+    effective_passphrase = passphrase_input or _resolve_blofin_passphrase(prior_record)
+
+    if is_blofin and not effective_passphrase:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": "BloFin API passphrase is required for this environment.",
+                "user_message": (
+                    "Enter your BloFin API Passphrase in Oracle Citadel Setup "
+                    "(the passphrase you chose when creating the API key)."
+                ),
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    if is_blofin:
+        verify = _blofin_verify_exchange_credentials(
+            base_url=profile.get("api_base_url") or BLOFIN_LIVE_API_BASE_URL,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            passphrase=effective_passphrase,
+            request_id=req_id,
+        )
+        if not verify.get("ok"):
+            friendly = _blofin_user_friendly_error(verify.get("code"), verify.get("msg"))
+            logger.warning(
+                "exchange_keys_blofin_verify_failed request_id=%s user_id=%s demo=%s "
+                "http=%s code=%s msg=%s",
+                req_id,
+                user_id,
+                request.use_demo_mode,
+                verify.get("http_status"),
+                verify.get("code"),
+                verify.get("msg"),
+            )
+            fail_body: dict[str, Any] = {
+                "success": False,
+                "detail": verify.get("msg") or "BloFin rejected these API credentials.",
+                "user_message": friendly,
+                "blofin_code": verify.get("code"),
+                "request_id": req_id,
+            }
+            if _blofin_is_ip_whitelist_error(verify.get("code"), verify.get("msg")):
+                egress_ip = _citadel_egress_ip_for_whitelist()
+                if egress_ip:
+                    fail_body["whitelist_ip"] = egress_ip
+            return JSONResponse(
+                status_code=400,
+                content=fail_body,
+                headers={"X-Request-ID": req_id},
+            )
+
     try:
         saved_profile = save_exchange_keys_record(
             user_id=user_id,
@@ -5751,6 +6010,7 @@ async def _handle_exchange_keys(http_request: Request) -> JSONResponse:
             risk_percent=float(request.risk_percent),
             exchange=request.exchange,
             use_demo_mode=request.use_demo_mode,
+            exchange_passphrase=passphrase_input or None,
         )
         if saved_profile.get("blofin_demo"):
             logger.info(
@@ -6210,7 +6470,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             content={
                 "success": False,
                 "detail": "BloFin API passphrase is not configured on the server.",
-                "user_message": "Server BloFin passphrase missing. Set BLOFIN_PASSPHRASE on Railway.",
+                "user_message": "Server BloFin passphrase missing. Re-save keys with your API Passphrase in Citadel Setup.",
                 "request_id": req_id,
             },
             headers={"X-Request-ID": req_id},
