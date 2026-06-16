@@ -1,4 +1,4 @@
-package com.example.on_chain_oracle_ai
+package com.onchainoracleai.app
 
 import io.flutter.embedding.android.FlutterActivity
 

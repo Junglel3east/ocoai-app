@@ -1,4 +1,3 @@
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -10,6 +9,10 @@ const String kYouTubePlaylistShortUrl = 'https://youtube.com/playlist?list=PLR5H
 const String kYouTubePlaylistAppUrl = 'vnd.youtube://playlist?list=PLR5HNGs7bPmo';
 
 const String kXHandle = '@OnChainOracleA';
+
+const String kPrivacyPolicyUrl = 'https://onchainoracleai.com/privacy';
+const String kSupportEmail = 'support@onchainoracleai.com';
+const String kSupportMailtoUrl = 'mailto:support@onchainoracleai.com';
 
 /// Opens [urls] in order — external browser / native app (YouTube, X, etc.).
 Future<bool> openSocialUrls(
@@ -47,6 +50,22 @@ Future<bool> openXProfile(BuildContext context) {
     context,
     urls: [kXProfileUrl, kXProfileTwitterFallbackUrl],
     label: 'X',
+  );
+}
+
+Future<bool> openPrivacyPolicy(BuildContext context) {
+  return openSocialUrls(
+    context,
+    urls: [kPrivacyPolicyUrl],
+    label: 'Privacy Policy',
+  );
+}
+
+Future<bool> openSupportEmail(BuildContext context) {
+  return openSocialUrls(
+    context,
+    urls: [kSupportMailtoUrl],
+    label: 'Support Email',
   );
 }
 

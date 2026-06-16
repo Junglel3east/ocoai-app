@@ -48,7 +48,7 @@ class DefaultFirebaseOptions {
     messagingSenderId: '000000000000',
     projectId: 'on-chain-oracle-ai',
     storageBucket: 'on-chain-oracle-ai.appspot.com',
-    iosBundleId: 'com.example.onChainOracleAi',
+    iosBundleId: 'com.onchainoracleai.app',
   );
 
   static const FirebaseOptions macos = FirebaseOptions(
@@ -57,6 +57,6 @@ class DefaultFirebaseOptions {
     messagingSenderId: '000000000000',
     projectId: 'on-chain-oracle-ai',
     storageBucket: 'on-chain-oracle-ai.appspot.com',
-    iosBundleId: 'com.example.onChainOracleAi',
+    iosBundleId: 'com.onchainoracleai.app',
   );
 }

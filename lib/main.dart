@@ -34,7 +34,10 @@ import 'services/oracle_desk_service.dart';
 import 'services/oracle_vision_service.dart';
 import 'services/app_api_key_service.dart';
 import 'services/auth_service.dart';
+import 'services/google_play_billing_service.dart';
 import 'services/social_links.dart';
+import 'services/x_share_service.dart';
+import 'widgets/push_to_x_button.dart';
 import 'services/user_profile_store.dart';
 import 'screens/edit_profile_screen.dart';
 import 'screens/login_screen.dart';
@@ -53,7 +56,7 @@ part 'screens/oracle_desk_screen.dart';
 
 const String kNewsApiKey = String.fromEnvironment(
   'NEWS_API_KEY',
-  defaultValue: '0164e1b479294ae581c5097fdcf0d69a',
+  defaultValue: '',
 );
 
 /// Production FastAPI backend (Railway live). Override: --dart-define=BACKEND_BASE_URL=...
@@ -1176,18 +1179,30 @@ abstract final class OracleCitadelService {
     required String userId,
     required String exchangeApiKey,
     required String exchangeApiSecret,
+    String? exchangePassphrase,
+    bool useDemoMode = false,
+    double riskPercent = 1.0,
   }) async {
     final uri = Uri.parse('$kCitadelBaseUrl/exchange_keys');
+    final payload = <String, dynamic>{
+      'user_id': userId,
+      'app_api_key': OracleCitadelStore.apiKey,
+      'api_key': exchangeApiKey,
+      'api_secret': exchangeApiSecret,
+      'use_demo_mode': useDemoMode,
+      'demo_mode': useDemoMode,
+      'risk_percent': riskPercent,
+    };
+    final passphrase = (exchangePassphrase ?? '').trim();
+    if (passphrase.isNotEmpty) {
+      payload['exchange_passphrase'] = passphrase;
+      payload['passphrase'] = passphrase;
+    }
     final response = await http
         .post(
           uri,
           headers: await _authHeaders(),
-          body: jsonEncode({
-            'user_id': userId,
-            'app_api_key': OracleCitadelStore.apiKey,
-            'api_key': exchangeApiKey,
-            'api_secret': exchangeApiSecret,
-          }),
+          body: jsonEncode(payload),
         )
         .timeout(const Duration(seconds: 30));
 
@@ -1307,7 +1322,8 @@ abstract final class OracleCitadelService {
         'MARKET order could not be sent (${response.statusCode}).';
     final whitelistIp = body['whitelist_ip']?.toString().trim();
     if (whitelistIp != null && whitelistIp.isNotEmpty) {
-      friendly = '$friendly\n\nWhitelist this IP in BloFin Demo → API Management: $whitelistIp';
+      final envLabel = OracleCitadelStore.useDemoMode ? 'BloFin Demo' : 'BloFin Live';
+      friendly = '$friendly\n\nWhitelist this IP in $envLabel → API Management: $whitelistIp';
     }
     throw OracleCitadelException(
       friendly,
@@ -1367,7 +1383,8 @@ abstract final class OracleCitadelService {
         'LIMIT order could not be sent (${response.statusCode}).';
     final whitelistIp = body['whitelist_ip']?.toString().trim();
     if (whitelistIp != null && whitelistIp.isNotEmpty) {
-      friendly = '$friendly\n\nWhitelist this IP in BloFin Demo → API Management: $whitelistIp';
+      final envLabel = OracleCitadelStore.useDemoMode ? 'BloFin Demo' : 'BloFin Live';
+      friendly = '$friendly\n\nWhitelist this IP in $envLabel → API Management: $whitelistIp';
     }
     throw OracleCitadelException(
       friendly,
@@ -4393,7 +4410,9 @@ void main() async {
   await AnalysisHistoryStore.init();
   await DailyAnalysisStore.init();
   await NotificationService.instance.initialize();
-  pingBackendHealth();
+  await GooglePlayBillingService.init();
+  await SubscriptionPlanStore.load();
+  if (kDebugMode) pingBackendHealth();
   runApp(const OnChainOracleAI());
 }
 
@@ -7079,6 +7098,16 @@ class _HomeScreenState extends State<HomeScreen> {
                   widget.onViewReport(snap);
                 },
               ),
+              if (hasReport)
+                PushToXButton(
+                  iconOnly: true,
+                  tooltip: 'Push to X',
+                  initialText: XShareService.formatAnalysisPost(
+                    coin: snap['coin']?.toString() ?? 'BTC',
+                    report: snap['report']?.toString() ?? '',
+                  ),
+                  sheetTitle: 'Share ${snap['coin']} Analysis',
+                ),
               IconButton(
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
@@ -7950,6 +7979,11 @@ class _MarketNewsFeedState extends State<_MarketNewsFeed> {
         timeAgo: _formatTimeAgo(publishedAt),
         imageUrl: imageUrl.isNotEmpty ? imageUrl : null,
         onTap: url.isNotEmpty ? () => _openArticle(url) : null,
+        onShareToX: () => XShareService.showComposeSheet(
+          context,
+          initialText: XShareService.formatNewsPost(headline: title, url: url),
+          title: 'Share headline',
+        ),
       ),
     );
   }
@@ -7971,6 +8005,7 @@ class _LiveNewsCard extends StatelessWidget {
   final String timeAgo;
   final String? imageUrl;
   final VoidCallback? onTap;
+  final VoidCallback? onShareToX;
 
   const _LiveNewsCard({
     required this.title,
@@ -7978,6 +8013,7 @@ class _LiveNewsCard extends StatelessWidget {
     required this.timeAgo,
     this.imageUrl,
     this.onTap,
+    this.onShareToX,
   });
 
   @override
@@ -8038,6 +8074,14 @@ class _LiveNewsCard extends StatelessWidget {
                     ],
                   ),
                 ),
+                if (onShareToX != null)
+                  IconButton(
+                    tooltip: 'Push to X',
+                    icon: Icon(Icons.north_east, size: 20, color: Colors.grey[400]),
+                    onPressed: onShareToX,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+                  ),
               ],
             ),
           ),
@@ -8414,22 +8458,159 @@ class SubscriptionPlanScreen extends StatefulWidget {
 
 class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
   String _currentPlan = 'Free';
+  String? _purchasingProductId;
+  bool _isRestoring = false;
 
   @override
   void initState() {
     super.initState();
-    SubscriptionPlanStore.load().then((_) {
-      if (mounted) setState(() => _currentPlan = SubscriptionPlanStore.currentPlan);
-    });
+    GooglePlayBillingService.onPurchaseEvent = _onBillingEvent;
+    _loadPlan();
   }
 
-  void _upgrade(String plan) {
-    if (plan == _currentPlan) return;
-    setState(() => _currentPlan = plan);
-    SubscriptionPlanStore.setPlan(plan);
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Upgraded to $plan — payment integration coming soon')),
-    );
+  @override
+  void dispose() {
+    if (GooglePlayBillingService.onPurchaseEvent == _onBillingEvent) {
+      GooglePlayBillingService.onPurchaseEvent = null;
+    }
+    super.dispose();
+  }
+
+  Future<void> _loadPlan() async {
+    await SubscriptionPlanStore.load();
+    if (mounted) setState(() => _currentPlan = SubscriptionPlanStore.currentPlan);
+  }
+
+  void _onBillingEvent(BillingPurchaseEvent event) {
+    if (!mounted) return;
+
+    switch (event.type) {
+      case BillingPurchaseEventType.pending:
+        setState(() => _purchasingProductId = event.productId);
+        break;
+      case BillingPurchaseEventType.success:
+        setState(() {
+          _purchasingProductId = null;
+          _isRestoring = false;
+          _currentPlan = event.plan ?? _currentPlan;
+        });
+        SubscriptionPlanStore.load().then((_) {
+          if (!mounted) return;
+          setState(() => _currentPlan = SubscriptionPlanStore.currentPlan);
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Welcome to ${event.plan}! Your subscription is active.'),
+            backgroundColor: const Color(0xFF43A047),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+        break;
+      case BillingPurchaseEventType.error:
+        setState(() {
+          _purchasingProductId = null;
+          _isRestoring = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(event.message ?? 'Purchase failed.'),
+            backgroundColor: const Color(0xFFB71C1C),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+        break;
+      case BillingPurchaseEventType.canceled:
+        setState(() {
+          _purchasingProductId = null;
+          _isRestoring = false;
+        });
+        break;
+      case BillingPurchaseEventType.restoring:
+        setState(() => _isRestoring = true);
+        break;
+      case BillingPurchaseEventType.restoreFinished:
+        setState(() => _isRestoring = false);
+        _loadPlan();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              event.restoreFound
+                  ? 'Purchases restored successfully.'
+                  : 'No active Google Play subscriptions found.',
+            ),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+        break;
+    }
+  }
+
+  Future<void> _purchasePlan(String plan) async {
+    if (plan == _currentPlan || _purchasingProductId != null || _isRestoring) return;
+
+    if (!GooglePlayBillingService.isAndroid) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Google Play subscriptions are available on Android only.'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      return;
+    }
+
+    if (!GooglePlayBillingService.isStoreAvailable) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Google Play Billing is unavailable. Check your connection and try again.'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      return;
+    }
+
+    final productId = GooglePlayBillingService.productIdForPlan(plan);
+    if (productId == null) return;
+
+    setState(() => _purchasingProductId = productId);
+    final started = await GooglePlayBillingService.purchase(productId);
+    if (!mounted) return;
+    if (!started) {
+      setState(() => _purchasingProductId = null);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not start purchase. Verify products in Google Play Console.'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
+  Future<void> _restorePurchases() async {
+    if (_purchasingProductId != null || _isRestoring) return;
+
+    if (!GooglePlayBillingService.isAndroid) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Restore purchases is available on Android only.'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      return;
+    }
+
+    await GooglePlayBillingService.restorePurchases();
+    if (!mounted) return;
+    Future.delayed(const Duration(seconds: 3), () {
+      if (!mounted || !_isRestoring) return;
+      setState(() => _isRestoring = false);
+      _loadPlan();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Restore complete. If you had a subscription, it should appear shortly.'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    });
   }
 
   @override
@@ -8491,12 +8672,19 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
                   ),
                   const SizedBox(height: 14),
                   Text(
-                    'Unlock deeper analysis, unlimited setups, Oracle Trader AI Chat, and institutional-grade tools.',
+                    'Unlock deeper analysis, unlimited setups, Oracle Trader AI Chat, and advanced trading tools.',
                     style: TextStyle(fontSize: 14, height: 1.5, color: Colors.grey[400]),
                   ),
                 ],
               ),
             ),
+          ),
+          const SizedBox(height: _AppSpacing.item),
+          Text(
+            'AI-generated analysis is for educational purposes only — not financial advice. '
+            'Subscriptions renew monthly via Google Play. Oracle Citadel is non-custodial; '
+            'you connect your own exchange API keys and are responsible for all trades.',
+            style: TextStyle(fontSize: 12, height: 1.45, color: Colors.grey[600]),
           ),
           const SizedBox(height: _AppSpacing.section),
           const _SectionHeader(title: 'Choose Your Plan'),
@@ -8534,7 +8722,9 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
             isCurrent: _currentPlan == 'Premium',
             badge: null,
             showUpgradeButton: true,
-            onUpgrade: () => _upgrade('Premium'),
+            upgradeButtonLabel: 'Go Premium',
+            isPurchasing: _purchasingProductId == GooglePlayBillingService.premiumProductId,
+            onUpgrade: () => _purchasePlan('Premium'),
           ),
           _PricingTierCard(
             name: 'Expert',
@@ -8553,13 +8743,41 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
             isCurrent: _currentPlan == 'Expert',
             badge: 'MOST POPULAR',
             showUpgradeButton: true,
-            onUpgrade: () => _upgrade('Expert'),
+            upgradeButtonLabel: 'Go Expert',
+            isPurchasing: _purchasingProductId == GooglePlayBillingService.expertProductId,
+            onUpgrade: () => _purchasePlan('Expert'),
           ),
           const SizedBox(height: 8),
           Center(
+            child: TextButton.icon(
+              onPressed: (_purchasingProductId != null || _isRestoring) ? null : _restorePurchases,
+              icon: _isRestoring
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00BFFF)),
+                    )
+                  : const Icon(Icons.restore_rounded, size: 18, color: Color(0xFF00BFFF)),
+              label: Text(
+                _isRestoring ? 'Restoring…' : 'Restore Purchases',
+                style: const TextStyle(color: Color(0xFF00BFFF), fontWeight: FontWeight.w600),
+              ),
+            ),
+          ),
+          Center(
             child: Text(
-              'Cancel anytime · Secure checkout coming soon',
+              'Cancel anytime · Billed through Google Play',
               style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Center(
+            child: TextButton(
+              onPressed: () => openPrivacyPolicy(context),
+              child: const Text(
+                'Privacy Policy',
+                style: TextStyle(color: Color(0xFF00BFFF), fontSize: 12),
+              ),
             ),
           ),
         ],
@@ -8579,6 +8797,8 @@ class _PricingTierCard extends StatelessWidget {
   final bool isCurrent;
   final String? badge;
   final bool showUpgradeButton;
+  final String? upgradeButtonLabel;
+  final bool isPurchasing;
   final VoidCallback onUpgrade;
 
   const _PricingTierCard({
@@ -8592,6 +8812,8 @@ class _PricingTierCard extends StatelessWidget {
     required this.isCurrent,
     required this.badge,
     required this.showUpgradeButton,
+    this.upgradeButtonLabel,
+    this.isPurchasing = false,
     required this.onUpgrade,
   });
 
@@ -8732,9 +8954,9 @@ class _PricingTierCard extends StatelessWidget {
                 SizedBox(
                   width: double.infinity,
                   child: _ScaleTap(
-                    onTap: isCurrent ? null : onUpgrade,
+                    onTap: (isCurrent || isPurchasing) ? null : onUpgrade,
                     child: ElevatedButton(
-                      onPressed: isCurrent ? null : onUpgrade,
+                      onPressed: (isCurrent || isPurchasing) ? null : onUpgrade,
                       style: ElevatedButton.styleFrom(
                         backgroundColor: isCurrent ? Colors.grey[800] : accentColor,
                         foregroundColor: isCurrent ? Colors.grey[500] : Colors.black,
@@ -8742,10 +8964,21 @@ class _PricingTierCard extends StatelessWidget {
                         minimumSize: const Size.fromHeight(50),
                         elevation: isCurrent ? 0 : 2,
                       ),
-                      child: Text(
-                        isCurrent ? 'Current Plan' : 'Upgrade to $name',
-                        style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
-                      ),
+                      child: isPurchasing
+                          ? const SizedBox(
+                              width: 22,
+                              height: 22,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2.5,
+                                color: Colors.black,
+                              ),
+                            )
+                          : Text(
+                              isCurrent
+                                  ? 'Current Plan'
+                                  : (upgradeButtonLabel ?? 'Upgrade to $name'),
+                              style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
+                            ),
                     ),
                   ),
                 ),
@@ -8920,8 +9153,9 @@ class PrivacySecurityScreen extends StatelessWidget {
                   ),
                   const SizedBox(height: 12),
                   Text(
-                    'On-Chain Oracle AI processes market data and your analysis requests to generate reports. '
-                    'We do not sell your personal information to third parties.',
+                    'On-Chain Oracle AI respects your privacy. We do not collect or store your exchange API '
+                    'secrets, wallet addresses, or trading balances. We only collect anonymous usage analytics. '
+                    'Subscriptions are handled by Google Play. We do not sell or share personal data.',
                     style: TextStyle(fontSize: 14, height: 1.55, color: Colors.grey[400]),
                   ),
                 ],
@@ -8931,13 +9165,14 @@ class PrivacySecurityScreen extends StatelessWidget {
           const SizedBox(height: _AppSpacing.item),
           _PrivacySection(
             title: 'Data Collection',
-            body: 'We collect usage analytics and coin symbols you analyze to improve AI accuracy. '
-                'Trade setup history is stored locally on your device.',
+            body: 'Anonymous usage analytics only. Trade setup and analysis history are stored locally '
+                'on your device. Exchange API keys for Oracle Citadel are encrypted server-side; '
+                'we never store wallet addresses or balances.',
           ),
           _PrivacySection(
-            title: 'Account Security',
-            body: 'Enable two-factor authentication when available. Never share your API keys or '
-                'account credentials with anyone.',
+            title: 'Subscriptions',
+            body: 'Premium and Expert plans are billed through Google Play (\$39/mo and \$79/mo). '
+                'Manage or cancel subscriptions in your Google Play account settings.',
           ),
           _PrivacySection(
             title: 'Third-Party Services',
@@ -8949,21 +9184,13 @@ class PrivacySecurityScreen extends StatelessWidget {
             icon: Icons.policy_outlined,
             title: 'Privacy Policy',
             subtitle: 'Read our full privacy policy',
-            onTap: () {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Privacy Policy — coming soon')),
-              );
-            },
+            onTap: () => openPrivacyPolicy(context),
           ),
           _ProfileMenuTile(
             icon: Icons.delete_outline,
             title: 'Delete Account',
             subtitle: 'Permanently remove your data',
-            onTap: () {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Account deletion — contact support')),
-              );
-            },
+            onTap: () => openSupportEmail(context),
           ),
         ],
       ),
@@ -9046,13 +9273,9 @@ class HelpSupportScreen extends StatelessWidget {
                 child: const Icon(Icons.mail_outline, color: Color(0xFF00BFFF)),
               ),
               title: const Text('Contact Support', style: TextStyle(fontWeight: FontWeight.w600)),
-              subtitle: Text('support@onchainoracle.ai', style: TextStyle(fontSize: 13, color: Colors.grey[500])),
+              subtitle: Text(kSupportEmail, style: TextStyle(fontSize: 13, color: Colors.grey[500])),
               trailing: Icon(Icons.open_in_new, size: 18, color: Colors.grey[600]),
-              onTap: () {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Opening email client — coming soon')),
-                );
-              },
+              onTap: () => openSupportEmail(context),
             ),
           ),
           const SizedBox(height: _AppSpacing.section),
@@ -9161,11 +9384,19 @@ class AboutScreen extends StatelessWidget {
             child: Padding(
               padding: const EdgeInsets.all(_AppSpacing.card),
               child: Text(
-                'On-Chain Oracle AI delivers institutional-grade crypto market analysis and trade setups '
-                'powered by AI. Charts, watchlists, alerts, and portfolio tools — all in one professional app.',
+                'On-Chain Oracle AI delivers AI-powered crypto market analysis and trade setups for '
+                'educational purposes. Charts, watchlists, Oracle Vision, and performance tracking — '
+                'all in one app.\n\n$kReportDisclaimer',
                 style: TextStyle(fontSize: 14, height: 1.55, color: Colors.grey[400]),
               ),
             ),
+          ),
+          const SizedBox(height: _AppSpacing.item),
+          _ProfileMenuTile(
+            icon: Icons.policy_outlined,
+            title: 'Privacy Policy',
+            subtitle: kPrivacyPolicyUrl,
+            onTap: () => openPrivacyPolicy(context),
           ),
           const SizedBox(height: _AppSpacing.section),
           Center(
@@ -9288,7 +9519,24 @@ class _AnalysisReportScreenState extends State<AnalysisReportScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text(resolvedCoin)),
+      appBar: AppBar(
+        title: Text(resolvedCoin),
+        actions: [
+          if (!loading && errorMessage == null)
+            IconButton(
+              tooltip: 'Push to X',
+              icon: const Icon(Icons.north_east),
+              onPressed: () => XShareService.showComposeSheet(
+                context,
+                initialText: XShareService.formatAnalysisPost(
+                  coin: resolvedCoin,
+                  report: report,
+                ),
+                title: 'Share $resolvedCoin Analysis',
+              ),
+            ),
+        ],
+      ),
       floatingActionButton: loading || errorMessage != null
           ? null
           : CompactChatFab(
@@ -9335,6 +9583,14 @@ class _AnalysisReportScreenState extends State<AnalysisReportScreen> {
                   const SizedBox(height: _AppSpacing.section),
                   Text(report, style: const TextStyle(fontSize: 16, height: 1.65)),
                   const SizedBox(height: _AppSpacing.section),
+                  PushToXButton(
+                    initialText: XShareService.formatAnalysisPost(
+                      coin: resolvedCoin,
+                      report: report,
+                    ),
+                    sheetTitle: 'Share $resolvedCoin Analysis',
+                  ),
+                  const SizedBox(height: _AppSpacing.item),
                   SendToCitadelButton(
                     coin: resolvedCoin,
                     directionLabel: 'Smart Direction',

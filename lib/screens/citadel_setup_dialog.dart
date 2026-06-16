@@ -59,6 +59,7 @@ Future<void> _citadelLinkExchangeKeys({
   required String userId,
   required String exchangeApiKey,
   required String exchangeApiSecret,
+  required String exchangePassphrase,
   required String exchange,
   required bool useDemoMode,
   required double riskPercent,
@@ -73,6 +74,8 @@ Future<void> _citadelLinkExchangeKeys({
           'app_api_key': OracleCitadelStore.apiKey,
           'api_key': exchangeApiKey,
           'api_secret': exchangeApiSecret,
+          'exchange_passphrase': exchangePassphrase,
+          'passphrase': exchangePassphrase,
           'exchange': exchange,
           'use_demo_mode': useDemoMode,
           'demo_mode': useDemoMode,
@@ -168,8 +171,9 @@ void _showCitadelSetupGuideSheet(BuildContext context) {
                     'For LIVE: use BloFin live API keys with Demo Mode OFF (default).',
                     'For testing only: enable Use Demo/Testnet Mode and use BloFin Demo API keys.',
                     'API Management → Create key → Trade permissions only; disable Withdrawals.',
+                    'Set the API Passphrase when creating the key — you must enter the same passphrase in Citadel Setup.',
                     'Whitelist Railway/server IP if prompted (see BloFin API docs).',
-                    'Copy API Key and Secret immediately; paste into Oracle Citadel Setup.',
+                    'Copy API Key and Secret immediately; paste Key, Secret, and Passphrase into Oracle Citadel Setup.',
                   ],
                 ),
                 const SizedBox(height: 8),
@@ -970,6 +974,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
   late final TextEditingController _userIdController;
   late final TextEditingController _exchangeKeyController;
   late final TextEditingController _exchangeSecretController;
+  late final TextEditingController _exchangePassphraseController;
   late final TextEditingController _riskController;
 
   bool _saving = false;
@@ -989,6 +994,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
     _userIdController = TextEditingController(text: OracleCitadelStore.userId);
     _exchangeKeyController = TextEditingController();
     _exchangeSecretController = TextEditingController();
+    _exchangePassphraseController = TextEditingController();
     _riskController = TextEditingController(
       text: OracleCitadelStore.defaultRiskPercent.toString(),
     );
@@ -1085,6 +1091,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
     _userIdController.dispose();
     _exchangeKeyController.dispose();
     _exchangeSecretController.dispose();
+    _exchangePassphraseController.dispose();
     _riskController.dispose();
     super.dispose();
   }
@@ -1134,6 +1141,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
 
       final exchangeKey = _exchangeKeyController.text.trim();
       final exchangeSecret = _exchangeSecretController.text.trim();
+      final exchangePassphrase = _exchangePassphraseController.text.trim();
       if (_looksLikeDemoExchangeKeys()) {
         if (!_useDemoMode) {
           setState(() => _useDemoMode = true);
@@ -1142,12 +1150,18 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
         await _persistCitadelUiPrefs();
       }
       if (exchangeKey.isNotEmpty && exchangeSecret.isNotEmpty) {
+        if (exchangePassphrase.isEmpty) {
+          throw OracleCitadelException(
+            'BloFin API Passphrase is required. Enter the passphrase you set when creating your API key.',
+          );
+        }
         await _persistCitadelUiPrefs();
         if (!mounted) return;
         await _citadelLinkExchangeKeys(
           userId: OracleCitadelStore.userId,
           exchangeApiKey: exchangeKey,
           exchangeApiSecret: exchangeSecret,
+          exchangePassphrase: exchangePassphrase,
           exchange: _kCitadelBlofinExchangeId,
           useDemoMode: _useDemoMode,
           riskPercent: risk,
@@ -1175,7 +1189,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
       final serverOk = await OracleCitadelService.verifyServerLinked();
       if (!serverOk) {
         throw OracleCitadelException(
-          'BloFin API Key and Secret are required on the server. '
+          'BloFin API Key, Secret, and Passphrase are required on the server. '
           'Enter them below and tap Save & Connect.',
         );
       }
@@ -1313,6 +1327,21 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                         controller: _exchangeSecretController,
                         obscure: true,
                         enabled: !_saving,
+                      ),
+                      const SizedBox(height: 12),
+                      _CitadelSetupField(
+                        label: 'BloFin API Passphrase',
+                        controller: _exchangePassphraseController,
+                        obscure: true,
+                        enabled: !_saving,
+                      ),
+                      const SizedBox(height: 6),
+                      Padding(
+                        padding: const EdgeInsets.only(left: 2, right: 2),
+                        child: Text(
+                          'Required for BloFin live and demo. Use the passphrase from API key creation — each key has its own.',
+                          style: TextStyle(fontSize: 11.5, color: Colors.grey[600], height: 1.35),
+                        ),
                       ),
                       const SizedBox(height: 12),
                       _CitadelSetupField(
