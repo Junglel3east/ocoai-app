@@ -1,1 +1,1 @@
-Internal Testing 1.0.1 — Push to X on analyses and news, BloFin live+demo passphrase fix, Citadel polish, Play billing scaffolding.
+Internal Testing 1.0.2 — Live BloFin passphrase fix (Railway live/demo env), X daily posting, Citadel stability.

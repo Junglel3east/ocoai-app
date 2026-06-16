@@ -169,8 +169,29 @@ BLOFIN_POST_ORDER_CONFIRM_DELAY_SEC = 1.5
 # MARKET fill confirmation — poll order-detail after placement (fills can lag API orderId).
 BLOFIN_MARKET_FILL_CONFIRM_MAX_POLLS = 5
 BLOFIN_MARKET_FILL_CONFIRM_POLL_SEC = 0.6
-# Passphrase is required by BloFin REST auth; set on Railway or save per-user later.
+# Passphrase env fallbacks — per-user encrypted passphrase in Citadel store takes priority.
+# Railway: BLOFIN_PASSPHRASE (demo) + Blofin_Passpharse_live or BLOFIN_PASSPHRASE_LIVE (live).
 BLOFIN_PASSPHRASE = (os.getenv("BLOFIN_PASSPHRASE") or os.getenv("CITADEL_BLOFIN_PASSPHRASE") or "").strip()
+
+
+def _blofin_env_passphrase(use_demo: bool) -> str:
+    """Server-side passphrase fallback when user did not save one in Citadel Setup."""
+    if use_demo:
+        return (
+            (os.getenv("BLOFIN_PASSPHRASE_DEMO") or "").strip()
+            or BLOFIN_PASSPHRASE
+        )
+    live_candidates = [
+        os.getenv("BLOFIN_PASSPHRASE_LIVE"),
+        os.getenv("Blofin_Passpharse_live"),  # common Railway typo
+        os.getenv("Blofin_Passphrase_live"),
+        os.getenv("BLOFIN_LIVE_PASSPHRASE"),
+        BLOFIN_PASSPHRASE,
+    ]
+    for raw in live_candidates:
+        if raw and str(raw).strip():
+            return str(raw).strip()
+    return ""
 
 MIN_RR_TP1 = 2.1
 TARGET_RR_TP1 = 2.3
@@ -3223,14 +3244,20 @@ def _blofin_place_tpsl_take_profit(
     return result
 
 
-def _resolve_blofin_passphrase(record: dict[str, Any]) -> str:
-    """Passphrase for BloFin headers — per-user encrypted value or env fallback (never logged)."""
+def _resolve_blofin_passphrase(
+    record: dict[str, Any],
+    *,
+    use_demo: Optional[bool] = None,
+) -> str:
+    """Passphrase for BloFin headers — per-user encrypted value, then live/demo env (never logged)."""
     enc = (record.get("exchange_passphrase_encrypted") or "").strip()
     if enc:
         decrypted = decrypt_secret_at_rest(enc)
         if decrypted:
             return decrypted.strip()
-    return BLOFIN_PASSPHRASE
+
+    is_demo = use_demo if use_demo is not None else _record_prefers_blofin_demo(record)
+    return _blofin_env_passphrase(is_demo)
 
 
 def _blofin_verify_exchange_credentials(
@@ -3563,14 +3590,21 @@ def _citadel_resolve_blofin_session(
             },
             headers={"X-Request-ID": req_id},
         )
-    passphrase = _resolve_blofin_passphrase(record)
+    passphrase = _resolve_blofin_passphrase(
+        record,
+        use_demo=_record_prefers_blofin_demo(record),
+    )
     if not passphrase:
         return None, JSONResponse(
             status_code=500,
             content={
                 "success": False,
                 "detail": "BloFin passphrase not configured.",
-                "user_message": "Server BloFin passphrase missing. Re-save keys with your API Passphrase in Citadel Setup.",
+                "user_message": (
+                    "BloFin passphrase missing for this environment. "
+                    "Re-save keys with passphrase in Citadel Setup, or set BLOFIN_PASSPHRASE_LIVE / "
+                    "Blofin_Passpharse_live on Railway for live."
+                ),
                 "request_id": req_id,
             },
             headers={"X-Request-ID": req_id},
@@ -5105,6 +5139,13 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("startup | grok_model=%s configured (key present)", GROK_MODEL)
 
+    logger.info(
+        "startup | citadel_encryption=%s blofin_passphrase_demo=%s blofin_passphrase_live=%s",
+        bool(CITADEL_ENCRYPTION_KEY),
+        bool(_blofin_env_passphrase(True)),
+        bool(_blofin_env_passphrase(False)),
+    )
+
     global _daily_scheduler_task, _x_daily_post_scheduler_task
     _init_daily_scheduler_state()
     if DAILY_ANALYSIS_ENABLED:
@@ -5947,7 +5988,10 @@ async def _handle_exchange_keys(http_request: Request) -> JSONResponse:
     is_blofin = "blofin" in exchange_name or not request.exchange
     prior_record = get_citadel_user_record(user_id) or {}
     passphrase_input = (request.exchange_passphrase or "").strip()
-    effective_passphrase = passphrase_input or _resolve_blofin_passphrase(prior_record)
+    effective_passphrase = passphrase_input or _resolve_blofin_passphrase(
+        prior_record,
+        use_demo=request.use_demo_mode,
+    )
 
     if is_blofin and not effective_passphrase:
         return JSONResponse(
@@ -6458,19 +6502,27 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             headers={"X-Request-ID": req_id},
         )
 
-    passphrase = _resolve_blofin_passphrase(record)
+    passphrase = _resolve_blofin_passphrase(
+        record,
+        use_demo=bool(blofin_profile.get("use_demo_mode")),
+    )
     if not passphrase:
+        env_hint = (
+            "Set BLOFIN_PASSPHRASE on Railway for demo, or BLOFIN_PASSPHRASE_LIVE / "
+            "Blofin_Passpharse_live for live — or enter passphrase in Citadel Setup."
+        )
         logger.error(
-            "execute_trade_blofin_passphrase_missing request_id=%s user_id=%s",
+            "execute_trade_blofin_passphrase_missing request_id=%s user_id=%s environment=%s",
             req_id,
             user_id,
+            environment,
         )
         return JSONResponse(
             status_code=500,
             content={
                 "success": False,
                 "detail": "BloFin API passphrase is not configured on the server.",
-                "user_message": "Server BloFin passphrase missing. Re-save keys with your API Passphrase in Citadel Setup.",
+                "user_message": f"BloFin passphrase missing ({environment}). {env_hint}",
                 "request_id": req_id,
             },
             headers={"X-Request-ID": req_id},

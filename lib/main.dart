@@ -8272,7 +8272,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   _ProfileMenuTile(
                     icon: Icons.info_outline,
                     title: 'About',
-                    subtitle: 'On-Chain Oracle AI v1.0.1',
+                    subtitle: 'On-Chain Oracle AI v1.0.2',
                     onTap: () => _open(context, const AboutScreen()),
                   ),
                 ],
@@ -9315,8 +9315,8 @@ class HelpSupportScreen extends StatelessWidget {
 class AboutScreen extends StatelessWidget {
   const AboutScreen({super.key});
 
-  static const _appVersion = '1.0.1';
-  static const _buildNumber = '2';
+  static const _appVersion = '1.0.2';
+  static const _buildNumber = '3';
 
   @override
   Widget build(BuildContext context) {
