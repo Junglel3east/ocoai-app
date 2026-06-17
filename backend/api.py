@@ -81,6 +81,9 @@ if _env_file.is_file():
 if _root_env.is_file():
     load_dotenv(_root_env)
 
+# Dedicated CoinGecko Pro service (imported after load_dotenv so env is resolved).
+import coingecko_service as cg
+
 # Required on Railway: Variables → GROK_API_KEY
 GROK_API_KEY = (os.getenv("GROK_API_KEY") or "").strip()
 GROK_MODEL = os.getenv("GROK_MODEL", "grok-4")
@@ -494,59 +497,44 @@ def normalize_analyze_mode(raw: Optional[str], *, default: str = "analysis") -> 
 
 
 def _coingecko_api_base() -> str:
-    return COINGECKO_PRO_API_BASE if COINGECKO_PRO_API_KEY else COINGECKO_PUBLIC_API_BASE
+    return cg.api_base()
 
 
 def _coingecko_request_headers(*, no_cache: bool = False) -> dict[str, str]:
-    headers: dict[str, str] = {"Accept": "application/json"}
-    if COINGECKO_PRO_API_KEY:
-        headers["x-cg-pro-api-key"] = COINGECKO_PRO_API_KEY
-    if no_cache:
-        headers.update(
-            {
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0",
-            }
-        )
-    return headers
+    return cg.build_headers(no_cache=no_cache)
 
 
 def refresh_coingecko_symbol_index(force: bool = False) -> None:
     global _COINGECKO_CACHE_LOADED_AT
 
     now = time.time()
-    # Symbol→id mapping only (not prices) — forced refresh capped at 1/min so the
-    # Home 7s live-price polling never hammers CoinGecko with 500-row index pulls.
+    # Symbol→id mapping — forced refresh capped at 1/min so the Home 7s
+    # live-price polling never hammers CoinGecko with 500-row index pulls.
     min_age = 60.0 if force else _COINGECKO_CACHE_TTL_SECONDS
     if (now - _COINGECKO_CACHE_LOADED_AT) < min_age:
         return
 
     try:
-        cg_base = _coingecko_api_base()
+        primed = 0
         for page in (1, 2):
-            response = requests.get(
-                f"{cg_base}/coins/markets",
-                params={
-                    "vs_currency": "usd",
-                    "order": "market_cap_desc",
-                    "per_page": 250,
-                    "page": page,
-                    "sparkline": "false",
-                },
-                headers=_coingecko_request_headers(),
-                timeout=REQUEST_TIMEOUT,
-            )
-            if response.status_code != 200:
-                logger.warning("CoinGecko markets page %d HTTP %s", page, response.status_code)
+            rows = cg.fetch_market_data(page=page, per_page=250)
+            if not rows:
                 break
-            for coin in response.json():
+            for coin in rows:
                 symbol = str(coin.get("symbol", "")).upper()
                 coin_id = coin.get("id")
                 if symbol and coin_id and symbol not in _SYMBOL_TO_COINGECKO_ID:
                     _SYMBOL_TO_COINGECKO_ID[symbol] = coin_id
+            # Reuse the rich rows we already paid for: warm the live-price cache
+            # so top-market lookups need no extra per-coin calls.
+            primed += cg.prime_price_cache(rows)
         _COINGECKO_CACHE_LOADED_AT = now
-        logger.info("CoinGecko index refreshed | symbols=%d", len(_SYMBOL_TO_COINGECKO_ID))
+        logger.info(
+            "CoinGecko index refreshed | symbols=%d primed=%d usage=%s",
+            len(_SYMBOL_TO_COINGECKO_ID),
+            primed,
+            cg.usage_stats().get("by_endpoint", {}),
+        )
     except Exception as exc:
         logger.warning("CoinGecko index refresh failed: %s", exc)
 
@@ -559,16 +547,7 @@ def resolve_coingecko_id(symbol: str) -> Optional[str]:
         return _SYMBOL_TO_COINGECKO_ID[upper]
 
     try:
-        response = requests.get(
-            f"{_coingecko_api_base()}/search",
-            params={"query": upper},
-            headers=_coingecko_request_headers(),
-            timeout=REQUEST_TIMEOUT,
-        )
-        if response.status_code != 200:
-            return None
-
-        coins = response.json().get("coins", [])
+        coins = cg.search(upper)
         for coin in coins:
             if str(coin.get("symbol", "")).upper() == upper:
                 coin_id = coin.get("id")
@@ -814,7 +793,9 @@ def format_live_price_banner(market: dict[str, Any]) -> str:
 
     if source == "coingecko_pro":
         vol = _compact_usd_label(market.get("volume_24h_usd"))
-        return f"LIVE PRICE from CoinGecko Pro: {price} | 24h {change:+.2f}% | CEX Volume: {vol}"
+        ch1h = market.get("change_1h_pct")
+        h1 = f" | 1h {float(ch1h):+.2f}%" if ch1h is not None else ""
+        return f"LIVE PRICE from CoinGecko Pro: {price}{h1} | 24h {change:+.2f}% | CEX Volume: {vol}"
 
     if source == "coingecko":
         vol = _compact_usd_label(market.get("volume_24h_usd"))
@@ -844,9 +825,43 @@ def format_coingecko_pro_prompt_block(market: dict[str, Any]) -> str:
     lines = [
         f"═══ {label} LIVE CEX REFERENCE — RELIABLE SPOT/PERP ANCHOR ═══",
         f"CEX 24h volume: {_compact_usd_label(vol)} | Use for CEX-led flow read when Mobula absent.",
-        "MANDATORY: Weight CEX volume + Binance derivatives (funding/OI/L-S/liqs) in **Liquidity & Sentiment**.",
-        "Do NOT invent DEX pool depth — state CEX-led flow explicitly when on-chain data is missing.",
     ]
+
+    # Multi-timeframe momentum (Pro /coins/markets) — sharper trend/MTF context.
+    momentum_bits: list[str] = []
+    for tf_label, tf_key in (
+        ("1h", "change_1h_pct"),
+        ("24h", "change_24h_pct"),
+        ("7d", "change_7d_pct"),
+        ("30d", "change_30d_pct"),
+    ):
+        val = market.get(tf_key)
+        if val is not None:
+            momentum_bits.append(f"{tf_label} {float(val):+.2f}%")
+    if momentum_bits:
+        lines.append(
+            "Momentum (price change): " + " | ".join(momentum_bits)
+            + " — align bias with multi-timeframe trend, flag divergences."
+        )
+
+    hi = market.get("high_24h")
+    lo = market.get("low_24h")
+    if hi and lo:
+        lines.append(
+            f"24h range: {format_usd(float(lo))} – {format_usd(float(hi))} "
+            "— use for intraday support/resistance and stop placement context."
+        )
+
+    mcap = market.get("market_cap_usd")
+    if mcap:
+        lines.append(f"Market cap: {_compact_usd_label(mcap)} (liquidity/size context).")
+
+    lines.extend(
+        [
+            "MANDATORY: Weight CEX volume + Binance derivatives (funding/OI/L-S/liqs) in **Liquidity & Sentiment**.",
+            "Do NOT invent DEX pool depth — state CEX-led flow explicitly when on-chain data is missing.",
+        ]
+    )
     return "\n".join(lines) + "\n\n"
 
 
@@ -911,45 +926,19 @@ def fetch_coingecko_market(
     symbol: str,
     *,
     no_cache: bool = False,
-    cache_bust_ms: Optional[int] = None,
+    cache_bust_ms: Optional[int] = None,  # retained for call-site compatibility
 ) -> Optional[dict[str, Any]]:
+    """Single-coin market dict via the CoinGecko service.
+
+    On Pro this uses /coins/markets (rich: price, 1h/24h/7d/30d momentum, volume,
+    market cap, 24h hi/lo) with a /simple/price fallback. Returns the legacy keys
+    plus the richer fields for AI context.
+    """
     coin_id = resolve_coingecko_id(symbol)
     if not coin_id:
         return None
-
     try:
-        # Aggressive cache-bust: headers + unique query param per request (proxies/CDNs)
-        params: dict[str, str] = {
-            "ids": coin_id,
-            "vs_currencies": "usd",
-            "include_24hr_change": "true",
-            "include_24hr_vol": "true",
-        }
-        if no_cache:
-            params["_"] = str(cache_bust_ms or int(time.time() * 1000))
-
-        response = requests.get(
-            f"{_coingecko_api_base()}/simple/price",
-            params=params,
-            headers=_coingecko_request_headers(no_cache=no_cache),
-            timeout=REQUEST_TIMEOUT,
-        )
-        if response.status_code != 200:
-            return None
-
-        payload = response.json().get(coin_id, {})
-        price = float(payload.get("usd", 0))
-        if price <= 0:
-            return None
-
-        cg_source = "coingecko_pro" if COINGECKO_PRO_API_KEY else "coingecko"
-        return {
-            "price": price,
-            "change_24h_pct": float(payload.get("usd_24h_change") or 0),
-            "volume_24h_usd": float(payload.get("usd_24h_vol") or 0),
-            "source": cg_source,
-            "coin_id": coin_id,
-        }
+        return cg.fetch_price(coin_id, no_cache=no_cache)
     except Exception as exc:
         logger.debug("CoinGecko price miss symbol=%s err=%s", symbol, exc)
         return None
@@ -960,14 +949,10 @@ def fetch_coingecko_market_aggressive(symbol: str) -> Optional[dict[str, Any]]:
     Two back-to-back cache-busted CoinGecko pulls; returns the latest successful tick.
     Called immediately before Grok (analysis + trade setup) — not cached from earlier requests.
     """
-    upper = symbol.upper()
-    last: Optional[dict[str, Any]] = None
-    base_ms = int(time.time() * 1000)
-    for attempt in range(2):
-        snap = fetch_coingecko_market(upper, no_cache=True, cache_bust_ms=base_ms + attempt)
-        if snap:
-            last = snap
-    return last
+    coin_id = resolve_coingecko_id(symbol.upper())
+    if not coin_id:
+        return None
+    return cg.fetch_price_aggressive(coin_id, attempts=2)
 
 
 def _citadel_blofin_linked_record(user_id: Optional[str]) -> Optional[dict[str, Any]]:
@@ -3704,11 +3689,28 @@ def _blofin_user_friendly_error(code: Any, msg: Optional[str]) -> str:
             "Insufficient margin on BloFin for this position size. "
             "Lower position size % or leverage and try again."
         )
+    if code_str in ("152011", "152012", "152013") or "brokerid" in lower.replace(" ", ""):
+        return (
+            "Your BloFin API key is linked to a broker (created via 'Connect to "
+            "Third-Party Applications'). Oracle Citadel needs a standard key. "
+            "On BloFin: delete this key, create a new 'API Key' (not the "
+            "third-party/broker option), enable 'Trade', then re-save the "
+            "Key/Secret/Passphrase in Citadel Setup."
+        )
+    if code_str == "152404":
+        return (
+            "BloFin authenticated your key but blocked the trade (code 152404). "
+            "Your live API key is missing the 'Trade' permission. On BloFin: "
+            "API Management -> edit your key -> enable Trade (Read alone is not enough), "
+            "then save the new Key/Secret/Passphrase in Citadel Setup. "
+            "Also confirm USDT-M Futures is activated on your live account."
+        )
     if "operation is not supported" in lower or "unsupported operation" in lower:
         return (
-            "BloFin rejected this order configuration. "
-            "Use MARKET for immediate entry (stop-loss is attached after fill). "
-            "Confirm Demo mode matches your API keys and you are trading USDT perpetual swaps."
+            "BloFin rejected this order (operation not supported). "
+            "Most often the API key lacks 'Trade' permission, or USDT-M Futures "
+            "is not activated on this account. Enable Trade on the key, confirm "
+            "Demo mode matches your keys, and you are trading USDT perpetual swaps."
         )
     return text or "BloFin could not place the MARKET order. Try again."
 

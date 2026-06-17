@@ -2932,12 +2932,26 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
   }
 
   String _citadelFriendlyErrorMessage(Object error) {
-    final text = error.toString();
-    if (text.contains('operation is not supported')) {
-      return 'BloFin rejected the order setup. Update the app, redeploy the backend, '
-          'then try MARKET again (stop-loss is placed after fill).';
+    // Prefer the backend's precise, actionable message when available.
+    if (error is OracleCitadelException && error.userMessage.trim().isNotEmpty) {
+      return error.userMessage;
     }
-    if (error is OracleCitadelException) return error.userMessage;
+    final text = error.toString();
+    if (text.toLowerCase().contains('brokerid') ||
+        text.contains('152011') ||
+        text.contains('152012') ||
+        text.contains('152013')) {
+      return 'Your BloFin API key is linked to a broker. Oracle Citadel needs a '
+          'standard key: on BloFin, delete this key and create a new "API Key" '
+          '(not the "Connect to Third-Party Applications" option), enable '
+          '"Trade", then re-save it in Citadel Setup.';
+    }
+    if (text.contains('152404') || text.contains('operation is not supported')) {
+      return 'BloFin authenticated your key but blocked the trade. Your live API '
+          'key needs the "Trade" permission enabled (Read alone is not enough), '
+          'and USDT-M Futures must be active on your account. Enable Trade on the '
+          'key, re-save it in Citadel Setup, then try MARKET again.';
+    }
     return 'Could not send to Citadel. Check connection and try again.';
   }
 
