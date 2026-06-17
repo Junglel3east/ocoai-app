@@ -3244,6 +3244,62 @@ def _blofin_place_tpsl_take_profit(
     return result
 
 
+def _blofin_place_tpsl_stop_loss(
+    *,
+    base_url: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    coin: str,
+    direction: str,
+    sl_price: float,
+    size: str,
+    client_order_id: Optional[str] = None,
+    request_id: str = "?",
+) -> dict[str, Any]:
+    """Reduce-only stop-loss via BloFin order-tpsl (after MARKET fill)."""
+    inst_id = _blofin_inst_id(coin)
+    body: dict[str, Any] = {
+        "instId": inst_id,
+        "marginMode": BLOFIN_MARGIN_MODE,
+        "positionSide": "net",
+        "side": _blofin_tp_close_side(direction),
+        "slTriggerPrice": str(sl_price),
+        "slOrderPrice": "-1",
+        "slTriggerPriceType": "last",
+        "size": str(size),
+        "reduceOnly": "true",
+    }
+    if client_order_id:
+        body["clientOrderId"] = client_order_id[:32]
+
+    http_status, raw_text, parsed = _blofin_private_request(
+        base_url=base_url,
+        api_key=api_key,
+        api_secret=api_secret,
+        passphrase=passphrase,
+        method="POST",
+        path=BLOFIN_TRADE_ORDER_TPSL_PATH,
+        body=body,
+        request_id=request_id,
+        log_tag="blofin_place_tpsl_sl",
+    )
+
+    if not isinstance(parsed, dict):
+        return {
+            "ok": False,
+            "http_status": http_status,
+            "code": "invalid_json",
+            "msg": "BloFin TP/SL returned non-JSON",
+            "tpsl_id": None,
+            "raw_preview": (raw_text or "")[:2000],
+        }
+
+    result = _blofin_parse_tpsl_response(parsed, http_status=http_status)
+    result["order_params"] = body
+    return result
+
+
 def _resolve_blofin_passphrase(
     record: dict[str, Any],
     *,
@@ -3647,6 +3703,12 @@ def _blofin_user_friendly_error(code: Any, msg: Optional[str]) -> str:
         return (
             "Insufficient margin on BloFin for this position size. "
             "Lower position size % or leverage and try again."
+        )
+    if "operation is not supported" in lower or "unsupported operation" in lower:
+        return (
+            "BloFin rejected this order configuration. "
+            "Use MARKET for immediate entry (stop-loss is attached after fill). "
+            "Confirm Demo mode matches your API keys and you are trading USDT perpetual swaps."
         )
     return text or "BloFin could not place the MARKET order. Try again."
 
@@ -6902,7 +6964,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
         order_type="market",
         size=order_size,
         tp1=None,
-        sl=trade.stop_loss,
+        sl=None,
         client_order_id=trade_id[:32],
         request_id=req_id,
     )
@@ -7009,7 +7071,42 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
 
         tp1_tpsl_id: Optional[str] = None
         tp2_tpsl_id: Optional[str] = None
+        sl_tpsl_id: Optional[str] = None
         tp_warnings: list[str] = []
+
+        sl_result = _blofin_place_tpsl_stop_loss(
+            base_url=api_base_url,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            passphrase=passphrase,
+            coin=trade.coin,
+            direction=trade.direction,
+            sl_price=trade.stop_loss,
+            size=position_size_str,
+            client_order_id=f"{trade_id[:28]}sl",
+            request_id=req_id,
+        )
+        sl_tpsl_id = sl_result.get("tpsl_id")
+        if sl_result.get("ok"):
+            logger.info(
+                "blofin_market_sl_tpsl_ok request_id=%s trade_id=%s tpsl_id=%s size=%s sl=%s",
+                req_id,
+                trade_id,
+                sl_tpsl_id,
+                position_size_str,
+                trade.stop_loss,
+            )
+        else:
+            tp_warnings.append(
+                f"Stop loss leg failed: {sl_result.get('msg') or 'unknown error'}"
+            )
+            logger.warning(
+                "blofin_market_sl_tpsl_failed request_id=%s trade_id=%s code=%s msg=%s",
+                req_id,
+                trade_id,
+                sl_result.get("code"),
+                sl_result.get("msg"),
+            )
 
         tp1_result = _blofin_place_tpsl_take_profit(
             base_url=api_base_url,
@@ -7097,6 +7194,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
                 "order_id": blofin_order_id,
                 "tp1_tpsl_id": tp1_tpsl_id,
                 "tp2_tpsl_id": tp2_tpsl_id,
+                "sl_tpsl_id": sl_tpsl_id,
                 "tp1_size": tp1_size,
                 "tp2_size": tp2_size,
                 "user_id": user_id,

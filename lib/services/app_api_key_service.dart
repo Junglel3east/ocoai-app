@@ -53,17 +53,40 @@ abstract final class AppApiKeyService {
 
   /// Creates or loads the App API Key, syncs SharedPreferences for Oracle Citadel.
   static Future<String> ensureKey({String? email}) async {
-    var key = await _storage.read(key: _appKeyStorageKey);
-    if (key == null || key.isEmpty) {
+    try {
+      var key = await _storage.read(key: _appKeyStorageKey);
+      if (key == null || key.isEmpty) {
+        final prefs = await SharedPreferences.getInstance();
+        key = prefs.getString(_citadelApiKeyPref);
+        if (key == null || key.isEmpty) {
+          key = _generateKey();
+        }
+        try {
+          await _storage.write(key: _appKeyStorageKey, value: key);
+        } catch (e) {
+          debugPrint('[AppApiKey] secure storage write failed, using prefs: $e');
+        }
+      }
+    } catch (e) {
+      debugPrint('[AppApiKey] secure storage read failed, using prefs: $e');
       final prefs = await SharedPreferences.getInstance();
-      key = prefs.getString(_citadelApiKeyPref);
+      var key = prefs.getString(_citadelApiKeyPref);
       if (key == null || key.isEmpty) {
         key = _generateKey();
+        await prefs.setString(_citadelApiKeyPref, key);
       }
-      await _storage.write(key: _appKeyStorageKey, value: key);
+      await _syncToCitadelPrefs(
+        (prefs.getString(_citadelUserIdPref) ?? 'demo_user').trim(),
+        key,
+      );
+      return key;
     }
 
     final prefs = await SharedPreferences.getInstance();
+    var key = await _storage.read(key: _appKeyStorageKey) ?? '';
+    if (key.isEmpty) {
+      key = prefs.getString(_citadelApiKeyPref) ?? _generateKey();
+    }
     final prefUserId = (prefs.getString(_citadelUserIdPref) ?? 'demo_user').trim();
 
     String userId;

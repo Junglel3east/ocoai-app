@@ -1,1 +1,1 @@
-Internal Testing 1.0.2 — Live BloFin passphrase fix (Railway live/demo env), X daily posting, Citadel stability.
+Internal Testing 1.0.3 — Oracle Citadel reliability: Market orders now place a two-step Stop Loss (entry, then SL via BloFin order-tpsl) on Live and Demo, plus dual TP (40%/60%). Clearer trade success/error feedback. Live BloFin passphrase handling, X daily posting (BTC/ETH/SOL/XRP), and general stability fixes.

@@ -331,8 +331,11 @@ class _EmptyPositionsCard extends StatelessWidget {
           const SizedBox(width: 12),
           Expanded(
             child: Text(
-              'No open BloFin positions — deploy from Trade Setup via Send to Citadel.',
-              style: TextStyle(fontSize: 13, height: 1.4, color: Colors.grey[500]),
+              'No open BloFin positions yet.\n'
+              '1. Trade Setup → generate a report\n'
+              '2. Scroll down → Send to Oracle Citadel\n'
+              '3. Choose MARKET or LIMIT and confirm',
+              style: TextStyle(fontSize: 13, height: 1.45, color: Colors.grey[500]),
             ),
           ),
         ],

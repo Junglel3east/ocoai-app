@@ -1019,6 +1019,97 @@ abstract final class OracleCitadelStore {
   }
 }
 
+/// Last trade setup with complete Citadel levels — survives Citadel connect on another tab.
+class CitadelPendingTrade {
+  final String coin;
+  final String directionLabel;
+  final String reportText;
+  final double entry;
+  final double stopLoss;
+  final double tp1;
+  final double tp2;
+  final DateTime savedAt;
+
+  const CitadelPendingTrade({
+    required this.coin,
+    required this.directionLabel,
+    required this.reportText,
+    required this.entry,
+    required this.stopLoss,
+    required this.tp1,
+    required this.tp2,
+    required this.savedAt,
+  });
+
+  String get direction => citadelDirectionFromSetup(directionLabel, entry, stopLoss);
+}
+
+abstract final class CitadelPendingTradeStore {
+  static const _coinKey = 'citadel_pending_coin';
+  static const _directionKey = 'citadel_pending_direction';
+  static const _reportKey = 'citadel_pending_report';
+  static const _entryKey = 'citadel_pending_entry';
+  static const _slKey = 'citadel_pending_sl';
+  static const _tp1Key = 'citadel_pending_tp1';
+  static const _tp2Key = 'citadel_pending_tp2';
+  static const _savedAtKey = 'citadel_pending_saved_at';
+
+  static Future<void> save({
+    required String coin,
+    required String directionLabel,
+    required String reportText,
+    required double entry,
+    required double stopLoss,
+    required double tp1,
+    required double tp2,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_coinKey, coin.trim().toUpperCase());
+    await prefs.setString(_directionKey, directionLabel);
+    await prefs.setString(_reportKey, reportText);
+    await prefs.setDouble(_entryKey, entry);
+    await prefs.setDouble(_slKey, stopLoss);
+    await prefs.setDouble(_tp1Key, tp1);
+    await prefs.setDouble(_tp2Key, tp2);
+    await prefs.setString(_savedAtKey, DateTime.now().toIso8601String());
+  }
+
+  static Future<CitadelPendingTrade?> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final coin = prefs.getString(_coinKey);
+    final entry = prefs.getDouble(_entryKey);
+    final sl = prefs.getDouble(_slKey);
+    final tp1 = prefs.getDouble(_tp1Key);
+    final tp2 = prefs.getDouble(_tp2Key);
+    if (coin == null || entry == null || sl == null || tp1 == null || tp2 == null) {
+      return null;
+    }
+    final savedAt = DateTime.tryParse(prefs.getString(_savedAtKey) ?? '') ?? DateTime.now();
+    return CitadelPendingTrade(
+      coin: coin,
+      directionLabel: prefs.getString(_directionKey) ?? 'Smart Direction',
+      reportText: prefs.getString(_reportKey) ?? '',
+      entry: entry,
+      stopLoss: sl,
+      tp1: tp1,
+      tp2: tp2,
+      savedAt: savedAt,
+    );
+  }
+
+  static Future<void> clear() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_coinKey);
+    await prefs.remove(_directionKey);
+    await prefs.remove(_reportKey);
+    await prefs.remove(_entryKey);
+    await prefs.remove(_slKey);
+    await prefs.remove(_tp1Key);
+    await prefs.remove(_tp2Key);
+    await prefs.remove(_savedAtKey);
+  }
+}
+
 class OracleCitadelException implements Exception {
   final String userMessage;
   final String? errorCode;
@@ -1420,14 +1511,18 @@ Future<void> _sendMarketOrder(
   required double leverage,
   required double riskPercent,
 }) async {
-  if (!context.mounted) return;
-  final rootContext = Navigator.of(context, rootNavigator: true).context;
+  final messengerContext = _citadelMessengerContext(context);
+  if (messengerContext == null) {
+    debugPrint('[Citadel] MARKET aborted — no valid ScaffoldMessenger context');
+    return;
+  }
+  final rootContext = Navigator.of(messengerContext, rootNavigator: true).context;
 
-  ScaffoldMessenger.of(context).showSnackBar(
+  ScaffoldMessenger.of(messengerContext).showSnackBar(
     SnackBar(
       content: Text('Executing MARKET ${direction.toUpperCase()} on $coin…'),
       behavior: SnackBarBehavior.floating,
-      duration: const Duration(seconds: 3),
+      duration: const Duration(seconds: 4),
     ),
   );
 
@@ -1444,6 +1539,19 @@ Future<void> _sendMarketOrder(
       leverage: leverage,
     );
 
+    await CitadelPendingTradeStore.clear();
+
+    if (messengerContext.mounted) {
+      ScaffoldMessenger.of(messengerContext).showSnackBar(
+        SnackBar(
+          content: Text('MARKET ${direction.toUpperCase()} on $coin sent to BloFin'),
+          backgroundColor: const Color(0xFF43A047),
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    }
+
     _showCitadelPostExecutionReviewDialog(
       rootContext,
       reportText: reportText,
@@ -1454,11 +1562,11 @@ Future<void> _sendMarketOrder(
       direction: direction,
     );
   } on OracleCitadelException catch (e) {
-    if (!context.mounted) return;
+    if (!messengerContext.mounted) return;
     if (e.errorCode == 'credentials_missing' || e.errorCode == 'credentials_mismatch') {
       await OracleCitadelStore.clearExchangeLinked();
     }
-    ScaffoldMessenger.of(context).showSnackBar(
+    ScaffoldMessenger.of(messengerContext).showSnackBar(
       SnackBar(
         content: Text(e.userMessage),
         backgroundColor: const Color(0xFFB71C1C),
@@ -1468,18 +1576,20 @@ Future<void> _sendMarketOrder(
             ? SnackBarAction(
                 label: 'Setup',
                 textColor: Colors.white,
-                onPressed: () => showCitadelSetupDialog(context),
+                onPressed: () => showCitadelSetupDialog(messengerContext),
               )
             : null,
       ),
     );
-  } catch (_) {
-    if (!context.mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
+  } catch (e) {
+    debugPrint('[Citadel] MARKET unexpected error: $e');
+    if (!messengerContext.mounted) return;
+    ScaffoldMessenger.of(messengerContext).showSnackBar(
       const SnackBar(
         content: Text('MARKET order failed. Check connection and try again.'),
         backgroundColor: Color(0xFFB71C1C),
         behavior: SnackBarBehavior.floating,
+        duration: Duration(seconds: 8),
       ),
     );
   }
@@ -1498,16 +1608,20 @@ Future<void> _sendLimitOrder(
   required double leverage,
   required double riskPercent,
 }) async {
-  if (!context.mounted) return;
-  final rootContext = Navigator.of(context, rootNavigator: true).context;
+  final messengerContext = _citadelMessengerContext(context);
+  if (messengerContext == null) {
+    debugPrint('[Citadel] LIMIT aborted — no valid ScaffoldMessenger context');
+    return;
+  }
+  final rootContext = Navigator.of(messengerContext, rootNavigator: true).context;
 
-  ScaffoldMessenger.of(context).showSnackBar(
+  ScaffoldMessenger.of(messengerContext).showSnackBar(
     SnackBar(
       content: Text(
         'Placing LIMIT ${direction.toUpperCase()} on $coin at ${_formatCitadelPrice(plannedEntry)}…',
       ),
       behavior: SnackBarBehavior.floating,
-      duration: const Duration(seconds: 3),
+      duration: const Duration(seconds: 4),
     ),
   );
 
@@ -1525,6 +1639,19 @@ Future<void> _sendLimitOrder(
       leverage: leverage,
     );
 
+    await CitadelPendingTradeStore.clear();
+
+    if (messengerContext.mounted) {
+      ScaffoldMessenger.of(messengerContext).showSnackBar(
+        SnackBar(
+          content: Text('LIMIT ${direction.toUpperCase()} on $coin placed on BloFin'),
+          backgroundColor: const Color(0xFF43A047),
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    }
+
     _showCitadelLimitPostPlacementDialog(
       rootContext,
       reportText: reportText,
@@ -1535,11 +1662,11 @@ Future<void> _sendLimitOrder(
       direction: direction,
     );
   } on OracleCitadelException catch (e) {
-    if (!context.mounted) return;
+    if (!messengerContext.mounted) return;
     if (e.errorCode == 'credentials_missing' || e.errorCode == 'credentials_mismatch') {
       await OracleCitadelStore.clearExchangeLinked();
     }
-    ScaffoldMessenger.of(context).showSnackBar(
+    ScaffoldMessenger.of(messengerContext).showSnackBar(
       SnackBar(
         content: Text(e.userMessage),
         backgroundColor: const Color(0xFFB71C1C),
@@ -1549,21 +1676,31 @@ Future<void> _sendLimitOrder(
             ? SnackBarAction(
                 label: 'Setup',
                 textColor: Colors.white,
-                onPressed: () => showCitadelSetupDialog(context),
+                onPressed: () => showCitadelSetupDialog(messengerContext),
               )
             : null,
       ),
     );
-  } catch (_) {
-    if (!context.mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
+  } catch (e) {
+    debugPrint('[Citadel] LIMIT unexpected error: $e');
+    if (!messengerContext.mounted) return;
+    ScaffoldMessenger.of(messengerContext).showSnackBar(
       const SnackBar(
         content: Text('LIMIT order failed. Check connection and try again.'),
         backgroundColor: Color(0xFFB71C1C),
         behavior: SnackBarBehavior.floating,
+        duration: Duration(seconds: 8),
       ),
     );
   }
+}
+
+/// Parent screen context for snackbars after the Citadel execute dialog closes.
+BuildContext? _citadelMessengerContext(BuildContext context) {
+  if (context.mounted) return context;
+  final root = Navigator.maybeOf(context, rootNavigator: true)?.context;
+  if (root != null && root.mounted) return root;
+  return null;
 }
 
 /// Oracle Citadel — MARKET or LIMIT execution choice.
@@ -1579,6 +1716,9 @@ Future<void> _showCitadelExecuteChoiceDialog(
 }) async {
   await OracleCitadelStore.load();
   if (!context.mounted) return;
+
+  // Parent screen — survives closing the execute dialog (dialog builder context is disposed on pop).
+  final hostContext = context;
 
   var leverage = OracleCitadelStore.defaultLeverage;
   var riskPercent = OracleCitadelStore.defaultRiskPercent;
@@ -1673,8 +1813,8 @@ Future<void> _showCitadelExecuteChoiceDialog(
                     await OracleCitadelStore.saveRiskPercent(selectedRisk);
                     if (!dialogContext.mounted) return;
                     Navigator.pop(dialogContext);
-                    _sendMarketOrder(
-                      context,
+                    await _sendMarketOrder(
+                      hostContext,
                       coin,
                       direction,
                       reportText: reportText,
@@ -1707,8 +1847,8 @@ Future<void> _showCitadelExecuteChoiceDialog(
                     await OracleCitadelStore.saveRiskPercent(selectedRisk);
                     if (!dialogContext.mounted) return;
                     Navigator.pop(dialogContext);
-                    _sendLimitOrder(
-                      context,
+                    await _sendLimitOrder(
+                      hostContext,
                       coin,
                       direction,
                       reportText: reportText,
@@ -2643,6 +2783,7 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
   void initState() {
     super.initState();
     _previewLevels = parseCitadelTradeLevels(widget.reportText);
+    _stashPendingTradeIfComplete();
     _loadTier();
     // Drop lingering Scaffold snackbars (e.g. prior MARKET failure) so they do not cover this screen.
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -2662,7 +2803,26 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
     if (oldWidget.reportText != widget.reportText) {
       _previewLevels = parseCitadelTradeLevels(widget.reportText);
       _sendErrorMessage = null;
+      _stashPendingTradeIfComplete();
     }
+  }
+
+  void _stashPendingTradeIfComplete() {
+    final parsed = _previewLevels ?? parseCitadelTradeLevels(widget.reportText);
+    final entry = widget.entry ?? parsed.entry;
+    final sl = widget.stopLoss ?? parsed.sl;
+    final tp1 = widget.tp1 ?? parsed.tp1;
+    final tp2 = widget.tp2 ?? parsed.tp2;
+    if (entry == null || sl == null || tp1 == null || tp2 == null) return;
+    CitadelPendingTradeStore.save(
+      coin: widget.coin,
+      directionLabel: widget.directionLabel,
+      reportText: widget.reportText,
+      entry: entry,
+      stopLoss: sl,
+      tp1: tp1,
+      tp2: tp2,
+    );
   }
 
   void _clearSendError() {
@@ -2671,6 +2831,18 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
   }
 
   Future<void> _onPressed() async {
+    try {
+      await _runCitadelSendFlow();
+    } catch (e) {
+      debugPrint('[Citadel] Send flow error: $e');
+      if (!mounted) return;
+      setState(() {
+        _sendErrorMessage = _citadelFriendlyErrorMessage(e);
+      });
+    }
+  }
+
+  Future<void> _runCitadelSendFlow() async {
     await SubscriptionPlanStore.load();
     if (!SubscriptionPlanStore.hasCitadelAccess) {
       if (mounted) showCitadelUpgradePrompt(context);
@@ -2757,6 +2929,16 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
       tp1: tp1,
       tp2: tp2,
     );
+  }
+
+  String _citadelFriendlyErrorMessage(Object error) {
+    final text = error.toString();
+    if (text.contains('operation is not supported')) {
+      return 'BloFin rejected the order setup. Update the app, redeploy the backend, '
+          'then try MARKET again (stop-loss is placed after fill).';
+    }
+    if (error is OracleCitadelException) return error.userMessage;
+    return 'Could not send to Citadel. Check connection and try again.';
   }
 
   @override
@@ -4501,6 +4683,85 @@ class _CitadelScreenState extends State<_CitadelScreen> {
 }
 
 /// Expert plan — full Citadel hub (BloFin status, leverage, setup).
+class _CitadelPendingDeployCard extends StatelessWidget {
+  final CitadelPendingTrade trade;
+  final VoidCallback onDeploy;
+  final VoidCallback onDismiss;
+
+  const _CitadelPendingDeployCard({
+    required this.trade,
+    required this.onDeploy,
+    required this.onDismiss,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final dir = trade.direction.toUpperCase();
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [
+            const Color(0xFF43A047).withValues(alpha: 0.14),
+            const Color(0xFF141414),
+          ],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0xFF43A047).withValues(alpha: 0.45)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.rocket_launch_rounded, color: Color(0xFF43A047), size: 22),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  'Trade ready to deploy',
+                  style: TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w800,
+                    color: Colors.green[100],
+                  ),
+                ),
+              ),
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                onPressed: onDismiss,
+                icon: Icon(Icons.close, color: Colors.grey[500], size: 18),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '$dir ${trade.coin} · Entry ${_formatCitadelPrice(trade.entry)} · '
+            'SL ${_formatCitadelPrice(trade.stopLoss)}',
+            style: TextStyle(fontSize: 13, height: 1.4, color: Colors.grey[400]),
+          ),
+          const SizedBox(height: 14),
+          FilledButton.icon(
+            onPressed: onDeploy,
+            icon: const Icon(Icons.bolt_rounded, size: 20),
+            label: const Text('Deploy to BloFin now'),
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFF43A047),
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Expert plan — full Citadel hub (BloFin status, leverage, setup).
 class _CitadelExpertView extends StatefulWidget {
   final bool isActive;
   final Future<void> Function() onOpenSetup;
@@ -4525,6 +4786,7 @@ class _CitadelExpertViewState extends State<_CitadelExpertView> {
   DateTime? _lastConnected;
   double _leverage = 5;
   double _riskPercent = 1;
+  CitadelPendingTrade? _pendingTrade;
 
   @override
   void initState() {
@@ -4555,6 +4817,7 @@ class _CitadelExpertViewState extends State<_CitadelExpertView> {
     } else {
       message = 'App credentials not saved — open setup to configure Citadel.';
     }
+    final pending = await CitadelPendingTradeStore.load();
     if (!mounted) return;
     setState(() {
       _serverLinked = linked;
@@ -4563,6 +4826,7 @@ class _CitadelExpertViewState extends State<_CitadelExpertView> {
       _lastConnected = iso != null ? DateTime.tryParse(iso) : null;
       _leverage = OracleCitadelStore.defaultLeverage;
       _riskPercent = OracleCitadelStore.defaultRiskPercent;
+      _pendingTrade = pending;
       _loading = false;
     });
   }
@@ -4682,6 +4946,54 @@ class _CitadelExpertViewState extends State<_CitadelExpertView> {
                   ),
                 ),
               if (!_loading && _serverLinked) ...[
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF00BFFF).withValues(alpha: 0.06),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.22)),
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Icon(Icons.info_outline_rounded, color: Color(0xFF00BFFF), size: 20),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'Connected means your BloFin keys are linked — it does not place orders by itself. '
+                          'Deploy from Trade Setup: generate a report, scroll down, tap Send to Oracle Citadel, '
+                          'then choose MARKET or LIMIT.',
+                          style: TextStyle(fontSize: 12.5, height: 1.45, color: Colors.grey[400]),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                if (_pendingTrade != null) ...[
+                  const SizedBox(height: 14),
+                  _CitadelPendingDeployCard(
+                    trade: _pendingTrade!,
+                    onDeploy: () {
+                      final pending = _pendingTrade!;
+                      _showCitadelExecuteChoiceDialog(
+                        context,
+                        reportText: pending.reportText,
+                        coin: pending.coin,
+                        direction: pending.direction,
+                        plannedEntry: pending.entry,
+                        stopLoss: pending.stopLoss,
+                        tp1: pending.tp1,
+                        tp2: pending.tp2,
+                      );
+                    },
+                    onDismiss: () async {
+                      await CitadelPendingTradeStore.clear();
+                      if (!mounted) return;
+                      setState(() => _pendingTrade = null);
+                    },
+                  ),
+                ],
                 const SizedBox(height: 20),
                 CitadelLivePositionsPanel(
                   isActive: widget.isActive,
@@ -9316,7 +9628,7 @@ class AboutScreen extends StatelessWidget {
   const AboutScreen({super.key});
 
   static const _appVersion = '1.0.2';
-  static const _buildNumber = '3';
+  static const _buildNumber = '4';
 
   @override
   Widget build(BuildContext context) {

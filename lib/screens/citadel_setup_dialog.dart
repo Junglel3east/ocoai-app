@@ -1182,7 +1182,24 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
           _connectedExchangeLabel = label;
           _lastConnectedAt = DateTime.now();
         });
+        final pending = await CitadelPendingTradeStore.load();
         _showSnackOnParent('Oracle Citadel connected successfully');
+        if (pending != null) {
+          if (!mounted) return;
+          _safePopDialog();
+          await Future<void>.delayed(const Duration(milliseconds: 400));
+          if (!widget.parentContext.mounted) return;
+          _showCitadelExecuteChoiceDialog(
+            widget.parentContext,
+            reportText: pending.reportText,
+            coin: pending.coin,
+            direction: pending.direction,
+            plannedEntry: pending.entry,
+            stopLoss: pending.stopLoss,
+            tp1: pending.tp1,
+            tp2: pending.tp2,
+          );
+        }
         return;
       }
 
@@ -1328,19 +1345,48 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                         obscure: true,
                         enabled: !_saving,
                       ),
-                      const SizedBox(height: 12),
-                      _CitadelSetupField(
-                        label: 'BloFin API Passphrase',
-                        controller: _exchangePassphraseController,
-                        obscure: true,
-                        enabled: !_saving,
-                      ),
-                      const SizedBox(height: 6),
-                      Padding(
-                        padding: const EdgeInsets.only(left: 2, right: 2),
-                        child: Text(
-                          'Required for BloFin live and demo. Use the passphrase from API key creation — each key has its own.',
-                          style: TextStyle(fontSize: 11.5, color: Colors.grey[600], height: 1.35),
+                      const SizedBox(height: 14),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFFF9800).withValues(alpha: 0.1),
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(color: const Color(0xFFFF9800).withValues(alpha: 0.45)),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            const Row(
+                              children: [
+                                Icon(Icons.key_outlined, color: Color(0xFFFF9800), size: 18),
+                                SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    'BloFin API Passphrase — required for live & demo trades',
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w700,
+                                      color: Color(0xFFFF9800),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 10),
+                            _CitadelSetupField(
+                              label: 'API Passphrase',
+                              controller: _exchangePassphraseController,
+                              obscure: true,
+                              enabled: !_saving,
+                              hintText: 'Same passphrase you set when creating the BloFin API key',
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              'Without this, live orders fail with signature errors. Each API key has its own passphrase.',
+                              style: TextStyle(fontSize: 11.5, color: Colors.grey[500], height: 1.35),
+                            ),
+                          ],
                         ),
                       ),
                       const SizedBox(height: 12),
@@ -1592,12 +1638,14 @@ class _CitadelSetupField extends StatelessWidget {
   final TextEditingController controller;
   final bool obscure;
   final bool enabled;
+  final String? hintText;
 
   const _CitadelSetupField({
     required this.label,
     required this.controller,
     this.obscure = false,
     this.enabled = true,
+    this.hintText,
   });
 
   @override
@@ -1609,6 +1657,8 @@ class _CitadelSetupField extends StatelessWidget {
       style: const TextStyle(fontSize: 14),
       decoration: InputDecoration(
         labelText: label,
+        hintText: hintText,
+        hintStyle: TextStyle(color: Colors.grey[700], fontSize: 12),
         labelStyle: TextStyle(color: Colors.grey[500], fontSize: 13),
         filled: true,
         fillColor: const Color(0xFF0A0A0A),
