@@ -4137,12 +4137,12 @@ def is_scalp_context(
 def oracle_flux_doctrine_block() -> str:
     """
     Oracle Flux + Flux Oscillator doctrine — core high-conviction framework for Grok.
-    TradingView: Oracle Flux PUB;FuZ3wAGW | Oracle Flux Oscillator PUB;JAI7kwOr
+    TradingView: Oracle Flux PUB;mQP80cUC | Oracle Flux Oscillator PUB;mUlI6Xj4
     """
     return """═══════════════════════════════════════
 ORACLE FLUX + FLUX OSCILLATOR — CORE HIGH-CONVICTION FRAMEWORK
 ═══════════════════════════════════════
-Oracle Flux (overlay, PUB;FuZ3wAGW) and Oracle Flux Oscillator (pane, PUB;JAI7kwOr) are your PRIMARY
+Oracle Flux (overlay, PUB;mQP80cUC) and Oracle Flux Oscillator (pane, PUB;mUlI6Xj4) are your PRIMARY
 confluence engine — not a garnish. Every report and trade card must read like a funded trader who runs
 Flux on every chart. When live Flux values arrive in the user prompt, cite them. When they do not, infer
 the same read from price action: Daily VWAP confluence, Fib rejections/holds, Heikin Ashi quality,
@@ -4169,7 +4169,7 @@ FLUX LEXICON (weave naturally — never dump labels):
   Reclaim + inflow + Oracle Score ramp = long bias. Reject + outflow + 0.786 Fib = short bias.
 • Heikin Ashi (Flux-integrated): clean bodies in trend direction = continuation; doji clusters at Fib/VWAP
   = indecision / reversal watch — tie to Flux Wave rollover.
-• Flux Oscillator (PUB;JAI7kwOr): pane companion — Flux Wave lines, Money Flow fill, OB/OS zones (±60/±80).
+• Flux Oscillator (PUB;mUlI6Xj4): pane companion — Flux Wave lines, Money Flow fill, OB/OS zones (±60/±80).
 • Pinch dots / rollover dots: oscillator exhaustion markers — pinch at overbought + HTF resistance =
   fade fuel; rollover at oversold + HTF support = bounce fuel. Cite when inferring exhaustion.
 • Oscillator STRONG BUY/SELL dots: LTF trigger confirmation — pair with overlay STRONG flags for A+ entries.
@@ -4343,7 +4343,7 @@ RULE 2 — GOD-MODE CONFLUENCE STACK (deep integration, zero blind spots)
 • LIQUIDATION CLUSTERS & BOOK PRESSURE: where are stops stacked, where does the cascade accelerate,
   which side of the book is thin. Liq clusters are targets AND invalidation guides — price hunts them.
 • BTC/ETH LEAD (when relevant): risk-on/off for alts, correlation breaks, HTF veto from majors.
-• ORACLE FLUX + FLUX OSCILLATOR (PUB;FuZ3wAGW / PUB;JAI7kwOr): CORE high-conviction framework — not optional
+• ORACLE FLUX + FLUX OSCILLATOR (PUB;mQP80cUC / PUB;mUlI6Xj4): CORE high-conviction framework — not optional
   garnish. Oracle Score, Conviction, Money Flow, Flux Wave, Engines, STRONG BUY/SELL, Chop Strength, Fib
   rejections (especially 0.786), VWAP confluence, pinch/rollover dots, oscillator OB/OS — weave into every
   section that benefits. Live Flux block in user prompt = cite values; no block = infer the same read from
@@ -4617,7 +4617,7 @@ REQUIRED BEHAVIOR:
 • TECHNICAL DEPTH: Daily VWAP, Previous Day VWAP, weekly/monthly VWAP, order blocks, FVGs, BOS/CHOCH,
   premium/discount, previous highs/lows, fakeouts, displacement, HTF/LTF alignment, DEX vs CEX volume delta,
   liquidation clusters, macro risk-on/off for alts.
-• ORACLE FLUX + FLUX OSCILLATOR (PUB;FuZ3wAGW / PUB;JAI7kwOr): core high-conviction framework on every
+• ORACLE FLUX + FLUX OSCILLATOR (PUB;mQP80cUC / PUB;mUlI6Xj4): core high-conviction framework on every
   chart read. Oracle Score, Conviction, Money Flow (inflow/outflow), Flux Wave, Engines, STRONG BUY/SELL,
   Chop Strength, Fib rejections (0.786 key), VWAP confluence, pinch/rollover dots, oscillator OB/OS,
   divergence. When [ORACLE FLUX] live values are in context, cite them. When not, infer the same Flux-style
@@ -4966,7 +4966,7 @@ def format_oracle_flux_prompt_block(flux: Optional[OracleFluxSnapshot]) -> str:
     if flux is None or not flux.has_signal():
         return (
             "═══ ORACLE FLUX — LIVE SNAPSHOT NOT PROVIDED (infer Flux read from structure) ═══\n"
-            "Charts run Oracle Flux PUB;FuZ3wAGW + Flux Oscillator PUB;JAI7kwOr. No live Flux payload "
+            "Charts run Oracle Flux PUB;mQP80cUC + Flux Oscillator PUB;mUlI6Xj4. No live Flux payload "
             "in this request — infer Oracle Score, Money Flow, Flux Wave, Engines, Chop, STRONG flags, "
             "Fib rejections, and VWAP confluence from price action on the requested TF. Apply full Flux "
             "doctrine below.\n\n"
@@ -4974,7 +4974,7 @@ def format_oracle_flux_prompt_block(flux: Optional[OracleFluxSnapshot]) -> str:
         )
 
     lines = [
-        "═══ ORACLE FLUX — LIVE CHART READ (PUB;FuZ3wAGW + PUB;JAI7kwOr) — CORE CONVICTION INPUT ═══",
+        "═══ ORACLE FLUX — LIVE CHART READ (PUB;mQP80cUC + PUB;mUlI6Xj4) — CORE CONVICTION INPUT ═══",
         "Treat these as authoritative Flux values. Fuse with HTF structure + derivatives; HTF veto wins on conflict.",
         "Weave into Oracle Flux Analysis, Confluence Summary, and trade trigger (e.g. \"Score 74 + 0.786 Fib "
         "rejection + Money Flow outflow + STRONG SELL → high-conviction short\").",

@@ -360,7 +360,7 @@ String buildTradeSetupTradingViewHTML(
   final sym = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
   final resolvedTvSymbol = tvSymbol ?? CoinAccessPolicy.resolveTradingViewSymbol(sym);
   final interval = tradingViewIntervalForTimeframe(timeframe);
-  // PUB scripts only work via widget `studies` at init — not via createStudy() at runtime.
+  // Public Flux scripts (PUB;mQP80cUC / PUB;mUlI6Xj4) load only via widget `studies` at init.
   final studiesBlock = includeFluxTools
       ? OracleFluxTvConfig.oracleFluxStudiesJson()
       : '';
@@ -424,7 +424,10 @@ String buildTradeSetupTradingViewHTML(
             "scales_context_menu",
             "legend_context_menu",
             "main_series_scale_menu",
-            "use_localstorage_for_settings"
+            "use_localstorage_for_settings",
+            "create_volume_indicator_by_default",
+            "create_volume_indicator_by_default_once",
+            "volume_force_overlay"
           ],
           "studies": [
             $studiesBlock
@@ -456,7 +459,7 @@ String buildTradeSetupTradingViewHTML(
     ''';
 }
 
-/// Reload chart with Oracle Flux studies (only way PUB scripts work in TV widget).
+/// Reload chart with Oracle Flux studies (PUB IDs must be in widget `studies` at init).
 Future<void> loadOracleFluxToolsOnChart(
   WebViewController controller, {
   required String symbol,
@@ -464,15 +467,15 @@ Future<void> loadOracleFluxToolsOnChart(
 }) async {
   final sym = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
   final tvSymbol = CoinAccessPolicy.resolveTradingViewSymbol(sym);
-  await controller.loadHtmlString(
-    buildTradeSetupTradingViewHTML(
-      sym,
-      tvSymbol: tvSymbol,
-      timeframe: timeframe,
-      includeFluxTools: true,
-    ),
-    baseUrl: kTradingViewChartBaseUrl,
+  final html = buildTradeSetupTradingViewHTML(
+    sym,
+    tvSymbol: tvSymbol,
+    timeframe: timeframe,
+    includeFluxTools: true,
   );
+  await controller.loadHtmlString(html, baseUrl: kTradingViewChartBaseUrl);
+  // Brief pause so WebView finishes init before success toast.
+  await Future<void>.delayed(const Duration(milliseconds: 600));
 }
 
 WebViewController createTradeSetupTradingViewController(
