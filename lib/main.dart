@@ -348,7 +348,7 @@ String tradingViewIntervalForTimeframe(String timeframe) {
 }
 
 /// Base URL so TradingView scripts load reliably inside Android/iOS WebView.
-const Uri kTradingViewChartBaseUri = Uri.parse('https://www.tradingview.com');
+const String kTradingViewChartBaseUrl = 'https://www.tradingview.com';
 
 /// Trade Setup / Analysis chart — Heikin Ashi, no auto-loaded scripts (Flux is manual via button).
 String buildTradeSetupTradingViewHTML(
@@ -471,7 +471,7 @@ Future<void> loadOracleFluxToolsOnChart(
       timeframe: timeframe,
       includeFluxTools: true,
     ),
-    baseUrl: kTradingViewChartBaseUri,
+    baseUrl: kTradingViewChartBaseUrl,
   );
 }
 
@@ -510,7 +510,7 @@ WebViewController createTradeSetupTradingViewController(
       timeframe: timeframe,
       includeFluxTools: includeFluxTools,
     ),
-    baseUrl: kTradingViewChartBaseUri,
+    baseUrl: kTradingViewChartBaseUrl,
   );
   return controller;
 }
