@@ -347,6 +347,9 @@ String tradingViewIntervalForTimeframe(String timeframe) {
   }
 }
 
+/// Base URL so TradingView scripts load reliably inside Android/iOS WebView.
+const Uri kTradingViewChartBaseUri = Uri.parse('https://www.tradingview.com');
+
 /// Trade Setup / Analysis chart — Heikin Ashi, no auto-loaded scripts (Flux is manual via button).
 String buildTradeSetupTradingViewHTML(
   String symbol, {
@@ -357,8 +360,7 @@ String buildTradeSetupTradingViewHTML(
   final sym = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
   final resolvedTvSymbol = tvSymbol ?? CoinAccessPolicy.resolveTradingViewSymbol(sym);
   final interval = tradingViewIntervalForTimeframe(timeframe);
-  final fluxIndicator = OracleFluxTvConfig.indicatorStudyId.trim();
-  final fluxOscillator = OracleFluxTvConfig.oscillatorStudyId.trim();
+  // PUB scripts only work via widget `studies` at init — not via createStudy() at runtime.
   final studiesBlock = includeFluxTools
       ? OracleFluxTvConfig.oracleFluxStudiesJson()
       : '';
@@ -374,10 +376,7 @@ String buildTradeSetupTradingViewHTML(
       <div id="tradingview"></div>
       <script src="https://s3.tradingview.com/tv.js"></script>
       <script>
-        var ocoTvWidget = null;
-        var ocoChartReady = false;
-        var ocoFluxPending = false;
-        ocoTvWidget = new TradingView.widget({
+        new TradingView.widget({
           "autosize": true,
           "symbol": "$resolvedTvSymbol",
           "interval": "$interval",
@@ -452,51 +451,28 @@ String buildTradeSetupTradingViewHTML(
           "container_id": "tradingview",
           "support_host": "https://www.tradingview.com"
         });
-        ocoTvWidget.onChartReady(function() {
-          ocoChartReady = true;
-          if (ocoFluxPending) {
-            ocoFluxPending = false;
-            window.__ocoAddFluxTools();
-          }
-        });
-        window.__ocoAddFluxTools = function() {
-          if (!ocoChartReady) {
-            ocoFluxPending = true;
-            return 'pending';
-          }
-          try {
-            var chart = ocoTvWidget.activeChart();
-            chart.createStudy('$fluxIndicator', false, false);
-            chart.createStudy('$fluxOscillator', false, false);
-            return 'ok';
-          } catch (e) {
-            return 'error';
-          }
-        };
       </script>
     </body></html>
     ''';
 }
 
-/// Inject Oracle Flux scripts into the live chart (Premium/Expert manual action).
-Future<bool> addOracleFluxToolsToChart(WebViewController controller) async {
-  try {
-    final result = await controller.runJavaScriptReturningResult(
-      'window.__ocoAddFluxTools ? window.__ocoAddFluxTools() : "missing"',
-    );
-    final status = result?.toString() ?? '';
-    if (status.contains('ok')) return true;
-    if (status.contains('pending')) {
-      await Future<void>.delayed(const Duration(milliseconds: 1800));
-      final retry = await controller.runJavaScriptReturningResult(
-        'window.__ocoAddFluxTools ? window.__ocoAddFluxTools() : "missing"',
-      );
-      return retry?.toString().contains('ok') ?? false;
-    }
-  } catch (e) {
-    debugPrint('[Chart] addOracleFluxTools JS failed: $e');
-  }
-  return false;
+/// Reload chart with Oracle Flux studies (only way PUB scripts work in TV widget).
+Future<void> loadOracleFluxToolsOnChart(
+  WebViewController controller, {
+  required String symbol,
+  required String timeframe,
+}) async {
+  final sym = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
+  final tvSymbol = CoinAccessPolicy.resolveTradingViewSymbol(sym);
+  await controller.loadHtmlString(
+    buildTradeSetupTradingViewHTML(
+      sym,
+      tvSymbol: tvSymbol,
+      timeframe: timeframe,
+      includeFluxTools: true,
+    ),
+    baseUrl: kTradingViewChartBaseUri,
+  );
 }
 
 WebViewController createTradeSetupTradingViewController(
@@ -527,12 +503,15 @@ WebViewController createTradeSetupTradingViewController(
     android.setMixedContentMode(MixedContentMode.compatibilityMode);
   }
 
-  controller.loadHtmlString(buildTradeSetupTradingViewHTML(
-    sym,
-    tvSymbol: tvSymbol,
-    timeframe: timeframe,
-    includeFluxTools: includeFluxTools,
-  ));
+  controller.loadHtmlString(
+    buildTradeSetupTradingViewHTML(
+      sym,
+      tvSymbol: tvSymbol,
+      timeframe: timeframe,
+      includeFluxTools: includeFluxTools,
+    ),
+    baseUrl: kTradingViewChartBaseUri,
+  );
   return controller;
 }
 
@@ -573,19 +552,17 @@ class _AddFluxToolsChartButtonState extends State<_AddFluxToolsChartButton> {
     if (_busy || _added) return;
     setState(() => _busy = true);
 
-    var ok = await addOracleFluxToolsToChart(widget.controller);
-    if (!ok) {
-      // Fallback: reload chart HTML with Flux studies baked in.
-      final sym = CoinAccessPolicy.normalizeCoinSymbol(widget.symbol) ??
-          widget.symbol.trim().toUpperCase();
-      final tvSymbol = CoinAccessPolicy.resolveTradingViewSymbol(sym);
-      await widget.controller.loadHtmlString(buildTradeSetupTradingViewHTML(
-        sym,
-        tvSymbol: tvSymbol,
+    var ok = false;
+    try {
+      // PUB scripts must be in widget `studies` at init — reload chart with Flux baked in.
+      await loadOracleFluxToolsOnChart(
+        widget.controller,
+        symbol: widget.symbol,
         timeframe: widget.timeframe,
-        includeFluxTools: true,
-      ));
+      );
       ok = true;
+    } catch (e) {
+      debugPrint('[Chart] Add Flux Tools failed: $e');
     }
 
     if (!mounted) return;
@@ -599,7 +576,11 @@ class _AddFluxToolsChartButtonState extends State<_AddFluxToolsChartButton> {
 
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(ok ? 'Oracle Flux tools added' : 'Could not add Flux tools — try again'),
+        content: Text(
+          ok
+              ? 'Oracle Flux tools added successfully'
+              : 'Could not add Flux tools — try again',
+        ),
         behavior: SnackBarBehavior.floating,
         backgroundColor: ok ? const Color(0xFF1A2A1A) : null,
       ),
@@ -610,12 +591,13 @@ class _AddFluxToolsChartButtonState extends State<_AddFluxToolsChartButton> {
   Widget build(BuildContext context) {
     if (!_visible) return const SizedBox.shrink();
 
-    return Material(
-      color: Colors.black.withValues(alpha: 0.72),
-      borderRadius: BorderRadius.circular(8),
-      child: InkWell(
+    // Opaque hit target so WebView does not steal taps from the overlay button.
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: _busy ? null : _onTap,
+      child: Material(
+        color: Colors.black.withValues(alpha: 0.72),
         borderRadius: BorderRadius.circular(8),
-        onTap: _busy ? null : _onTap,
         child: Container(
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(8),
