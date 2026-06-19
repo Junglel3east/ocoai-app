@@ -39,6 +39,7 @@ import 'services/social_links.dart';
 import 'services/x_share_service.dart';
 import 'widgets/push_to_x_button.dart';
 import 'services/user_profile_store.dart';
+import 'constants/oracle_flux_tv_config.dart';
 import 'screens/edit_profile_screen.dart';
 import 'screens/login_screen.dart';
 import 'screens/profile_screen.dart' show kProfileBackgroundOrbHeight, kProfileBackgroundOrbOpacity;
@@ -346,8 +347,7 @@ String tradingViewIntervalForTimeframe(String timeframe) {
   }
 }
 
-/// Trade Setup chart — Heikin Ashi + Daily VWAP + Prev Day VWAP + Fib 0.382/0.5/0.618/0.786 only.
-/// No EMAs, RSI, MACD, volume, or trade level lines (Entry/TP/SL stay in the report).
+/// Trade Setup / Analysis chart — Heikin Ashi + Oracle Flux indicator + Oracle Flux oscillator only.
 String buildTradeSetupTradingViewHTML(
   String symbol, {
   String? tvSymbol,
@@ -419,8 +419,7 @@ String buildTradeSetupTradingViewHTML(
             "use_localstorage_for_settings"
           ],
           "studies": [
-            {"id": "VWAP@tv-basicstudies", "inputs": {"Anchor period": "Session"}},
-            {"id": "AutoFibRetracement@tv-basicstudies"}
+            ${OracleFluxTvConfig.oracleFluxStudiesJson()}
           ],
           "studies_overrides": {
             "paneProperties.background": "#0F0F0F",
@@ -432,29 +431,7 @@ String buildTradeSetupTradingViewHTML(
             "mainSeriesProperties.haStyle.borderUpColor": "#26A69A",
             "mainSeriesProperties.haStyle.borderDownColor": "#EF5350",
             "mainSeriesProperties.haStyle.wickUpColor": "#26A69A",
-            "mainSeriesProperties.haStyle.wickDownColor": "#EF5350",
-            "VWAP@tv-basicstudies.plot.color": "#00E5FF",
-            "VWAP@tv-basicstudies.plot.linewidth": 2,
-            "auto_fib_retracement.trendline.color": "rgba(255,152,0,0.45)",
-            "auto_fib_retracement.trendline.linewidth": 1,
-            "auto_fib_retracement.level1.color": "#FF9800",
-            "auto_fib_retracement.level2.color": "#00E676",
-            "auto_fib_retracement.level3.color": "#26C6DA",
-            "auto_fib_retracement.level4.color": "#2196F3",
-            "auto_fib_retracement.level5.color": "#2196F3",
-            "auto_fib_retracement.level6.color": "#2196F3",
-            "auto_fib_retracement.level7.color": "#2196F3",
-            "auto_fib_retracement.level1.coeff": 0.382,
-            "auto_fib_retracement.level2.coeff": 0.5,
-            "auto_fib_retracement.level3.coeff": 0.618,
-            "auto_fib_retracement.level4.coeff": 0.786,
-            "auto_fib_retracement.level5.visible": false,
-            "auto_fib_retracement.level6.visible": false,
-            "auto_fib_retracement.level7.visible": false,
-            "auto_fib_retracement.level8.visible": false,
-            "auto_fib_retracement.level9.visible": false,
-            "auto_fib_retracement.level10.visible": false,
-            "auto_fib_retracement.level11.visible": false
+            "mainSeriesProperties.haStyle.wickDownColor": "#EF5350"
           },
           "overrides": {
             "mainSeriesProperties.priceAxisProperties.autoScale": true,
@@ -512,7 +489,7 @@ class TradingViewChartPanel extends StatefulWidget {
   final WebViewController controller;
   final double height;
   final bool mountWebView;
-  /// When set, fullscreen opens the same focused Trade Setup chart (Heikin Ashi + VWAP + Fib).
+  /// When set, fullscreen opens the same Analysis/Trade Setup chart (Heikin Ashi + Oracle Flux).
   final String? tradeSetupTimeframe;
   final bool premiumFrame;
 
@@ -9787,14 +9764,14 @@ class _AnalysisReportScreenState extends State<AnalysisReportScreen> {
     if (widget.historyItem != null) {
       report = widget.historyItem!['report'];
       loading = false;
-      _chartController = createTradingViewController(resolvedCoin);
+      _chartController = createTradeSetupTradingViewController(resolvedCoin, timeframe: '1h');
     } else {
       _fetchFromBackend();
     }
   }
 
   void _ensureChartController() {
-    _chartController ??= createTradingViewController(resolvedCoin);
+    _chartController ??= createTradeSetupTradingViewController(resolvedCoin, timeframe: '1h');
   }
 
   Future<void> _fetchFromBackend() async {
@@ -9905,6 +9882,7 @@ class _AnalysisReportScreenState extends State<AnalysisReportScreen> {
                     TradingViewChartPanel(
                       symbol: resolvedCoin,
                       controller: _chartController!,
+                      tradeSetupTimeframe: '1h',
                     ),
                   const SizedBox(height: _AppSpacing.section),
                   Text(report, style: const TextStyle(fontSize: 16, height: 1.65)),
