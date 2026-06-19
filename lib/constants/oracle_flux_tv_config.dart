@@ -1,6 +1,6 @@
-/// Published Oracle Flux TradingView study IDs (Trade Setup + Analysis charts only).
+/// Published Oracle Flux TradingView study IDs — manual load only (Add Flux Tools button).
 ///
-/// Home / Charts tab uses [buildTradingViewHTML] — unchanged.
+/// Analysis / Trade Setup charts start with no extra scripts. Home tab uses [buildTradingViewHTML].
 abstract final class OracleFluxTvConfig {
   /// Oracle Flux overlay indicator (published on TradingView).
   static const indicatorStudyId = String.fromEnvironment(
@@ -14,7 +14,7 @@ abstract final class OracleFluxTvConfig {
     defaultValue: 'PUB;JAI7kwOr',
   );
 
-  /// JSON entries for widget `studies` — ONLY these two scripts, nothing else.
+  /// JSON entries for widget `studies` — used only when user taps Add Flux Tools.
   static String oracleFluxStudiesJson() {
     return '''
             {"id": "${indicatorStudyId.trim()}"},

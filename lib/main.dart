@@ -347,15 +347,21 @@ String tradingViewIntervalForTimeframe(String timeframe) {
   }
 }
 
-/// Trade Setup / Analysis chart — Heikin Ashi + Oracle Flux indicator + Oracle Flux oscillator only.
+/// Trade Setup / Analysis chart — Heikin Ashi, no auto-loaded scripts (Flux is manual via button).
 String buildTradeSetupTradingViewHTML(
   String symbol, {
   String? tvSymbol,
   required String timeframe,
+  bool includeFluxTools = false,
 }) {
   final sym = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
   final resolvedTvSymbol = tvSymbol ?? CoinAccessPolicy.resolveTradingViewSymbol(sym);
   final interval = tradingViewIntervalForTimeframe(timeframe);
+  final fluxIndicator = OracleFluxTvConfig.indicatorStudyId.trim();
+  final fluxOscillator = OracleFluxTvConfig.oscillatorStudyId.trim();
+  final studiesBlock = includeFluxTools
+      ? OracleFluxTvConfig.oracleFluxStudiesJson()
+      : '';
   return '''
     <html><head>
       <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
@@ -368,7 +374,10 @@ String buildTradeSetupTradingViewHTML(
       <div id="tradingview"></div>
       <script src="https://s3.tradingview.com/tv.js"></script>
       <script>
-        new TradingView.widget({
+        var ocoTvWidget = null;
+        var ocoChartReady = false;
+        var ocoFluxPending = false;
+        ocoTvWidget = new TradingView.widget({
           "autosize": true,
           "symbol": "$resolvedTvSymbol",
           "interval": "$interval",
@@ -419,7 +428,7 @@ String buildTradeSetupTradingViewHTML(
             "use_localstorage_for_settings"
           ],
           "studies": [
-            ${OracleFluxTvConfig.oracleFluxStudiesJson()}
+            $studiesBlock
           ],
           "studies_overrides": {
             "paneProperties.background": "#0F0F0F",
@@ -443,14 +452,57 @@ String buildTradeSetupTradingViewHTML(
           "container_id": "tradingview",
           "support_host": "https://www.tradingview.com"
         });
+        ocoTvWidget.onChartReady(function() {
+          ocoChartReady = true;
+          if (ocoFluxPending) {
+            ocoFluxPending = false;
+            window.__ocoAddFluxTools();
+          }
+        });
+        window.__ocoAddFluxTools = function() {
+          if (!ocoChartReady) {
+            ocoFluxPending = true;
+            return 'pending';
+          }
+          try {
+            var chart = ocoTvWidget.activeChart();
+            chart.createStudy('$fluxIndicator', false, false);
+            chart.createStudy('$fluxOscillator', false, false);
+            return 'ok';
+          } catch (e) {
+            return 'error';
+          }
+        };
       </script>
     </body></html>
     ''';
 }
 
+/// Inject Oracle Flux scripts into the live chart (Premium/Expert manual action).
+Future<bool> addOracleFluxToolsToChart(WebViewController controller) async {
+  try {
+    final result = await controller.runJavaScriptReturningResult(
+      'window.__ocoAddFluxTools ? window.__ocoAddFluxTools() : "missing"',
+    );
+    final status = result?.toString() ?? '';
+    if (status.contains('ok')) return true;
+    if (status.contains('pending')) {
+      await Future<void>.delayed(const Duration(milliseconds: 1800));
+      final retry = await controller.runJavaScriptReturningResult(
+        'window.__ocoAddFluxTools ? window.__ocoAddFluxTools() : "missing"',
+      );
+      return retry?.toString().contains('ok') ?? false;
+    }
+  } catch (e) {
+    debugPrint('[Chart] addOracleFluxTools JS failed: $e');
+  }
+  return false;
+}
+
 WebViewController createTradeSetupTradingViewController(
   String symbol, {
   required String timeframe,
+  bool includeFluxTools = false,
 }) {
   final sym = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
   final tvSymbol = CoinAccessPolicy.resolveTradingViewSymbol(sym);
@@ -479,8 +531,122 @@ WebViewController createTradeSetupTradingViewController(
     sym,
     tvSymbol: tvSymbol,
     timeframe: timeframe,
+    includeFluxTools: includeFluxTools,
   ));
   return controller;
+}
+
+/// Premium/Expert-only control — manually adds Oracle Flux scripts to the chart.
+class _AddFluxToolsChartButton extends StatefulWidget {
+  final WebViewController controller;
+  final String symbol;
+  final String timeframe;
+
+  const _AddFluxToolsChartButton({
+    required this.controller,
+    required this.symbol,
+    required this.timeframe,
+  });
+
+  @override
+  State<_AddFluxToolsChartButton> createState() => _AddFluxToolsChartButtonState();
+}
+
+class _AddFluxToolsChartButtonState extends State<_AddFluxToolsChartButton> {
+  bool _visible = false;
+  bool _busy = false;
+  bool _added = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadTier();
+  }
+
+  Future<void> _loadTier() async {
+    await SubscriptionPlanStore.load();
+    if (!mounted) return;
+    setState(() => _visible = SubscriptionPlanStore.isPremiumOrHigher && !_added);
+  }
+
+  Future<void> _onTap() async {
+    if (_busy || _added) return;
+    setState(() => _busy = true);
+
+    var ok = await addOracleFluxToolsToChart(widget.controller);
+    if (!ok) {
+      // Fallback: reload chart HTML with Flux studies baked in.
+      final sym = CoinAccessPolicy.normalizeCoinSymbol(widget.symbol) ??
+          widget.symbol.trim().toUpperCase();
+      final tvSymbol = CoinAccessPolicy.resolveTradingViewSymbol(sym);
+      await widget.controller.loadHtmlString(buildTradeSetupTradingViewHTML(
+        sym,
+        tvSymbol: tvSymbol,
+        timeframe: widget.timeframe,
+        includeFluxTools: true,
+      ));
+      ok = true;
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      if (ok) {
+        _added = true;
+        _visible = false;
+      }
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(ok ? 'Oracle Flux tools added' : 'Could not add Flux tools — try again'),
+        behavior: SnackBarBehavior.floating,
+        backgroundColor: ok ? const Color(0xFF1A2A1A) : null,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_visible) return const SizedBox.shrink();
+
+    return Material(
+      color: Colors.black.withValues(alpha: 0.72),
+      borderRadius: BorderRadius.circular(8),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: _busy ? null : _onTap,
+        child: Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.45)),
+            boxShadow: [
+              BoxShadow(
+                color: const Color(0xFF00BFFF).withValues(alpha: 0.18),
+                blurRadius: 8,
+              ),
+            ],
+          ),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+          child: _busy
+              ? const SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00E5FF)),
+                )
+              : const Text(
+                  'Add Flux Tools',
+                  style: TextStyle(
+                    color: Color(0xFF00E5FF),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.2,
+                  ),
+                ),
+        ),
+      ),
+    );
+  }
 }
 
 /// Embedded chart with expand-to-fullscreen control (Analysis, Trade Setup, etc.).
@@ -489,7 +655,7 @@ class TradingViewChartPanel extends StatefulWidget {
   final WebViewController controller;
   final double height;
   final bool mountWebView;
-  /// When set, fullscreen opens the same Analysis/Trade Setup chart (Heikin Ashi + Oracle Flux).
+  /// When set, fullscreen opens the same Analysis/Trade Setup chart (Heikin Ashi, manual Flux).
   final String? tradeSetupTimeframe;
   final bool premiumFrame;
 
@@ -536,6 +702,17 @@ class _TradingViewChartPanelState extends State<TradingViewChartPanel> {
                   )
                 : const ColoredBox(color: Color(0xFF0F0F0F)),
           ),
+        ),
+        Positioned(
+          top: 6,
+          left: 6,
+          child: widget.tradeSetupTimeframe != null
+              ? _AddFluxToolsChartButton(
+                  controller: widget.controller,
+                  symbol: widget.symbol,
+                  timeframe: widget.tradeSetupTimeframe!,
+                )
+              : const SizedBox.shrink(),
         ),
         Positioned(
           top: 6,
@@ -635,9 +812,23 @@ class _FullScreenChartScreenState extends State<FullScreenChartScreen> {
         ],
       ),
       body: SafeArea(
-        child: WebViewWidget(
-          controller: _controller,
-          gestureRecognizers: kTradingViewGestureRecognizers,
+        child: Stack(
+          children: [
+            WebViewWidget(
+              controller: _controller,
+              gestureRecognizers: kTradingViewGestureRecognizers,
+            ),
+            if (tf != null)
+              Positioned(
+                top: 6,
+                left: 6,
+                child: _AddFluxToolsChartButton(
+                  controller: _controller,
+                  symbol: widget.symbol,
+                  timeframe: tf,
+                ),
+              ),
+          ],
         ),
       ),
     );
