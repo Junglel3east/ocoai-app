@@ -49,8 +49,9 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import requests
 import uvicorn
@@ -294,6 +295,16 @@ class AnalyzeRequest(BaseModel):
     request_ts: Optional[int] = None
     user_id: Optional[str] = Field(None, max_length=128)
     vision_confluence_pct: Optional[float] = Field(None, ge=0, le=100)
+    # Oracle Flux chart indicator snapshot (optional — backward compatible if omitted).
+    oracle_flux: Optional[dict[str, Any]] = Field(
+        None,
+        validation_alias=AliasChoices("oracle_flux", "oracleFlux", "flux"),
+    )
+    # Generic chart context blob; may nest oracle_flux / oracleFlux / flux.
+    chart_context: Optional[Union[dict[str, Any], str]] = Field(
+        None,
+        validation_alias=AliasChoices("chart_context", "chartContext"),
+    )
     # User's chosen leverage — Citadel-configured when sent by Flutter; else server defaults to 5x.
     leverage: Optional[float] = Field(None, ge=1.0, le=100.0)
 
@@ -4277,6 +4288,12 @@ RULE 2 — GOD-MODE CONFLUENCE STACK (deep integration, zero blind spots)
 • LIQUIDATION CLUSTERS & BOOK PRESSURE: where are stops stacked, where does the cascade accelerate,
   which side of the book is thin. Liq clusters are targets AND invalidation guides — price hunts them.
 • BTC/ETH LEAD (when relevant): risk-on/off for alts, correlation breaks, HTF veto from majors.
+• ORACLE FLUX (when ORACLE FLUX block present in user prompt — confirmation only):
+  Treat Flux as a chart-indicator confirmation layer, not a standalone signal. Weave naturally when it
+  adds edge (e.g. "Flux shows 0.786 Fib rejection + Money Flow outflow + Oracle Score 74 → high-conviction short").
+  STRONG BUY/SELL flags are high-priority when aligned with HTF + structure — ignore or veto when they fight
+  Daily/4H. High Chop Strength = range/chop — cut conviction and prefer stand-down unless a clean sweep trigger.
+  Only mention Flux when it materially confirms or vetoes your read — never force it into every section.
 • PREMIUM BREVITY: Tight trader prose. No filler. Each **Key Drivers** bullet: 2–4 crisp sentences max.
   One positioning story in **Liquidity & Sentiment** — never repeat Mobula numbers in **Technicals**.
 
@@ -4293,7 +4310,7 @@ recent liquidations. Mobula may add liquidity/volume context.
   squeeze setup, liquidity grab. Read like a leverage trader sizing a perp — never "Funding is X. OI is Y."
 
 **Confluence Summary** — EXACTLY one sentence. Grade STRONG / MODERATE / WEAK. Fuse structure + VWAP +
-  momentum + derivatives + liquidity when available.
+  momentum + derivatives + liquidity + Oracle Flux (when present and meaningful) when available.
 
 Derivatives OVERRIDE or CONFIRM technical bias: extreme positive funding + crowded longs = counter-long fuel;
 negative funding + rising OI + short liqs = squeeze blueprint; OI collapse after spike = move spent.
@@ -4554,6 +4571,365 @@ REQUIRED BEHAVIOR:
 You are talking to a leverage trader who paid for edge. Sound like you have real money on the line."""
 
 
+# ---------------------------------------------------------------------------
+# Oracle Flux — chart indicator context (optional confirmation layer for Grok)
+# Parses structured Flux payloads when present; no-op when absent (100% backward compatible).
+# ---------------------------------------------------------------------------
+
+_FLUX_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "oracle_score": ("oracle_score", "oracleScore", "score", "flux_score", "fluxScore"),
+    "conviction_pct": (
+        "conviction_pct",
+        "convictionPct",
+        "conviction_percent",
+        "convictionPercent",
+        "conviction",
+    ),
+    "conviction_label": ("conviction_label", "convictionLabel", "conviction_state", "convictionState"),
+    "money_flow": (
+        "money_flow",
+        "moneyFlow",
+        "money_flow_state",
+        "moneyFlowState",
+        "mf_state",
+        "mfState",
+    ),
+    "nearest_fib": (
+        "nearest_fib",
+        "nearestFib",
+        "nearest_fib_level",
+        "nearestFibLevel",
+        "fib_level",
+        "fibLevel",
+        "fib",
+    ),
+    "strong_buy": ("strong_buy", "strongBuy", "strong_buy_active", "strongBuyActive"),
+    "strong_sell": ("strong_sell", "strongSell", "strong_sell_active", "strongSellActive"),
+    "chop_strength": ("chop_strength", "chopStrength", "chop", "chop_index", "chopIndex"),
+    "direction_bias": ("direction_bias", "directionBias", "bias", "flux_bias", "fluxBias"),
+    "engines": ("engines", "flux_engines", "fluxEngines", "engine_states", "engineStates"),
+}
+
+
+@dataclass
+class OracleFluxSnapshot:
+    """Normalized Oracle Flux indicator read for AI prompt injection."""
+
+    oracle_score: Optional[float] = None
+    conviction_pct: Optional[float] = None
+    conviction_label: Optional[str] = None
+    money_flow: Optional[str] = None
+    nearest_fib: Optional[str] = None
+    strong_buy: Optional[bool] = None
+    strong_sell: Optional[bool] = None
+    engines: dict[str, str] = field(default_factory=dict)
+    chop_strength: Optional[float] = None
+    direction_bias: Optional[str] = None
+
+    def has_signal(self) -> bool:
+        return any(
+            [
+                self.oracle_score is not None,
+                self.conviction_pct is not None,
+                bool(self.conviction_label),
+                bool(self.money_flow),
+                bool(self.nearest_fib),
+                self.strong_buy is True,
+                self.strong_sell is True,
+                bool(self.engines),
+                self.chop_strength is not None,
+                bool(self.direction_bias),
+            ]
+        )
+
+
+def _flux_first_value(data: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in data and data[key] is not None:
+            return data[key]
+    lower_map = {str(k).lower(): v for k, v in data.items()}
+    for key in keys:
+        hit = lower_map.get(key.lower())
+        if hit is not None:
+            return hit
+    return None
+
+
+def _flux_coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("%", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        match = re.search(r"-?\d+(?:\.\d+)?", text)
+        if match:
+            try:
+                return float(match.group(0))
+            except ValueError:
+                return None
+    return None
+
+
+def _flux_coerce_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on", "active", "present", "detected"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "inactive", "none", "absent"}:
+        return False
+    return None
+
+
+def _flux_normalize_money_flow(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower().replace("_", " ").replace("-", " ")
+    if not text:
+        return None
+    if any(token in text for token in ("inflow", "in flow", "accumulation", "accumulating", "buying pressure")):
+        return "inflow"
+    if any(token in text for token in ("outflow", "out flow", "distribution", "distributing", "selling pressure")):
+        return "outflow"
+    if any(token in text for token in ("neutral", "flat", "balanced", "sideways", "mixed")):
+        return "neutral"
+    if "bull" in text:
+        return "inflow"
+    if "bear" in text:
+        return "outflow"
+    return text
+
+
+def _flux_normalize_fib(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower().replace("fib", "").strip()
+    if not text:
+        return None
+    match = re.search(r"(?:0?\.\d{1,3}|1\.0{0,3})", text)
+    if match:
+        fib = match.group(0)
+        if fib.startswith("."):
+            return f"0{fib}"
+        return fib
+    return text
+
+
+def _flux_parse_engines(value: Any) -> dict[str, str]:
+    engines: dict[str, str] = {}
+    if value is None:
+        return engines
+    if isinstance(value, dict):
+        for name, state in value.items():
+            label = str(name).strip()
+            state_text = str(state).strip()
+            if label and state_text:
+                engines[label] = state_text
+        return engines
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                engines.update(_flux_parse_engines(item))
+            elif isinstance(item, str) and ":" in item:
+                name, state = item.split(":", 1)
+                engines[name.strip()] = state.strip()
+        return engines
+    if isinstance(value, str):
+        for chunk in re.split(r"[|;]", value):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if ":" in chunk:
+                name, state = chunk.split(":", 1)
+                engines[name.strip()] = state.strip()
+            elif " " in chunk:
+                name, state = chunk.split(" ", 1)
+                engines[name.strip()] = state.strip()
+    return engines
+
+
+def _flux_split_conviction(value: Any) -> tuple[Optional[float], Optional[str]]:
+    pct = _flux_coerce_float(value)
+    if pct is not None and 0 <= pct <= 100:
+        return pct, None
+    if pct is not None and pct > 100:
+        return None, str(value).strip()
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None, None
+    return None, text
+
+
+def parse_oracle_flux(raw: Any) -> Optional[OracleFluxSnapshot]:
+    """Parse a Flux payload dict (or JSON string) into a normalized snapshot."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(raw, dict):
+        return None
+
+    snap = OracleFluxSnapshot()
+    snap.oracle_score = _flux_coerce_float(
+        _flux_first_value(raw, *_FLUX_FIELD_ALIASES["oracle_score"])
+    )
+    conviction_raw = _flux_first_value(raw, *_FLUX_FIELD_ALIASES["conviction_pct"])
+    snap.conviction_pct, snap.conviction_label = _flux_split_conviction(conviction_raw)
+    label_only = _flux_first_value(raw, *_FLUX_FIELD_ALIASES["conviction_label"])
+    if label_only and not snap.conviction_label:
+        snap.conviction_label = str(label_only).strip()
+    snap.money_flow = _flux_normalize_money_flow(
+        _flux_first_value(raw, *_FLUX_FIELD_ALIASES["money_flow"])
+    )
+    snap.nearest_fib = _flux_normalize_fib(
+        _flux_first_value(raw, *_FLUX_FIELD_ALIASES["nearest_fib"])
+    )
+    snap.strong_buy = _flux_coerce_bool(
+        _flux_first_value(raw, *_FLUX_FIELD_ALIASES["strong_buy"])
+    )
+    snap.strong_sell = _flux_coerce_bool(
+        _flux_first_value(raw, *_FLUX_FIELD_ALIASES["strong_sell"])
+    )
+    snap.chop_strength = _flux_coerce_float(
+        _flux_first_value(raw, *_FLUX_FIELD_ALIASES["chop_strength"])
+    )
+    bias = _flux_first_value(raw, *_FLUX_FIELD_ALIASES["direction_bias"])
+    snap.direction_bias = str(bias).strip() if bias is not None else None
+    snap.engines = _flux_parse_engines(_flux_first_value(raw, *_FLUX_FIELD_ALIASES["engines"]))
+
+    if snap.has_signal():
+        return snap
+    return None
+
+
+def _flux_dict_has_markers(data: dict[str, Any]) -> bool:
+    lowered = {str(k).lower() for k in data.keys()}
+    markers = {
+        "oracle_score",
+        "oraclescore",
+        "conviction",
+        "money_flow",
+        "moneyflow",
+        "chop_strength",
+        "chopstrength",
+        "strong_buy",
+        "strongbuy",
+        "strong_sell",
+        "strongsell",
+        "nearest_fib",
+        "nearestfib",
+        "engines",
+        "flux_engines",
+    }
+    return bool(lowered & markers)
+
+
+def extract_oracle_flux_from_request(request: AnalyzeRequest) -> Optional[OracleFluxSnapshot]:
+    """Collect Flux data from optional request fields without breaking legacy clients."""
+    candidates: list[dict[str, Any]] = []
+
+    if isinstance(request.oracle_flux, dict):
+        candidates.append(request.oracle_flux)
+
+    ctx = request.chart_context
+    if isinstance(ctx, dict):
+        nested = (
+            ctx.get("oracle_flux")
+            or ctx.get("oracleFlux")
+            or ctx.get("flux")
+        )
+        if isinstance(nested, dict):
+            candidates.append(nested)
+        elif _flux_dict_has_markers(ctx):
+            candidates.append(ctx)
+    elif isinstance(ctx, str) and ctx.strip():
+        try:
+            parsed = json.loads(ctx)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            nested = (
+                parsed.get("oracle_flux")
+                or parsed.get("oracleFlux")
+                or parsed.get("flux")
+            )
+            if isinstance(nested, dict):
+                candidates.append(nested)
+            elif _flux_dict_has_markers(parsed):
+                candidates.append(parsed)
+
+    for raw in candidates:
+        snap = parse_oracle_flux(raw)
+        if snap is not None:
+            logger.info(
+                "oracle_flux_parsed score=%s conviction=%s money_flow=%s fib=%s strong_buy=%s strong_sell=%s chop=%s",
+                snap.oracle_score,
+                snap.conviction_pct if snap.conviction_pct is not None else snap.conviction_label,
+                snap.money_flow,
+                snap.nearest_fib,
+                snap.strong_buy,
+                snap.strong_sell,
+                snap.chop_strength,
+            )
+            return snap
+    return None
+
+
+def format_oracle_flux_prompt_block(flux: Optional[OracleFluxSnapshot]) -> str:
+    """Inject Flux as a confirmation layer — only when values are present."""
+    if flux is None or not flux.has_signal():
+        return ""
+
+    lines = [
+        "═══ ORACLE FLUX — CHART INDICATOR CONFIRMATION (optional edge; cite only when it matters) ═══",
+        "Flux is a confirmation layer on structure + derivatives — never a standalone reason to trade.",
+        "Weave naturally when aligned (e.g. \"Flux: 0.786 Fib rejection + Money Flow outflow + Oracle Score 74 → leans short\").",
+        "If Flux fights HTF structure or derivatives, name the veto. High Chop Strength = range/chop — downgrade conviction.",
+    ]
+
+    if flux.oracle_score is not None:
+        lines.append(f"Oracle Score: {flux.oracle_score:.0f}/100")
+    if flux.conviction_pct is not None:
+        lines.append(f"Flux Conviction: {flux.conviction_pct:.0f}%")
+    elif flux.conviction_label:
+        lines.append(f"Flux Conviction: {flux.conviction_label}")
+    if flux.money_flow:
+        lines.append(f"Money Flow: {flux.money_flow}")
+    if flux.nearest_fib:
+        lines.append(f"Nearest Fib level: {flux.nearest_fib} (rejection/hold context)")
+    if flux.strong_buy is True:
+        lines.append("STRONG BUY: active on chart")
+    if flux.strong_sell is True:
+        lines.append("STRONG SELL: active on chart")
+    if flux.engines:
+        engine_text = " | ".join(f"{name}: {state}" for name, state in flux.engines.items())
+        lines.append(f"Engines: {engine_text}")
+    if flux.chop_strength is not None:
+        lines.append(f"Chop Strength: {flux.chop_strength:.0f} (higher = messier range)")
+    if flux.direction_bias:
+        lines.append(f"Flux directional bias: {flux.direction_bias}")
+
+    lines.append(
+        "Use in **Confluence Summary** or **Key Drivers** only when it adds real edge — skip Flux mention if chop/noise."
+    )
+    return "\n".join(lines) + "\n\n"
+
+
 def normalize_direction(direction: str) -> str:
     value = (direction or "Smart Direction").strip()
     lowered = value.lower()
@@ -4713,6 +5089,7 @@ def build_analyze_user_prompt(
     scalp_mode: bool = False,
     derivatives: Optional[dict[str, Any]] = None,
     vision_confluence_pct: Optional[float] = None,
+    oracle_flux: Optional[OracleFluxSnapshot] = None,
     user_id: Optional[str] = None,
     system_prompt: Optional[str] = None,
     leverage: Optional[float] = None,
@@ -4731,6 +5108,7 @@ def build_analyze_user_prompt(
     derivatives_block = format_derivatives_prompt_block(derivatives)
     mobula_block = format_mobula_market_prompt_block(market)
     coingecko_block = format_coingecko_pro_prompt_block(market)
+    flux_block = format_oracle_flux_prompt_block(oracle_flux)
     market_fallback_note = format_market_data_fallback_note(market)
     live_price_banner = format_live_price_banner(market)
     prompt_leverage, leverage_is_user_set = resolve_prompt_leverage(
@@ -4850,7 +5228,7 @@ TONE EXEMPLAR (match cadence — technical but conversational):
 "BTC 1D reclaiming Daily VWAP with strong bid absorption + funding flipping positive. Clear liquidity sweep
 below previous lows — strong LONG bias here."
 {scalp_banner}
-{vision_block}
+{vision_block}{flux_block}
 ═══════════════════════════════════════════════════════════
 AUTHORITATIVE LIVE PRICE — RULE 0 (ZERO TOLERANCE)
 ═══════════════════════════════════════════════════════════
@@ -4876,6 +5254,7 @@ Direction: {direction_instruction(direction)}
 ═══ LIVE MARKET DATA — ORDER OF AUTHORITY (synthesize; never list metrics alone) ═══
 {mobula_block}{coingecko_block}{market_fallback_note}{derivatives_block}
 Cross-check: Mobula liquidity + volume delta ↔ CoinGecko CEX vol ↔ funding/OI/L-S/liqs ↔ Daily VWAP/structure on {timeframe}.
+When Oracle Flux block is present above, cross-check Flux Fib/Money Flow/Score vs structure — confirm or veto, never force.
 **Liquidity & Sentiment** opens with liquidity/trap/slippage read (Mobula or CEX volume), then derivatives story.
 Oracle Vision / Desk conviction must be data-backed — no generic % without citing liquidity or positioning.
 
@@ -5574,6 +5953,7 @@ async def _handle_analyze(
         )
 
         derivatives = fetch_derivatives_snapshot(coin, spot_price=float(market["price"]))
+        oracle_flux = extract_oracle_flux_from_request(request)
 
         # User's chosen leverage: request value → client prompt → Citadel record → 5x default.
         effective_leverage, leverage_is_user_set = resolve_prompt_leverage(
@@ -5597,6 +5977,7 @@ async def _handle_analyze(
             scalp_mode=scalp_mode,
             derivatives=derivatives,
             vision_confluence_pct=request.vision_confluence_pct,
+            oracle_flux=oracle_flux,
             user_id=user_id,
             system_prompt=request.system_prompt,
             leverage=effective_leverage,
@@ -5604,7 +5985,7 @@ async def _handle_analyze(
 
         logger.info(
             "analyze request_id=%s coin=%s mode=%s tf=%s dir=%s scalp=%s leverage=%sx price=%.6f src=%s "
-            "mobula_liq=%s on_chain_vol=%s deriv=%s",
+            "mobula_liq=%s on_chain_vol=%s deriv=%s flux=%s",
             req_id,
             coin,
             mode,
@@ -5617,6 +5998,7 @@ async def _handle_analyze(
             market.get("liquidity_usd") if market.get("source") == "mobula" else None,
             market.get("on_chain_volume_usd") if market.get("source") == "mobula" else None,
             derivatives["has_futures_data"],
+            oracle_flux.oracle_score if oracle_flux else None,
         )
 
         # Slightly lower temperature — tighter, more decisive veteran voice (same headings)
