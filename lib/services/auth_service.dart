@@ -10,6 +10,9 @@ import 'app_api_key_service.dart';
 import 'user_profile_store.dart';
 
 /// Local email/password auth with secure storage and optional biometrics.
+///
+/// Credentials are mirrored to SharedPreferences so sign-in still works when
+/// encrypted secure storage hangs or fails (common on sideload / Samsung builds).
 abstract final class AuthService {
   static const _sessionKey = 'auth_session_active';
   static const _registeredEmailKey = 'auth_registered_email';
@@ -18,6 +21,7 @@ abstract final class AuthService {
   static const _biometricKey = 'auth_biometric_enabled';
   static const _subscriptionPlanKey = 'subscription_plan';
   static const _salt = 'oco_oracle_auth_v1';
+  static const _mirrorPrefix = 'auth_mirror_';
 
   static const _storage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
@@ -25,6 +29,39 @@ abstract final class AuthService {
   );
 
   static final LocalAuthentication _localAuth = LocalAuthentication();
+
+  static const Duration _secureTimeout = Duration(seconds: 10);
+
+  static Future<String?> _secureRead(String key) async {
+    try {
+      final value = await _storage.read(key: key).timeout(_secureTimeout);
+      if (value != null && value.isNotEmpty) return value;
+    } catch (e) {
+      debugPrint('[AuthService] secure read failed key=$key: $e');
+    }
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString('$_mirrorPrefix$key');
+  }
+
+  static Future<void> _secureWrite(String key, String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('$_mirrorPrefix$key', value);
+    try {
+      await _storage.write(key: key, value: value).timeout(_secureTimeout);
+    } catch (e) {
+      debugPrint('[AuthService] secure write failed key=$key (prefs mirror ok): $e');
+    }
+  }
+
+  static Future<void> _secureDelete(String key) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('$_mirrorPrefix$key');
+    try {
+      await _storage.delete(key: key).timeout(_secureTimeout);
+    } catch (e) {
+      debugPrint('[AuthService] secure delete failed key=$key: $e');
+    }
+  }
 
   static Future<void> init() async {
     await UserProfileStore.load();
@@ -36,26 +73,26 @@ abstract final class AuthService {
   }
 
   static Future<bool> hasValidSession() async {
-    final session = await _storage.read(key: _sessionKey);
+    final session = await _secureRead(_sessionKey);
     return session == 'true';
   }
 
   static Future<bool> isRememberMeEnabled() async {
-    return (await _storage.read(key: _rememberMeKey)) == 'true';
+    return (await _secureRead(_rememberMeKey)) == 'true';
   }
 
   static Future<bool> isBiometricEnabled() async {
-    return (await _storage.read(key: _biometricKey)) == 'true';
+    return (await _secureRead(_biometricKey)) == 'true';
   }
 
   static Future<String?> getRememberedEmail() async {
     if (!await isRememberMeEnabled()) return null;
-    return await _storage.read(key: _registeredEmailKey);
+    return await _secureRead(_registeredEmailKey);
   }
 
   static Future<bool> hasRegisteredAccount() async {
-    final email = await _storage.read(key: _registeredEmailKey);
-    final hash = await _storage.read(key: _passwordHashKey);
+    final email = await _secureRead(_registeredEmailKey);
+    final hash = await _secureRead(_passwordHashKey);
     return email != null && email.isNotEmpty && hash != null && hash.isNotEmpty;
   }
 
@@ -115,11 +152,15 @@ abstract final class AuthService {
     );
     if (!ok) return false;
 
-    await _storage.write(key: _sessionKey, value: 'true');
+    await _secureWrite(_sessionKey, 'true');
     await _syncProfileFromStorage();
-    final email = await _storage.read(key: _registeredEmailKey);
+    final email = await _secureRead(_registeredEmailKey);
     if (email != null && email.isNotEmpty) {
-      await AppApiKeyService.ensureKey(email: email);
+      try {
+        await AppApiKeyService.ensureKey(email: email).timeout(_secureTimeout);
+      } catch (e) {
+        debugPrint('[AuthService] ensureKey after biometric skipped: $e');
+      }
     }
     return true;
   }
@@ -138,7 +179,7 @@ abstract final class AuthService {
       return AuthResult.failure('Password must be at least 8 characters.');
     }
 
-    final existing = await _storage.read(key: _registeredEmailKey);
+    final existing = await _secureRead(_registeredEmailKey);
     if (existing != null && existing.isNotEmpty) {
       return AuthResult.failure('An account already exists. Sign in instead.');
     }
@@ -168,11 +209,11 @@ abstract final class AuthService {
       return AuthResult.failure('Enter your password.');
     }
 
-    final storedEmail = await _storage.read(key: _registeredEmailKey);
-    final storedHash = await _storage.read(key: _passwordHashKey);
+    final storedEmail = await _secureRead(_registeredEmailKey);
+    final storedHash = await _secureRead(_passwordHashKey);
 
     if (storedEmail == null || storedHash == null) {
-      return AuthResult.failure('No account found. Create one first.');
+      return AuthResult.failure('No account found. Tap "Create one" below.');
     }
     if (storedEmail.toLowerCase() != normalizedEmail) {
       return AuthResult.failure('Email or password is incorrect.');
@@ -204,20 +245,20 @@ abstract final class AuthService {
       return AuthResult.failure('Biometric authentication cancelled.');
     }
 
-    await _storage.write(key: _sessionKey, value: 'true');
+    await _secureWrite(_sessionKey, 'true');
     await _syncProfileFromStorage();
     return AuthResult.success();
   }
 
   static Future<void> signOut() async {
-    await _storage.delete(key: _sessionKey);
+    await _secureDelete(_sessionKey);
   }
 
   static Future<void> setBiometricEnabled(bool enabled) async {
     if (enabled) {
-      await _storage.write(key: _biometricKey, value: 'true');
+      await _secureWrite(_biometricKey, 'true');
     } else {
-      await _storage.delete(key: _biometricKey);
+      await _secureDelete(_biometricKey);
     }
   }
 
@@ -227,20 +268,20 @@ abstract final class AuthService {
     required bool rememberMe,
     required bool enableBiometric,
   }) async {
-    await _storage.write(key: _registeredEmailKey, value: email);
-    await _storage.write(key: _passwordHashKey, value: _hashPassword(password));
+    await _secureWrite(_registeredEmailKey, email);
+    await _secureWrite(_passwordHashKey, _hashPassword(password));
 
     if (rememberMe) {
-      await _storage.write(key: _rememberMeKey, value: 'true');
+      await _secureWrite(_rememberMeKey, 'true');
     } else {
-      await _storage.delete(key: _rememberMeKey);
-      await _storage.delete(key: _biometricKey);
+      await _secureDelete(_rememberMeKey);
+      await _secureDelete(_biometricKey);
     }
 
     if (rememberMe && enableBiometric && await canUseBiometrics()) {
-      await _storage.write(key: _biometricKey, value: 'true');
+      await _secureWrite(_biometricKey, 'true');
     } else {
-      await _storage.delete(key: _biometricKey);
+      await _secureDelete(_biometricKey);
     }
   }
 
@@ -250,7 +291,7 @@ abstract final class AuthService {
   }
 
   static Future<void> _activateSession(String email) async {
-    await _storage.write(key: _sessionKey, value: 'true');
+    await _secureWrite(_sessionKey, 'true');
 
     final nameFromEmail = email.split('@').first;
     final displayName = nameFromEmail.isNotEmpty
@@ -264,11 +305,15 @@ abstract final class AuthService {
       timezone: UserProfileStore.timezone,
     );
     await UserProfileStore.saveTier(await _currentTier());
-    await AppApiKeyService.ensureKey(email: email);
+    try {
+      await AppApiKeyService.ensureKey(email: email).timeout(_secureTimeout);
+    } catch (e) {
+      debugPrint('[AuthService] ensureKey after sign-in skipped: $e');
+    }
   }
 
   static Future<void> _syncProfileFromStorage() async {
-    final email = await _storage.read(key: _registeredEmailKey);
+    final email = await _secureRead(_registeredEmailKey);
     if (email == null || email.isEmpty) return;
     await UserProfileStore.load();
     await UserProfileStore.save(

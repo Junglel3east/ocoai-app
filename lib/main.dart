@@ -4519,38 +4519,71 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
 
   Future<void> _goHome() async {
     if (!mounted) return;
-    await AuthService.init();
-    await AppApiKeyService.ensureKey();
-    await OracleCitadelStore.load();
-
-    if (await AuthService.hasValidSession()) {
-      _navigateTo(const MainScreen());
-      return;
+    try {
+      await AuthService.init();
+      try {
+        await AppApiKeyService.ensureKey().timeout(const Duration(seconds: 12));
+      } catch (e) {
+        debugPrint('[Splash] ensureKey skipped: $e');
+      }
+      await OracleCitadelStore.load();
+    } catch (e) {
+      debugPrint('[Splash] bootstrap error (continuing): $e');
     }
 
-    if (await AuthService.tryBiometricUnlock()) {
-      if (!mounted) return;
-      _navigateTo(const MainScreen());
-      return;
-    }
-
-    final rememberedEmail = await AuthService.getRememberedEmail();
     if (!mounted) return;
-    _navigateTo(
-      LoginScreen(
-        prefillEmail: rememberedEmail,
-        onSuccess: (ctx) {
-          Navigator.of(ctx).pushReplacement(
-            PageRouteBuilder<void>(
-              pageBuilder: (_, __, ___) => const MainScreen(),
-              transitionsBuilder: (_, animation, __, child) =>
-                  FadeTransition(opacity: animation, child: child),
-              transitionDuration: const Duration(milliseconds: 450),
-            ),
-          );
-        },
-      ),
-    );
+
+    try {
+      if (await AuthService.hasValidSession()) {
+        _navigateTo(const MainScreen());
+        return;
+      }
+
+      final bioOk = await AuthService.tryBiometricUnlock().timeout(
+        const Duration(seconds: 15),
+        onTimeout: () => false,
+      );
+      if (bioOk) {
+        if (!mounted) return;
+        _navigateTo(const MainScreen());
+        return;
+      }
+
+      final rememberedEmail = await AuthService.getRememberedEmail();
+      if (!mounted) return;
+      _navigateTo(
+        LoginScreen(
+          prefillEmail: rememberedEmail,
+          onSuccess: (ctx) {
+            Navigator.of(ctx).pushReplacement(
+              PageRouteBuilder<void>(
+                pageBuilder: (_, __, ___) => const MainScreen(),
+                transitionsBuilder: (_, animation, __, child) =>
+                    FadeTransition(opacity: animation, child: child),
+                transitionDuration: const Duration(milliseconds: 450),
+              ),
+            );
+          },
+        ),
+      );
+    } catch (e) {
+      debugPrint('[Splash] route error (fallback login): $e');
+      if (!mounted) return;
+      _navigateTo(
+        LoginScreen(
+          onSuccess: (ctx) {
+            Navigator.of(ctx).pushReplacement(
+              PageRouteBuilder<void>(
+                pageBuilder: (_, __, ___) => const MainScreen(),
+                transitionsBuilder: (_, animation, __, child) =>
+                    FadeTransition(opacity: animation, child: child),
+                transitionDuration: const Duration(milliseconds: 450),
+              ),
+            );
+          },
+        ),
+      );
+    }
   }
 
   @override
@@ -4583,7 +4616,11 @@ void main() async {
   await AnalysisHistoryStore.init();
   await DailyAnalysisStore.init();
   await NotificationService.instance.initialize();
-  await GooglePlayBillingService.init();
+  try {
+    await GooglePlayBillingService.init().timeout(const Duration(seconds: 8));
+  } catch (e) {
+    debugPrint('[main] Google Play Billing init skipped: $e');
+  }
   await SubscriptionPlanStore.load();
   if (kDebugMode) pingBackendHealth();
   runApp(const OnChainOracleAI());

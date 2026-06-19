@@ -38,9 +38,31 @@ abstract final class AppApiKeyService {
     return 'oco_${encoded.length > 32 ? encoded.substring(0, 32) : encoded}';
   }
 
-  static Future<String?> getKey() => _storage.read(key: _appKeyStorageKey);
+  static Future<String?> getKey() async {
+    try {
+      final key = await _storage
+          .read(key: _appKeyStorageKey)
+          .timeout(const Duration(seconds: 10));
+      if (key != null && key.isNotEmpty) return key;
+    } catch (e) {
+      debugPrint('[AppApiKey] secure read failed, using prefs: $e');
+    }
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_citadelApiKeyPref);
+  }
 
-  static Future<String?> getUserId() => _storage.read(key: _appUserIdStorageKey);
+  static Future<String?> getUserId() async {
+    try {
+      final uid = await _storage
+          .read(key: _appUserIdStorageKey)
+          .timeout(const Duration(seconds: 10));
+      if (uid != null && uid.isNotEmpty) return uid;
+    } catch (e) {
+      debugPrint('[AppApiKey] secure user id read failed, using prefs: $e');
+    }
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_citadelUserIdPref);
+  }
 
   /// Persists Citadel user id when changed in Oracle Citadel Setup.
   static Future<void> syncUserId(String userId) async {

@@ -77,40 +77,52 @@ class _LoginScreenState extends State<LoginScreen> {
     if (!_formKey.currentState!.validate()) return;
 
     setState(() => _loading = true);
-    final email = _emailController.text.trim();
-    final password = _passwordController.text;
+    try {
+      final email = _emailController.text.trim();
+      final password = _passwordController.text;
 
-    final AuthResult result;
-    if (_isCreateMode) {
-      result = await AuthService.signUp(
-        email: email,
-        password: password,
-        rememberMe: _rememberMe,
-        enableBiometric: _enableBiometric,
+      final AuthResult result;
+      if (_isCreateMode) {
+        result = await AuthService.signUp(
+          email: email,
+          password: password,
+          rememberMe: _rememberMe,
+          enableBiometric: _enableBiometric,
+        );
+      } else {
+        result = await AuthService.signIn(
+          email: email,
+          password: password,
+          rememberMe: _rememberMe,
+          enableBiometric: _enableBiometric,
+        );
+      }
+
+      if (!mounted) return;
+      if (result.ok) {
+        widget.onSuccess(context);
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(result.message ?? 'Authentication failed.'),
+          behavior: SnackBarBehavior.floating,
+        ),
       );
-    } else {
-      result = await AuthService.signIn(
-        email: email,
-        password: password,
-        rememberMe: _rememberMe,
-        enableBiometric: _enableBiometric,
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Sign in failed. If you reinstalled the app, tap "Create one" to register again.',
+          ),
+          behavior: SnackBarBehavior.floating,
+        ),
       );
+    } finally {
+      if (mounted) setState(() => _loading = false);
     }
-
-    if (!mounted) return;
-    setState(() => _loading = false);
-
-    if (result.ok) {
-      widget.onSuccess(context);
-      return;
-    }
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(result.message ?? 'Authentication failed.'),
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
   }
 
   Future<void> _biometricLogin() async {
