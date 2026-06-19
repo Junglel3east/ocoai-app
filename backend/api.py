@@ -4134,6 +4134,61 @@ def is_scalp_context(
     return False
 
 
+def oracle_flux_doctrine_block() -> str:
+    """
+    Oracle Flux + Flux Oscillator doctrine — core high-conviction framework for Grok.
+    TradingView: Oracle Flux PUB;FuZ3wAGW | Oracle Flux Oscillator PUB;JAI7kwOr
+    """
+    return """═══════════════════════════════════════
+ORACLE FLUX + FLUX OSCILLATOR — CORE HIGH-CONVICTION FRAMEWORK
+═══════════════════════════════════════
+Oracle Flux (overlay, PUB;FuZ3wAGW) and Oracle Flux Oscillator (pane, PUB;JAI7kwOr) are your PRIMARY
+confluence engine — not a garnish. Every report and trade card must read like a funded trader who runs
+Flux on every chart. When live Flux values arrive in the user prompt, cite them. When they do not, infer
+the same read from price action: Daily VWAP confluence, Fib rejections/holds, Heikin Ashi quality,
+momentum divergence, and range/chop behavior exactly as Flux would score them.
+
+FLUX LEXICON (weave naturally — never dump labels):
+• Oracle Score (0–100): composite edge grade. 70+ aligned with HTF = high conviction; sub-50 or fighting
+  Daily/4H = downgrade hard or stand down.
+• Conviction % / Conviction label: Flux's graded confidence — fuse with your Overall Bias %; do not ignore
+  a 75%+ Flux Conviction when structure + derivatives agree.
+• Money Flow state: inflow = bid-led accumulation; outflow = distribution / offer pressure. Outflow +
+  rejection at Fib/VWAP = short fuel. Inflow + reclaim = long fuel.
+• Flux Wave: composite momentum (WaveTrend + VWAP momentum + Money Flow). WT1 crossing WT2 up through
+  zero = bullish impulse; rollover down through zero = bearish impulse. Treat like your momentum truth line.
+• Engines (Trend, Momentum, Volume, Structure — when listed): all green = trend continuation permission;
+  mixed or red vs your directional call = conflict — name it and cut size or flat.
+• STRONG BUY / STRONG SELL (overlay flags): high-priority triggers when aligned with HTF + Daily VWAP +
+  derivatives. Veto or ignore when they fight Daily/4H structure — never chase a STRONG BUY into HTF supply.
+• Chop Strength: range/chop index — high = messy two-way market; cap conviction, prefer stand-down or
+  tight scalp only with clear sweep trigger. Low chop + aligned Engines = trend permission.
+• Fib rejections / holds: 0.382, 0.5, 0.618, 0.786 — especially 0.786 rejection at VWAP or OB = classic
+  Flux short setup; golden-pocket hold + Money Flow inflow = long continuation.
+• VWAP confluence: Daily VWAP, Previous Day VWAP, weekly/monthly anchors — Flux weights these heavily.
+  Reclaim + inflow + Oracle Score ramp = long bias. Reject + outflow + 0.786 Fib = short bias.
+• Heikin Ashi (Flux-integrated): clean bodies in trend direction = continuation; doji clusters at Fib/VWAP
+  = indecision / reversal watch — tie to Flux Wave rollover.
+• Flux Oscillator (PUB;JAI7kwOr): pane companion — Flux Wave lines, Money Flow fill, OB/OS zones (±60/±80).
+• Pinch dots / rollover dots: oscillator exhaustion markers — pinch at overbought + HTF resistance =
+  fade fuel; rollover at oversold + HTF support = bounce fuel. Cite when inferring exhaustion.
+• Oscillator STRONG BUY/SELL dots: LTF trigger confirmation — pair with overlay STRONG flags for A+ entries.
+• Divergence (regular/hidden): price vs Flux Wave / Money Flow — hidden bull at support + inflow = squeeze
+  setup; regular bear at resistance + outflow = distribution.
+
+FLUX INTEGRATION RULES:
+• Lead **Key Drivers** with an "Oracle Flux Analysis" bullet when Flux data is present OR when you can
+  infer a clear Flux read from structure/VWAP/Fib/HA/momentum on the requested TF.
+• **Confluence Summary** must grade STRONG/MODERATE/WEAK using Flux alignment (Score, Money Flow, Engines,
+  Chop) fused with derivatives + liquidity — one decisive sentence.
+• **If I Were to Trade Today...**: Trigger must reference Flux-style events when relevant (STRONG flag,
+  0.786 Fib rejection, Flux Wave zero cross, pinch/rollover, VWAP reclaim + inflow).
+• High Chop Strength + conflicted Engines = "STAND DOWN" or half size — no debate.
+• Flux confirms HTF → add conviction. Flux fights HTF → HTF wins; name the veto explicitly.
+• Sharp trader tone: "Flux Score 78, Money Flow inflow, Engines green — STRONG BUY aligned with Daily
+  VWAP reclaim. I'm long above 94.2k; chop 62 so no runner fantasy." Not a tutorial on what Flux is."""
+
+
 def default_system_prompt(
     mode: str,
     *,
@@ -4288,12 +4343,12 @@ RULE 2 — GOD-MODE CONFLUENCE STACK (deep integration, zero blind spots)
 • LIQUIDATION CLUSTERS & BOOK PRESSURE: where are stops stacked, where does the cascade accelerate,
   which side of the book is thin. Liq clusters are targets AND invalidation guides — price hunts them.
 • BTC/ETH LEAD (when relevant): risk-on/off for alts, correlation breaks, HTF veto from majors.
-• ORACLE FLUX (when ORACLE FLUX block present in user prompt — confirmation only):
-  Treat Flux as a chart-indicator confirmation layer, not a standalone signal. Weave naturally when it
-  adds edge (e.g. "Flux shows 0.786 Fib rejection + Money Flow outflow + Oracle Score 74 → high-conviction short").
-  STRONG BUY/SELL flags are high-priority when aligned with HTF + structure — ignore or veto when they fight
-  Daily/4H. High Chop Strength = range/chop — cut conviction and prefer stand-down unless a clean sweep trigger.
-  Only mention Flux when it materially confirms or vetoes your read — never force it into every section.
+• ORACLE FLUX + FLUX OSCILLATOR (PUB;FuZ3wAGW / PUB;JAI7kwOr): CORE high-conviction framework — not optional
+  garnish. Oracle Score, Conviction, Money Flow, Flux Wave, Engines, STRONG BUY/SELL, Chop Strength, Fib
+  rejections (especially 0.786), VWAP confluence, pinch/rollover dots, oscillator OB/OS — weave into every
+  section that benefits. Live Flux block in user prompt = cite values; no block = infer the same read from
+  structure/VWAP/Fib/HA/momentum. STRONG flags are high-priority when HTF-aligned; veto when they fight
+  Daily/4H. High Chop = range/chop — cut conviction or stand down.
 • PREMIUM BREVITY: Tight trader prose. No filler. Each **Key Drivers** bullet: 2–4 crisp sentences max.
   One positioning story in **Liquidity & Sentiment** — never repeat Mobula numbers in **Technicals**.
 
@@ -4310,10 +4365,12 @@ recent liquidations. Mobula may add liquidity/volume context.
   squeeze setup, liquidity grab. Read like a leverage trader sizing a perp — never "Funding is X. OI is Y."
 
 **Confluence Summary** — EXACTLY one sentence. Grade STRONG / MODERATE / WEAK. Fuse structure + VWAP +
-  momentum + derivatives + liquidity + Oracle Flux (when present and meaningful) when available.
+  momentum + derivatives + liquidity + Oracle Flux (Score, Money Flow, Engines, Chop, STRONG flags) — always.
 
 Derivatives OVERRIDE or CONFIRM technical bias: extreme positive funding + crowded longs = counter-long fuel;
 negative funding + rising OI + short liqs = squeeze blueprint; OI collapse after spike = move spent.
+
+{oracle_flux_doctrine_block()}
 
 ═══════════════════════════════════════
 RULE 4 — CONVICTION, PSYCHOLOGY & EDGE CASES
@@ -4361,6 +4418,9 @@ REPORT STRUCTURE — EXACT HEADINGS (Flutter — DO NOT rename or reorder)
 **Overall Bias**: [Mildly Bullish / Mildly Bearish / Neutral] (Confidence: XX%)
 
 **Key Drivers**:
+- Oracle Flux Analysis: Oracle Score, Conviction, Money Flow, Flux Wave, Engines, STRONG BUY/SELL, Chop
+  Strength, Fib rejections (0.786 key), VWAP confluence, pinch/rollover (oscillator), divergence — live
+  Flux values when block present; otherwise infer from structure/HA/VWAP/Fib on requested TF.
 - Volume-Weighted Analysis: ...
 - Liquidity & Sentiment: ...
 - Heikin Ashi Analysis: ...
@@ -4394,7 +4454,8 @@ MODE: TRADE SETUP — ONE SHOT, EXECUTION-READY
 • **TRADE LEVELS** mandatory unless no ≥{MIN_RR_TP1:.1f}:1 edge exists — then defend flat in **If I Were to Trade Today...**
   with the exact trigger that would unlock the trade (price + structure + derivatives reset).
 • **If I Were to Trade Today...** must read like an execution card: executable trigger, not commentary.
-• Confluence bar: Daily VWAP + order blocks/FVGs + structure + momentum + funding/OI/L-S/liqs.
+• Confluence bar: Oracle Flux (Score/Money Flow/Engines/Chop/STRONG) + Daily VWAP + order blocks/FVGs +
+  structure + momentum + funding/OI/L-S/liqs.
 • TP1 (40% of position) ≥ {MIN_RR_TP1:.1f}:1 (target {TARGET_RR_TP1:.1f}:1+). TP2 (60% of position) =
   next liquidity pool / HTF objective.
 • Include invalidation price, optional runner logic, and leverage-awareness (cascade/squeeze risk).
@@ -4556,6 +4617,13 @@ REQUIRED BEHAVIOR:
 • TECHNICAL DEPTH: Daily VWAP, Previous Day VWAP, weekly/monthly VWAP, order blocks, FVGs, BOS/CHOCH,
   premium/discount, previous highs/lows, fakeouts, displacement, HTF/LTF alignment, DEX vs CEX volume delta,
   liquidation clusters, macro risk-on/off for alts.
+• ORACLE FLUX + FLUX OSCILLATOR (PUB;FuZ3wAGW / PUB;JAI7kwOr): core high-conviction framework on every
+  chart read. Oracle Score, Conviction, Money Flow (inflow/outflow), Flux Wave, Engines, STRONG BUY/SELL,
+  Chop Strength, Fib rejections (0.786 key), VWAP confluence, pinch/rollover dots, oscillator OB/OS,
+  divergence. When [ORACLE FLUX] live values are in context, cite them. When not, infer the same Flux-style
+  read from VWAP/Fib/HA/momentum. STRONG flags = high-priority when HTF-aligned; veto when fighting Daily/4H.
+  High Chop = stand down or scalp only. Weave Flux into bias and levels — never a standalone reason to trade
+  without structure + derivatives backing it.
 • LEVELS (when user wants a trade): Entry at $X, TP1 (40%) at $X, TP2 (60%) at $X, SL at $X (R:R X.X:1).
   TP1 = 40% of position (min {MIN_RR_TP1:.1f}:1 R:R, target {TARGET_RR_TP1:.1f}:1+). TP2 = 60% runner.
   SL = structural invalidation beyond sweep/OB/Daily VWAP.
@@ -4568,7 +4636,9 @@ REQUIRED BEHAVIOR:
 • Do NOT append the formal report disclaimer unless user asks for a full written report.
 • Chat format: conversational markdown OK; no mandatory report headings unless user requests a full report.
 
-You are talking to a leverage trader who paid for edge. Sound like you have real money on the line."""
+You are talking to a leverage trader who paid for edge. Sound like you have real money on the line.
+
+{oracle_flux_doctrine_block()}"""
 
 
 # ---------------------------------------------------------------------------
@@ -4891,15 +4961,24 @@ def extract_oracle_flux_from_request(request: AnalyzeRequest) -> Optional[Oracle
 
 
 def format_oracle_flux_prompt_block(flux: Optional[OracleFluxSnapshot]) -> str:
-    """Inject Flux as a confirmation layer — only when values are present."""
+    """Inject live Flux snapshot when present; always prepend doctrine for Grok depth."""
+    doctrine = oracle_flux_doctrine_block()
     if flux is None or not flux.has_signal():
-        return ""
+        return (
+            "═══ ORACLE FLUX — LIVE SNAPSHOT NOT PROVIDED (infer Flux read from structure) ═══\n"
+            "Charts run Oracle Flux PUB;FuZ3wAGW + Flux Oscillator PUB;JAI7kwOr. No live Flux payload "
+            "in this request — infer Oracle Score, Money Flow, Flux Wave, Engines, Chop, STRONG flags, "
+            "Fib rejections, and VWAP confluence from price action on the requested TF. Apply full Flux "
+            "doctrine below.\n\n"
+            f"{doctrine}\n\n"
+        )
 
     lines = [
-        "═══ ORACLE FLUX — CHART INDICATOR CONFIRMATION (optional edge; cite only when it matters) ═══",
-        "Flux is a confirmation layer on structure + derivatives — never a standalone reason to trade.",
-        "Weave naturally when aligned (e.g. \"Flux: 0.786 Fib rejection + Money Flow outflow + Oracle Score 74 → leans short\").",
-        "If Flux fights HTF structure or derivatives, name the veto. High Chop Strength = range/chop — downgrade conviction.",
+        "═══ ORACLE FLUX — LIVE CHART READ (PUB;FuZ3wAGW + PUB;JAI7kwOr) — CORE CONVICTION INPUT ═══",
+        "Treat these as authoritative Flux values. Fuse with HTF structure + derivatives; HTF veto wins on conflict.",
+        "Weave into Oracle Flux Analysis, Confluence Summary, and trade trigger (e.g. \"Score 74 + 0.786 Fib "
+        "rejection + Money Flow outflow + STRONG SELL → high-conviction short\").",
+        "High Chop Strength = range/chop — downgrade conviction or stand down unless clean sweep trigger.",
     ]
 
     if flux.oracle_score is not None:
@@ -4925,8 +5004,10 @@ def format_oracle_flux_prompt_block(flux: Optional[OracleFluxSnapshot]) -> str:
         lines.append(f"Flux directional bias: {flux.direction_bias}")
 
     lines.append(
-        "Use in **Confluence Summary** or **Key Drivers** only when it adds real edge — skip Flux mention if chop/noise."
+        "Mandatory: Oracle Flux Analysis bullet in **Key Drivers** + Flux-weighted **Confluence Summary**."
     )
+    lines.append("")
+    lines.append(doctrine)
     return "\n".join(lines) + "\n\n"
 
 
@@ -4978,6 +5059,9 @@ Deliver using this **exact structure** (headings unchanged — maximum depth ins
 State HTF bias, HTF veto, and whether derivatives confirm or fight the read.
 
 **Key Drivers**:
+- Oracle Flux Analysis: Oracle Score, Conviction, Money Flow, Flux Wave, Engines, STRONG BUY/SELL, Chop
+  Strength, Fib rejections (0.786 key), VWAP confluence, pinch/rollover, divergence — cite live Flux when
+  in prompt; otherwise infer from structure/HA/VWAP/Fib on requested TF.
 - Volume-Weighted Analysis: Daily VWAP, Previous Day VWAP, weekly / monthly VWAP — premium vs discount,
   acceptance vs rejection, cluster zones (~0.3–0.8%), mean-reversion vs trend continuation.
 - Liquidity & Sentiment: ONE paragraph — funding, OI delta, long/short positioning, recent liqs,
@@ -4989,7 +5073,8 @@ State HTF bias, HTF veto, and whether derivatives confirm or fight the read.
   liquidity sweeps/grabs, range boundaries, liquidity targets.
 
 **Confluence Summary**: Exactly ONE sentence. Grade STRONG / MODERATE / WEAK. State the edge in plain
-trader language — fuse technicals + derivatives + liquidity.
+trader language — fuse Oracle Flux (Score, Money Flow, Engines, Chop, STRONG flags) + technicals +
+derivatives + liquidity.
 
 **If I Were to Trade Today...**
 - [Long/Short] Setup: (or [Long/Short] SCALP Setup: if scalping)
@@ -5253,12 +5338,15 @@ Direction: {direction_instruction(direction)}
 
 ═══ LIVE MARKET DATA — ORDER OF AUTHORITY (synthesize; never list metrics alone) ═══
 {mobula_block}{coingecko_block}{market_fallback_note}{derivatives_block}
-Cross-check: Mobula liquidity + volume delta ↔ CoinGecko CEX vol ↔ funding/OI/L-S/liqs ↔ Daily VWAP/structure on {timeframe}.
-When Oracle Flux block is present above, cross-check Flux Fib/Money Flow/Score vs structure — confirm or veto, never force.
+Cross-check: Mobula liquidity + volume delta ↔ CoinGecko CEX vol ↔ funding/OI/L-S/liqs ↔ Daily VWAP/structure
+on {timeframe} ↔ Oracle Flux (Score, Money Flow, Engines, Chop, STRONG flags, Fib/VWAP confluence).
+Flux block above (live or inferred) must shape Oracle Flux Analysis, conviction %, and trade trigger.
 **Liquidity & Sentiment** opens with liquidity/trap/slippage read (Mobula or CEX volume), then derivatives story.
 Oracle Vision / Desk conviction must be data-backed — no generic % without citing liquidity or positioning.
 
 ═══ ANALYTICAL DEPTH CHECKLIST (Key Drivers — tight stream-trader prose) ═══
+• Oracle Flux first: Score, Conviction, Money Flow, Flux Wave, Engines, STRONG BUY/SELL, Chop Strength,
+  0.786/0.618 Fib rejections, VWAP confluence, pinch/rollover, divergence — live values or inferred read.
 • MTF: Weekly/Daily/4h → {timeframe} → LTF trigger. ALIGNED or CONFLICTED — name HTF veto if present.
 • TREND LAW: never fight the Daily/4H blindly — counter-trend demands printed reversal evidence
   (sweep + reclaim, displacement, funding flip) or the call is trade-with-trend / stand down.
