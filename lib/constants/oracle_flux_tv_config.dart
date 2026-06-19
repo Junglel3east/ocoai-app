@@ -1,4 +1,4 @@
-/// Public Oracle Flux TradingView study IDs — manual load only (Add Flux Tools button).
+/// Public Oracle Flux TradingView study IDs — manual load only (Indicators button).
 ///
 /// Analysis / Trade Setup charts start with no extra scripts. Home tab uses [buildTradingViewHTML].
 abstract final class OracleFluxTvConfig {
@@ -14,6 +14,11 @@ abstract final class OracleFluxTvConfig {
     defaultValue: 'mUlI6Xj4',
   );
 
+  static const indicatorLabel = 'Oracle Flux';
+  static const indicatorSubtitle = 'Main Indicator';
+  static const oscillatorLabel = 'Oracle Flux Oscillator';
+  static const oscillatorSubtitle = 'Momentum & Money Flow pane';
+
   /// TradingView widget expects published scripts as `PUB;<scriptId>`.
   static String tradingViewStudyId(String raw) {
     final id = raw.trim();
@@ -22,12 +27,18 @@ abstract final class OracleFluxTvConfig {
     return 'PUB;$id';
   }
 
-  /// JSON entries for widget `studies` — used only when user taps Add Flux Tools.
-  static String oracleFluxStudiesJson() {
-    final indicator = tradingViewStudyId(indicatorStudyId);
-    final oscillator = tradingViewStudyId(oscillatorStudyId);
-    return '''
-            {"id": "$indicator"},
-            {"id": "$oscillator"}''';
+  /// JSON entries for widget `studies` — only selected scripts (manual Indicators panel).
+  static String oracleFluxStudiesJson({
+    bool includeIndicator = false,
+    bool includeOscillator = false,
+  }) {
+    final lines = <String>[];
+    if (includeIndicator) {
+      lines.add('{"id": "${tradingViewStudyId(indicatorStudyId)}"}');
+    }
+    if (includeOscillator) {
+      lines.add('{"id": "${tradingViewStudyId(oscillatorStudyId)}"}');
+    }
+    return lines.join(',\n            ');
   }
 }

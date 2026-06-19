@@ -350,20 +350,22 @@ String tradingViewIntervalForTimeframe(String timeframe) {
 /// Base URL so TradingView scripts load reliably inside Android/iOS WebView.
 const String kTradingViewChartBaseUrl = 'https://www.tradingview.com';
 
-/// Trade Setup / Analysis chart — Heikin Ashi, no auto-loaded scripts (Flux is manual via button).
+/// Trade Setup / Analysis chart — Heikin Ashi, no auto-loaded scripts (Flux via Indicators button).
 String buildTradeSetupTradingViewHTML(
   String symbol, {
   String? tvSymbol,
   required String timeframe,
-  bool includeFluxTools = false,
+  bool includeFluxIndicator = false,
+  bool includeFluxOscillator = false,
 }) {
   final sym = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
   final resolvedTvSymbol = tvSymbol ?? CoinAccessPolicy.resolveTradingViewSymbol(sym);
   final interval = tradingViewIntervalForTimeframe(timeframe);
   // Public Flux scripts (PUB;mQP80cUC / PUB;mUlI6Xj4) load only via widget `studies` at init.
-  final studiesBlock = includeFluxTools
-      ? OracleFluxTvConfig.oracleFluxStudiesJson()
-      : '';
+  final studiesBlock = OracleFluxTvConfig.oracleFluxStudiesJson(
+    includeIndicator: includeFluxIndicator,
+    includeOscillator: includeFluxOscillator,
+  );
   return '''
     <html><head>
       <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
@@ -459,11 +461,13 @@ String buildTradeSetupTradingViewHTML(
     ''';
 }
 
-/// Reload chart with Oracle Flux studies (PUB IDs must be in widget `studies` at init).
-Future<void> loadOracleFluxToolsOnChart(
+/// Reload chart with selected Oracle Flux studies (PUB IDs must be in widget `studies` at init).
+Future<void> loadOracleFluxStudiesOnChart(
   WebViewController controller, {
   required String symbol,
   required String timeframe,
+  required bool includeIndicator,
+  required bool includeOscillator,
 }) async {
   final sym = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
   final tvSymbol = CoinAccessPolicy.resolveTradingViewSymbol(sym);
@@ -471,17 +475,18 @@ Future<void> loadOracleFluxToolsOnChart(
     sym,
     tvSymbol: tvSymbol,
     timeframe: timeframe,
-    includeFluxTools: true,
+    includeFluxIndicator: includeIndicator,
+    includeFluxOscillator: includeOscillator,
   );
   await controller.loadHtmlString(html, baseUrl: kTradingViewChartBaseUrl);
-  // Brief pause so WebView finishes init before success toast.
   await Future<void>.delayed(const Duration(milliseconds: 600));
 }
 
 WebViewController createTradeSetupTradingViewController(
   String symbol, {
   required String timeframe,
-  bool includeFluxTools = false,
+  bool includeFluxIndicator = false,
+  bool includeFluxOscillator = false,
 }) {
   final sym = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
   final tvSymbol = CoinAccessPolicy.resolveTradingViewSymbol(sym);
@@ -511,33 +516,233 @@ WebViewController createTradeSetupTradingViewController(
       sym,
       tvSymbol: tvSymbol,
       timeframe: timeframe,
-      includeFluxTools: includeFluxTools,
+      includeFluxIndicator: includeFluxIndicator,
+      includeFluxOscillator: includeFluxOscillator,
     ),
     baseUrl: kTradingViewChartBaseUrl,
   );
   return controller;
 }
 
-/// Premium/Expert-only control — manually adds Oracle Flux scripts to the chart.
-class _AddFluxToolsChartButton extends StatefulWidget {
+/// Selection returned from the restricted Oracle Flux Indicators panel.
+typedef _OracleFluxSelection = ({bool includeIndicator, bool includeOscillator});
+
+/// Premium/Expert-only Indicators picker — Oracle Flux scripts only.
+Future<_OracleFluxSelection?> showOracleFluxIndicatorPicker(BuildContext context) {
+  return showModalBottomSheet<_OracleFluxSelection>(
+    context: context,
+    backgroundColor: const Color(0xFF121212),
+    barrierColor: Colors.black54,
+    isScrollControlled: true,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+    ),
+    builder: (ctx) => const _OracleFluxIndicatorPickerSheet(),
+  );
+}
+
+class _OracleFluxIndicatorPickerSheet extends StatefulWidget {
+  const _OracleFluxIndicatorPickerSheet();
+
+  @override
+  State<_OracleFluxIndicatorPickerSheet> createState() =>
+      _OracleFluxIndicatorPickerSheetState();
+}
+
+class _OracleFluxIndicatorPickerSheetState extends State<_OracleFluxIndicatorPickerSheet> {
+  bool _mainSelected = true;
+  bool _oscSelected = true;
+
+  @override
+  Widget build(BuildContext context) {
+    final canApply = _mainSelected || _oscSelected;
+    return SafeArea(
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(16, 10, 16, 16 + MediaQuery.paddingOf(context).bottom),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Center(
+              child: Container(
+                width: 36,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.white24,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 14),
+            const Text(
+              'Indicators',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 18,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'Oracle Flux exclusive · Premium & Expert',
+              style: TextStyle(color: Colors.grey[500], fontSize: 12),
+            ),
+            const SizedBox(height: 14),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: const Color(0xFF0A0A0A),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.28)),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.search, size: 18, color: Colors.grey[600]),
+                  const SizedBox(width: 10),
+                  Text(
+                    'Oracle Flux scripts only',
+                    style: TextStyle(color: Colors.grey[600], fontSize: 13),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            _FluxIndicatorOptionTile(
+              title: OracleFluxTvConfig.indicatorLabel,
+              subtitle: OracleFluxTvConfig.indicatorSubtitle,
+              selected: _mainSelected,
+              onChanged: (v) => setState(() => _mainSelected = v),
+            ),
+            const SizedBox(height: 8),
+            _FluxIndicatorOptionTile(
+              title: OracleFluxTvConfig.oscillatorLabel,
+              subtitle: OracleFluxTvConfig.oscillatorSubtitle,
+              selected: _oscSelected,
+              onChanged: (v) => setState(() => _oscSelected = v),
+            ),
+            const SizedBox(height: 18),
+            FilledButton(
+              onPressed: canApply
+                  ? () => Navigator.pop(
+                        context,
+                        (
+                          includeIndicator: _mainSelected,
+                          includeOscillator: _oscSelected,
+                        ),
+                      )
+                  : null,
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFF00BFFF),
+                disabledBackgroundColor: const Color(0xFF1E3A4A),
+                foregroundColor: Colors.black,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              ),
+              child: const Text(
+                'Add to chart',
+                style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _FluxIndicatorOptionTile extends StatelessWidget {
+  final String title;
+  final String subtitle;
+  final bool selected;
+  final ValueChanged<bool> onChanged;
+
+  const _FluxIndicatorOptionTile({
+    required this.title,
+    required this.subtitle,
+    required this.selected,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: selected ? const Color(0xFF0D1F2A) : const Color(0xFF181818),
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: () => onChanged(!selected),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: selected
+                  ? const Color(0xFF00BFFF).withValues(alpha: 0.55)
+                  : const Color(0xFF2A2A2A),
+            ),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                Icons.show_chart,
+                size: 20,
+                color: selected ? const Color(0xFF00E5FF) : Colors.grey[600],
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: TextStyle(
+                        color: selected ? Colors.white : Colors.grey[300],
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      style: TextStyle(color: Colors.grey[600], fontSize: 11),
+                    ),
+                  ],
+                ),
+              ),
+              Checkbox(
+                value: selected,
+                onChanged: (v) => onChanged(v ?? false),
+                activeColor: const Color(0xFF00BFFF),
+                checkColor: Colors.black,
+                side: BorderSide(color: Colors.grey[700]!),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Premium/Expert-only Indicators button — opens restricted Oracle Flux picker.
+class _OracleFluxIndicatorsButton extends StatefulWidget {
   final WebViewController controller;
   final String symbol;
   final String timeframe;
 
-  const _AddFluxToolsChartButton({
+  const _OracleFluxIndicatorsButton({
     required this.controller,
     required this.symbol,
     required this.timeframe,
   });
 
   @override
-  State<_AddFluxToolsChartButton> createState() => _AddFluxToolsChartButtonState();
+  State<_OracleFluxIndicatorsButton> createState() => _OracleFluxIndicatorsButtonState();
 }
 
-class _AddFluxToolsChartButtonState extends State<_AddFluxToolsChartButton> {
+class _OracleFluxIndicatorsButtonState extends State<_OracleFluxIndicatorsButton> {
   bool _visible = false;
   bool _busy = false;
-  bool _added = false;
 
   @override
   void initState() {
@@ -548,34 +753,34 @@ class _AddFluxToolsChartButtonState extends State<_AddFluxToolsChartButton> {
   Future<void> _loadTier() async {
     await SubscriptionPlanStore.load();
     if (!mounted) return;
-    setState(() => _visible = SubscriptionPlanStore.isPremiumOrHigher && !_added);
+    setState(() => _visible = SubscriptionPlanStore.isPremiumOrHigher);
   }
 
   Future<void> _onTap() async {
-    if (_busy || _added) return;
+    if (_busy) return;
+
+    final selection = await showOracleFluxIndicatorPicker(context);
+    if (selection == null) return;
+    if (!selection.includeIndicator && !selection.includeOscillator) return;
+
     setState(() => _busy = true);
 
     var ok = false;
     try {
-      // PUB scripts must be in widget `studies` at init — reload chart with Flux baked in.
-      await loadOracleFluxToolsOnChart(
+      await loadOracleFluxStudiesOnChart(
         widget.controller,
         symbol: widget.symbol,
         timeframe: widget.timeframe,
+        includeIndicator: selection.includeIndicator,
+        includeOscillator: selection.includeOscillator,
       );
       ok = true;
     } catch (e) {
-      debugPrint('[Chart] Add Flux Tools failed: $e');
+      debugPrint('[Chart] Oracle Flux indicators failed: $e');
     }
 
     if (!mounted) return;
-    setState(() {
-      _busy = false;
-      if (ok) {
-        _added = true;
-        _visible = false;
-      }
-    });
+    setState(() => _busy = false);
 
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
@@ -594,7 +799,6 @@ class _AddFluxToolsChartButtonState extends State<_AddFluxToolsChartButton> {
   Widget build(BuildContext context) {
     if (!_visible) return const SizedBox.shrink();
 
-    // Opaque hit target so WebView does not steal taps from the overlay button.
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: _busy ? null : _onTap,
@@ -612,21 +816,28 @@ class _AddFluxToolsChartButtonState extends State<_AddFluxToolsChartButton> {
               ),
             ],
           ),
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 7),
           child: _busy
               ? const SizedBox(
                   width: 14,
                   height: 14,
                   child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00E5FF)),
                 )
-              : const Text(
-                  'Add Flux Tools',
-                  style: TextStyle(
-                    color: Color(0xFF00E5FF),
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: 0.2,
-                  ),
+              : const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.auto_graph, size: 15, color: Color(0xFF00E5FF)),
+                    SizedBox(width: 5),
+                    Text(
+                      'Indicators',
+                      style: TextStyle(
+                        color: Color(0xFF00E5FF),
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 0.2,
+                      ),
+                    ),
+                  ],
                 ),
         ),
       ),
@@ -692,7 +903,7 @@ class _TradingViewChartPanelState extends State<TradingViewChartPanel> {
           top: 6,
           left: 6,
           child: widget.tradeSetupTimeframe != null
-              ? _AddFluxToolsChartButton(
+              ? _OracleFluxIndicatorsButton(
                   controller: widget.controller,
                   symbol: widget.symbol,
                   timeframe: widget.tradeSetupTimeframe!,
@@ -807,7 +1018,7 @@ class _FullScreenChartScreenState extends State<FullScreenChartScreen> {
               Positioned(
                 top: 6,
                 left: 6,
-                child: _AddFluxToolsChartButton(
+                child: _OracleFluxIndicatorsButton(
                   controller: _controller,
                   symbol: widget.symbol,
                   timeframe: tf,
