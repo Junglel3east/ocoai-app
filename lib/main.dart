@@ -350,6 +350,102 @@ String tradingViewIntervalForTimeframe(String timeframe) {
 /// Base URL so TradingView scripts load reliably inside Android/iOS WebView.
 const String kTradingViewChartBaseUrl = 'https://www.tradingview.com';
 
+/// Bridges TradingView WebView lifecycle → Flutter (page finished + chartReady).
+final Expando<OcoChartWebBridge> _ocoChartBridges = Expando<OcoChartWebBridge>();
+
+class OcoChartWebBridge {
+  Completer<void>? _pageFinished;
+  Completer<String>? _chartReady;
+
+  /// Reset waiters before a new HTML load (Flux reload path).
+  void beginLoad() {
+    _pageFinished = Completer<void>();
+    _chartReady = Completer<String>();
+    debugPrint('[Chart] OcoChartWebBridge: beginLoad — waiting for page + chartReady');
+  }
+
+  void attachOnce(WebViewController controller) {
+    controller.setNavigationDelegate(
+      NavigationDelegate(
+        onPageStarted: (url) => debugPrint('[Chart] onPageStarted: $url'),
+        onPageFinished: (url) {
+          debugPrint('[Chart] onPageFinished: $url');
+          final c = _pageFinished;
+          if (c != null && !c.isCompleted) c.complete();
+        },
+        onWebResourceError: (WebResourceError error) {
+          debugPrint(
+            '[Chart] WebResourceError: ${error.description} (code ${error.errorCode})',
+          );
+        },
+      ),
+    );
+
+    controller.addJavaScriptChannel(
+      'OcoChartBridge',
+      onMessageReceived: (JavaScriptMessage message) {
+        final payload = message.message;
+        debugPrint('[Chart] OcoChartBridge received: $payload');
+        if (payload.startsWith('chartReady')) {
+          final c = _chartReady;
+          if (c != null && !c.isCompleted) c.complete(payload);
+        }
+      },
+    );
+
+    if (controller.platform is AndroidWebViewController) {
+      (controller.platform as AndroidWebViewController).setOnConsoleMessage(
+        (JavaScriptConsoleMessage message) {
+          debugPrint('[Chart JS ${message.level.name}] ${message.message}');
+        },
+      );
+    }
+  }
+
+  Future<bool> waitForChartReady({
+    Duration pageTimeout = const Duration(seconds: 15),
+    Duration chartTimeout = const Duration(seconds: 25),
+  }) async {
+    try {
+      await _pageFinished!.future.timeout(pageTimeout);
+      debugPrint('[Chart] onPageFinished confirmed — awaiting OcoChartBridge chartReady');
+    } on TimeoutException {
+      debugPrint(
+        '[Chart] TIMEOUT: onPageFinished not received within ${pageTimeout.inSeconds}s',
+      );
+      return false;
+    } catch (e) {
+      debugPrint('[Chart] error waiting for onPageFinished: $e');
+      return false;
+    }
+
+    try {
+      final signal = await _chartReady!.future.timeout(chartTimeout);
+      debugPrint('[Chart] chartReady confirmed: $signal');
+      return true;
+    } on TimeoutException {
+      debugPrint(
+        '[Chart] TIMEOUT: chartReady not received within ${chartTimeout.inSeconds}s',
+      );
+      return false;
+    } catch (e) {
+      debugPrint('[Chart] error waiting for chartReady: $e');
+      return false;
+    }
+  }
+}
+
+OcoChartWebBridge _bridgeFor(WebViewController controller) {
+  var bridge = _ocoChartBridges[controller];
+  if (bridge == null) {
+    bridge = OcoChartWebBridge();
+    bridge.attachOnce(controller);
+    _ocoChartBridges[controller] = bridge;
+    debugPrint('[Chart] OcoChartWebBridge attached to WebViewController');
+  }
+  return bridge;
+}
+
 /// Trade Setup / Analysis chart — Heikin Ashi, no auto-loaded scripts (Flux via Indicators button).
 String buildTradeSetupTradingViewHTML(
   String symbol, {
@@ -378,7 +474,7 @@ String buildTradeSetupTradingViewHTML(
       <div id="tradingview"></div>
       <script src="https://s3.tradingview.com/tv.js"></script>
       <script>
-        new TradingView.widget({
+        var ocoTvWidget = new TradingView.widget({
           "autosize": true,
           "symbol": "$resolvedTvSymbol",
           "interval": "$interval",
@@ -456,19 +552,38 @@ String buildTradeSetupTradingViewHTML(
           "container_id": "tradingview",
           "support_host": "https://www.tradingview.com"
         });
+        ocoTvWidget.onChartReady(function() {
+          try {
+            if (typeof OcoChartBridge !== 'undefined') {
+              OcoChartBridge.postMessage('chartReady');
+            }
+          } catch (err) {
+            try {
+              OcoChartBridge.postMessage('chartError:' + (err && err.message ? err.message : 'unknown'));
+            } catch (ignore) {}
+          }
+        });
       </script>
     </body></html>
     ''';
 }
 
-/// Reload chart with selected Oracle Flux studies (PUB IDs must be in widget `studies` at init).
-Future<void> loadOracleFluxStudiesOnChart(
+/// Reload chart with selected Oracle Flux studies; returns true only after chartReady.
+Future<bool> loadOracleFluxStudiesOnChart(
   WebViewController controller, {
   required String symbol,
   required String timeframe,
   required bool includeIndicator,
   required bool includeOscillator,
 }) async {
+  final bridge = _ocoChartBridges[controller];
+  if (bridge == null) {
+    debugPrint('[Chart] loadOracleFluxStudiesOnChart: no OcoChartWebBridge attached');
+    return false;
+  }
+
+  bridge.beginLoad();
+
   final sym = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
   final tvSymbol = CoinAccessPolicy.resolveTradingViewSymbol(sym);
   final html = buildTradeSetupTradingViewHTML(
@@ -478,8 +593,26 @@ Future<void> loadOracleFluxStudiesOnChart(
     includeFluxIndicator: includeIndicator,
     includeFluxOscillator: includeOscillator,
   );
-  await controller.loadHtmlString(html, baseUrl: kTradingViewChartBaseUrl);
-  await Future<void>.delayed(const Duration(milliseconds: 600));
+
+  debugPrint(
+    '[Chart] loadOracleFluxStudiesOnChart: reloading HTML '
+    '(indicator=$includeIndicator oscillator=$includeOscillator)',
+  );
+
+  try {
+    await controller.loadHtmlString(html, baseUrl: kTradingViewChartBaseUrl);
+  } catch (e) {
+    debugPrint('[Chart] loadHtmlString failed: $e');
+    return false;
+  }
+
+  final ready = await bridge.waitForChartReady();
+  if (ready) {
+    debugPrint('[Chart] Oracle Flux chart reload — chartReady confirmed');
+  } else {
+    debugPrint('[Chart] Oracle Flux chart reload — chartReady NOT confirmed (timeout or error)');
+  }
+  return ready;
 }
 
 WebViewController createTradeSetupTradingViewController(
@@ -510,6 +643,8 @@ WebViewController createTradeSetupTradingViewController(
     android.setMediaPlaybackRequiresUserGesture(true);
     android.setMixedContentMode(MixedContentMode.compatibilityMode);
   }
+
+  _bridgeFor(controller);
 
   controller.loadHtmlString(
     buildTradeSetupTradingViewHTML(
@@ -767,14 +902,13 @@ class _OracleFluxIndicatorsButtonState extends State<_OracleFluxIndicatorsButton
 
     var ok = false;
     try {
-      await loadOracleFluxStudiesOnChart(
+      ok = await loadOracleFluxStudiesOnChart(
         widget.controller,
         symbol: widget.symbol,
         timeframe: widget.timeframe,
         includeIndicator: selection.includeIndicator,
         includeOscillator: selection.includeOscillator,
       );
-      ok = true;
     } catch (e) {
       debugPrint('[Chart] Oracle Flux indicators failed: $e');
     }
@@ -787,7 +921,7 @@ class _OracleFluxIndicatorsButtonState extends State<_OracleFluxIndicatorsButton
         content: Text(
           ok
               ? 'Oracle Flux tools added successfully'
-              : 'Could not add Flux tools — try again',
+              : 'Failed to load Oracle Flux tools. Please try refreshing the chart.',
         ),
         behavior: SnackBarBehavior.floating,
         backgroundColor: ok ? const Color(0xFF1A2A1A) : null,
