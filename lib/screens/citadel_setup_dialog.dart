@@ -16,6 +16,7 @@ const String _kCitadelExchangeLinkedPref = 'citadel_exchange_linked';
 
 /// BloFin exchange id sent when linking keys (live vs demo resolved on backend).
 const String _kCitadelBlofinExchangeId = 'blofin';
+const String _kCitadelBitunixExchangeId = 'bitunix';
 
 // ─── Legal & exchange guidance copy ─────────────────────────────────────────
 
@@ -435,7 +436,7 @@ class _CitadelLeverageSelector extends StatelessWidget {
           ),
           const SizedBox(height: 6),
           Text(
-            'Applied on BloFin before each Citadel MARKET order.',
+            'Applied on your connected exchange before each Citadel MARKET order.',
             style: TextStyle(fontSize: 11.5, color: Colors.grey[600], height: 1.35),
           ),
         ],
@@ -979,6 +980,10 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
 
   bool _saving = false;
   bool _useDemoMode = true;
+  String _selectedExchange = _kCitadelBlofinExchangeId;
+
+  bool get _isBitunix => _selectedExchange == _kCitadelBitunixExchangeId;
+  bool get _isBlofin => !_isBitunix;
 
   /// Shown after successful exchange key link (also restored from prefs on open).
   bool _isExchangeLinked = false;
@@ -1047,6 +1052,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
     setState(() {
       _useDemoMode = demoPref;
       OracleCitadelStore.useDemoMode = demoPref;
+      _selectedExchange = OracleCitadelStore.selectedExchange;
       _isExchangeLinked = linked && OracleCitadelStore.isConfigured;
       _connectedExchangeLabel = label;
       _lastConnectedAt = lastConnected;
@@ -1080,8 +1086,9 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
   }
 
   String get _displayExchangeLabel {
-    if (_useDemoMode) return 'BloFin';
-    return _connectedExchangeLabel.isNotEmpty ? _connectedExchangeLabel : 'Exchange';
+    if (_isBitunix) return 'Bitunix Live';
+    if (_useDemoMode) return 'BloFin Demo';
+    return _connectedExchangeLabel.isNotEmpty ? _connectedExchangeLabel : 'BloFin Live';
   }
 
   @override
@@ -1150,11 +1157,16 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
         await _persistCitadelUiPrefs();
       }
       if (exchangeKey.isNotEmpty && exchangeSecret.isNotEmpty) {
-        if (exchangePassphrase.isEmpty) {
+        if (_isBlofin && exchangePassphrase.isEmpty) {
           throw OracleCitadelException(
             'BloFin API Passphrase is required. Enter the passphrase you set when creating your API key.',
           );
         }
+        if (_isBitunix && _useDemoMode) {
+          setState(() => _useDemoMode = false);
+          await OracleCitadelStore.saveDemoMode(false);
+        }
+        await OracleCitadelStore.saveSelectedExchange(_selectedExchange);
         await _persistCitadelUiPrefs();
         if (!mounted) return;
         await _citadelLinkExchangeKeys(
@@ -1162,8 +1174,8 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
           exchangeApiKey: exchangeKey,
           exchangeApiSecret: exchangeSecret,
           exchangePassphrase: exchangePassphrase,
-          exchange: _kCitadelBlofinExchangeId,
-          useDemoMode: _useDemoMode,
+          exchange: _selectedExchange,
+          useDemoMode: _isBitunix ? false : _useDemoMode,
           riskPercent: risk,
         );
         final verified = await OracleCitadelService.verifyServerLinked();
@@ -1173,7 +1185,9 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
             'Try Save & Connect again, or contact support if this persists.',
           );
         }
-        final label = _useDemoMode ? 'BloFin' : 'Exchange API';
+        final label = _isBitunix
+            ? 'Bitunix Live'
+            : (_useDemoMode ? 'BloFin Demo' : 'BloFin Live');
         await _persistConnectionStatus(exchangeLabel: label, demoMode: _useDemoMode);
         if (!mounted) return;
         setState(() {
@@ -1206,8 +1220,10 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
       final serverOk = await OracleCitadelService.verifyServerLinked();
       if (!serverOk) {
         throw OracleCitadelException(
-          'BloFin API Key, Secret, and Passphrase are required on the server. '
-          'Enter them below and tap Save & Connect.',
+          _isBitunix
+              ? 'Bitunix API Key and Secret are required on the server. Enter them below and tap Save & Connect.'
+              : 'BloFin API Key, Secret, and Passphrase are required on the server. '
+                  'Enter them below and tap Save & Connect.',
         );
       }
 
@@ -1330,6 +1346,55 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                       const SizedBox(height: 12),
                       _CitadelAppApiKeyCard(apiKey: _appApiKey, enabled: !_saving),
                       const SizedBox(height: 12),
+                      Text(
+                        'Exchange',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.grey[400],
+                          letterSpacing: 0.6,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      SegmentedButton<String>(
+                        segments: const [
+                          ButtonSegment(
+                            value: _kCitadelBlofinExchangeId,
+                            label: Text('BloFin'),
+                            icon: Icon(Icons.swap_horiz_rounded, size: 18),
+                          ),
+                          ButtonSegment(
+                            value: _kCitadelBitunixExchangeId,
+                            label: Text('Bitunix'),
+                            icon: Icon(Icons.candlestick_chart_rounded, size: 18),
+                          ),
+                        ],
+                        selected: {_selectedExchange},
+                        style: ButtonStyle(
+                          visualDensity: VisualDensity.compact,
+                        ),
+                        onSelectionChanged: _saving
+                            ? null
+                            : (selection) async {
+                                if (!mounted || selection.isEmpty) return;
+                                final next = selection.first;
+                                setState(() {
+                                  _selectedExchange = next;
+                                  if (next == _kCitadelBitunixExchangeId) {
+                                    _useDemoMode = false;
+                                  }
+                                });
+                                await OracleCitadelStore.saveSelectedExchange(next);
+                              },
+                      ),
+                      if (_isBitunix) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          'Bitunix is live-only (API Key + Secret). No passphrase required.',
+                          style: TextStyle(fontSize: 11.5, color: Colors.grey[500], height: 1.35),
+                        ),
+                      ],
+                      const SizedBox(height: 12),
                       const _CitadelDemoKeysNotice(),
                       const SizedBox(height: 12),
                       _CitadelSetupField(
@@ -1346,50 +1411,51 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                         enabled: !_saving,
                       ),
                       const SizedBox(height: 14),
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(14),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFFFF9800).withValues(alpha: 0.1),
-                          borderRadius: BorderRadius.circular(14),
-                          border: Border.all(color: const Color(0xFFFF9800).withValues(alpha: 0.45)),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            const Row(
-                              children: [
-                                Icon(Icons.key_outlined, color: Color(0xFFFF9800), size: 18),
-                                SizedBox(width: 8),
-                                Expanded(
-                                  child: Text(
-                                    'BloFin API Passphrase — required for live & demo trades',
-                                    style: TextStyle(
-                                      fontSize: 13,
-                                      fontWeight: FontWeight.w700,
-                                      color: Color(0xFFFF9800),
+                      if (_isBlofin)
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(14),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFFF9800).withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(14),
+                            border: Border.all(color: const Color(0xFFFF9800).withValues(alpha: 0.45)),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              const Row(
+                                children: [
+                                  Icon(Icons.key_outlined, color: Color(0xFFFF9800), size: 18),
+                                  SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      'BloFin API Passphrase — required for live & demo trades',
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w700,
+                                        color: Color(0xFFFF9800),
+                                      ),
                                     ),
                                   ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 10),
-                            _CitadelSetupField(
-                              label: 'API Passphrase',
-                              controller: _exchangePassphraseController,
-                              obscure: true,
-                              enabled: !_saving,
-                              hintText: 'Same passphrase you set when creating the BloFin API key',
-                            ),
-                            const SizedBox(height: 6),
-                            Text(
-                              'Without this, live orders fail with signature errors. Each API key has its own passphrase.',
-                              style: TextStyle(fontSize: 11.5, color: Colors.grey[500], height: 1.35),
-                            ),
-                          ],
+                                ],
+                              ),
+                              const SizedBox(height: 10),
+                              _CitadelSetupField(
+                                label: 'API Passphrase',
+                                controller: _exchangePassphraseController,
+                                obscure: true,
+                                enabled: !_saving,
+                                hintText: 'Same passphrase you set when creating the BloFin API key',
+                              ),
+                              const SizedBox(height: 6),
+                              Text(
+                                'Without this, live orders fail with signature errors. Each API key has its own passphrase.',
+                                style: TextStyle(fontSize: 11.5, color: Colors.grey[500], height: 1.35),
+                              ),
+                            ],
+                          ),
                         ),
-                      ),
-                      const SizedBox(height: 12),
+                      if (_isBlofin) const SizedBox(height: 12),
                       _CitadelSetupField(
                         label: 'Risk % per trade',
                         controller: _riskController,
@@ -1415,12 +1481,14 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                             style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
                           ),
                           subtitle: Text(
-                            'Leave OFF for LIVE trading (default). ON enables BloFin Demo for testing.',
+                            _isBitunix
+                                ? 'Bitunix supports live trading only — keep Demo OFF.'
+                                : 'Leave OFF for LIVE trading (default). ON enables BloFin Demo for testing.',
                             style: TextStyle(fontSize: 12, color: Colors.grey[500]),
                           ),
                           value: _useDemoMode,
                           activeThumbColor: const Color(0xFF00BFFF),
-                          onChanged: _saving
+                          onChanged: (_saving || _isBitunix)
                               ? null
                               : (value) async {
                                   if (!mounted) return;
@@ -1489,7 +1557,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                       ),
                       const SizedBox(height: 8),
                       const Text(
-                        'BloFin is our launch exchange. More exchanges coming soon.',
+                        'BloFin and Bitunix are supported for live Citadel execution. More exchanges coming soon.',
                         style: TextStyle(
                           fontSize: 12,
                           fontStyle: FontStyle.italic,

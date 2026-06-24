@@ -1440,6 +1440,7 @@ abstract final class OracleCitadelStore {
   static const _riskPercentKey = 'citadel_risk_percent';
   static const _leverageKey = 'citadel_leverage';
   static const _demoModeKey = 'citadel_use_demo_mode';
+  static const _selectedExchangeKey = 'citadel_selected_exchange';
 
   static String userId = 'demo_user';
   static String apiKey = '';
@@ -1447,6 +1448,8 @@ abstract final class OracleCitadelStore {
   static double defaultLeverage = 5.0;
   /// BloFin Demo is the default — demo API keys only work against the demo host.
   static bool useDemoMode = true;
+  /// Connected exchange: `blofin` or `bitunix`.
+  static String selectedExchange = 'blofin';
 
   static bool get isConfigured => userId.trim().isNotEmpty && apiKey.trim().isNotEmpty;
 
@@ -1465,6 +1468,24 @@ abstract final class OracleCitadelStore {
     if (defaultLeverage < 1) defaultLeverage = 1;
     if (defaultLeverage > 100) defaultLeverage = 100;
     useDemoMode = prefs.getBool(_demoModeKey) ?? true;
+    selectedExchange = prefs.getString(_selectedExchangeKey) ?? 'blofin';
+    if (selectedExchange != 'bitunix') selectedExchange = 'blofin';
+  }
+
+  static String get exchangeDisplayLabel {
+    if (selectedExchange == 'bitunix') return 'Bitunix Live';
+    if (useDemoMode) return 'BloFin Demo';
+    return 'BloFin Live';
+  }
+
+  static Future<void> saveSelectedExchange(String exchange) async {
+    selectedExchange = exchange == 'bitunix' ? 'bitunix' : 'blofin';
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_selectedExchangeKey, selectedExchange);
+    if (selectedExchange == 'bitunix') {
+      useDemoMode = false;
+      await prefs.setBool(_demoModeKey, false);
+    }
   }
 
   static Future<void> saveDemoMode(bool enabled) async {
@@ -1769,6 +1790,7 @@ abstract final class OracleCitadelService {
     required String exchangeApiKey,
     required String exchangeApiSecret,
     String? exchangePassphrase,
+    String exchange = 'blofin',
     bool useDemoMode = false,
     double riskPercent = 1.0,
   }) async {
@@ -1778,6 +1800,7 @@ abstract final class OracleCitadelService {
       'app_api_key': OracleCitadelStore.apiKey,
       'api_key': exchangeApiKey,
       'api_secret': exchangeApiSecret,
+      'exchange': exchange,
       'use_demo_mode': useDemoMode,
       'demo_mode': useDemoMode,
       'risk_percent': riskPercent,
@@ -1826,13 +1849,22 @@ abstract final class OracleCitadelService {
       } catch (_) {}
 
       if (response.statusCode == 200 && body['linked'] == true) {
+        final ex = (body['exchange']?.toString() ?? '').toLowerCase();
+        if (ex.contains('bitunix')) {
+          await OracleCitadelStore.saveSelectedExchange('bitunix');
+        } else if (ex.contains('blofin')) {
+          await OracleCitadelStore.saveSelectedExchange('blofin');
+        }
+        if (body['use_demo_mode'] is bool) {
+          await OracleCitadelStore.saveDemoMode(body['use_demo_mode'] as bool);
+        }
         await OracleCitadelStore.markExchangeLinked(true);
         return const CitadelServerLinkStatus(linked: true);
       }
 
       final message = body['user_message']?.toString() ??
           _parseUserMessage(response) ??
-          'Exchange keys not found on server. Re-link BloFin keys in Oracle Citadel Setup.';
+          'Exchange keys not found on server. Re-link keys in Oracle Citadel Setup.';
       final errorCode = body['error_code']?.toString();
       debugPrint(
         '[Citadel] server link check failed status=${response.statusCode} '
@@ -1911,7 +1943,7 @@ abstract final class OracleCitadelService {
         'MARKET order could not be sent (${response.statusCode}).';
     final whitelistIp = body['whitelist_ip']?.toString().trim();
     if (whitelistIp != null && whitelistIp.isNotEmpty) {
-      final envLabel = OracleCitadelStore.useDemoMode ? 'BloFin Demo' : 'BloFin Live';
+      final envLabel = OracleCitadelStore.exchangeDisplayLabel;
       friendly = '$friendly\n\nWhitelist this IP in $envLabel → API Management: $whitelistIp';
     }
     throw OracleCitadelException(
@@ -1972,7 +2004,7 @@ abstract final class OracleCitadelService {
         'LIMIT order could not be sent (${response.statusCode}).';
     final whitelistIp = body['whitelist_ip']?.toString().trim();
     if (whitelistIp != null && whitelistIp.isNotEmpty) {
-      final envLabel = OracleCitadelStore.useDemoMode ? 'BloFin Demo' : 'BloFin Live';
+      final envLabel = OracleCitadelStore.exchangeDisplayLabel;
       friendly = '$friendly\n\nWhitelist this IP in $envLabel → API Management: $whitelistIp';
     }
     throw OracleCitadelException(
@@ -2042,7 +2074,10 @@ Future<void> _sendMarketOrder(
     if (messengerContext.mounted) {
       ScaffoldMessenger.of(messengerContext).showSnackBar(
         SnackBar(
-          content: Text('MARKET ${direction.toUpperCase()} on $coin sent to BloFin'),
+          content: Text(
+            'MARKET ${direction.toUpperCase()} on $coin sent to '
+            '${OracleCitadelStore.selectedExchange == 'bitunix' ? 'Bitunix' : 'BloFin'}',
+          ),
           backgroundColor: const Color(0xFF43A047),
           behavior: SnackBarBehavior.floating,
           duration: const Duration(seconds: 4),
@@ -2142,7 +2177,10 @@ Future<void> _sendLimitOrder(
     if (messengerContext.mounted) {
       ScaffoldMessenger.of(messengerContext).showSnackBar(
         SnackBar(
-          content: Text('LIMIT ${direction.toUpperCase()} on $coin placed on BloFin'),
+          content: Text(
+            'LIMIT ${direction.toUpperCase()} on $coin placed on '
+            '${OracleCitadelStore.selectedExchange == 'bitunix' ? 'Bitunix' : 'BloFin'}',
+          ),
           backgroundColor: const Color(0xFF43A047),
           behavior: SnackBarBehavior.floating,
           duration: const Duration(seconds: 4),
@@ -2266,9 +2304,7 @@ Future<void> _showCitadelExecuteChoiceDialog(
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            OracleCitadelStore.useDemoMode
-                                ? 'Market or Limit · BloFin Demo'
-                                : 'Market or Limit · BloFin LIVE',
+                            'Market or Limit · ${OracleCitadelStore.exchangeDisplayLabel}',
                             style: const TextStyle(fontSize: 13, color: Colors.grey),
                           ),
                         ],
@@ -2298,7 +2334,7 @@ Future<void> _showCitadelExecuteChoiceDialog(
                   iconColor: const Color(0xFF43A047),
                   title: 'Execute as MARKET Order NOW',
                   subtitle:
-                      'Enter immediately at the current market price on BloFin. '
+                      'Enter immediately at the current market price on ${OracleCitadelStore.selectedExchange == 'bitunix' ? 'Bitunix' : 'BloFin'}. '
                       'Stop loss is placed on entry; TP1 (40%) and TP2 (60%) legs follow fill.',
                   highlighted: true,
                   showSliders: false,
@@ -2331,7 +2367,7 @@ Future<void> _showCitadelExecuteChoiceDialog(
                   iconColor: const Color(0xFF00BFFF),
                   title: 'Place LIMIT Order at Entry',
                   subtitle:
-                      'Rest on the BloFin order book at ${_formatCitadelPrice(plannedEntry)}. '
+                      'Rest on the ${OracleCitadelStore.selectedExchange == 'bitunix' ? 'Bitunix' : 'BloFin'} order book at ${_formatCitadelPrice(plannedEntry)}. '
                       'Stop loss attaches to the limit order. TP1/TP2 are set after the order fills.',
                   highlighted: true,
                   showSliders: false,
@@ -2405,6 +2441,9 @@ void _showCitadelLimitPostPlacementDialog(
                 (limitResult['blofin_confirm'] as Map)['average_price']?.toString() ?? '',
               )
             : null);
+    final exchangeLabel = limitResult['exchange']?.toString() == 'bitunix'
+        ? 'Bitunix'
+        : 'BloFin';
     final confidence = analysis.confidencePercent;
     final grade = analysis.confluenceGrade;
 
@@ -2458,8 +2497,8 @@ void _showCitadelLimitPostPlacementDialog(
                             if (displayCoin.isNotEmpty)
                               Text(
                                 filledImmediately
-                                    ? '$displayCoin $displayDirection · BloFin Position'
-                                    : '$displayCoin $displayDirection · BloFin Open Orders',
+                                    ? '$displayCoin $displayDirection · $exchangeLabel Position'
+                                    : '$displayCoin $displayDirection · $exchangeLabel Open Orders',
                                 style: TextStyle(fontSize: 12.5, color: Colors.grey[400]),
                               ),
                           ],
@@ -2478,7 +2517,7 @@ void _showCitadelLimitPostPlacementDialog(
                 const SizedBox(height: 8),
                 Text(
                   filledImmediately
-                      ? 'Your limit filled immediately on BloFin. TP1 (40%) and TP2 (60%) legs were attached when possible.'
+                      ? 'Your limit filled immediately on $exchangeLabel. TP1 (40%) and TP2 (60%) legs were attached when possible.'
                       : 'Your limit is on the book — no position until price hits entry. '
                           'TP1 (40%) and TP2 (60%) will apply after fill.',
                   style: TextStyle(fontSize: 13, color: Colors.grey[400], height: 1.45),
@@ -2588,6 +2627,9 @@ void _showCitadelPostExecutionReviewDialog(
     final displayCoin = marketResult['coin']?.toString() ?? coin;
     final displayDirection =
         (marketResult['direction']?.toString() ?? direction).toUpperCase();
+    final exchangeLabel = marketResult['exchange']?.toString() == 'bitunix'
+        ? 'Bitunix'
+        : 'BloFin';
 
     final confidence = analysis.confidencePercent;
     final grade = analysis.confluenceGrade;
@@ -2636,7 +2678,7 @@ void _showCitadelPostExecutionReviewDialog(
                             ),
                             if (displayCoin.isNotEmpty)
                               Text(
-                                '$displayCoin $displayDirection · BloFin',
+                                '$displayCoin $displayDirection · $exchangeLabel',
                                 style: TextStyle(fontSize: 12.5, color: Colors.grey[400]),
                               ),
                           ],

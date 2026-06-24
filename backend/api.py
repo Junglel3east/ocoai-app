@@ -84,6 +84,7 @@ if _root_env.is_file():
 
 # Dedicated CoinGecko Pro service (imported after load_dotenv so env is resolved).
 import coingecko_service as cg
+import bitunix_service as bux
 
 # Required on Railway: Variables → GROK_API_KEY
 GROK_API_KEY = (os.getenv("GROK_API_KEY") or "").strip()
@@ -1870,11 +1871,29 @@ def resolve_citadel_exchange_profile(
     use_demo_mode: bool,
 ) -> dict[str, Any]:
     """
-    Oracle Citadel MARKET execution is BloFin-only. Empty/unspecified exchange defaults to BloFin
-    (demo host when use_demo_mode is True, live host otherwise).
+    Oracle Citadel execution: BloFin (demo or live) or Bitunix (live only).
+    Empty/unspecified exchange defaults to BloFin.
     """
     raw = (exchange or "").strip().lower()
+    is_bitunix = "bitunix" in raw
     is_blofin = "blofin" in raw or raw in ("", "unspecified")
+
+    if is_bitunix:
+        if use_demo_mode:
+            return {
+                "exchange": "bitunix",
+                "environment": "live",
+                "api_base_url": bux.BITUNIX_LIVE_API_BASE_URL,
+                "blofin_demo": False,
+                "demo_rejected": True,
+            }
+        return {
+            "exchange": "bitunix",
+            "environment": "live",
+            "api_base_url": bux.BITUNIX_LIVE_API_BASE_URL,
+            "blofin_demo": False,
+            "demo_rejected": False,
+        }
 
     if use_demo_mode and is_blofin:
         return {
@@ -1920,6 +1939,14 @@ def _normalize_citadel_exchange_record(record: dict[str, Any]) -> dict[str, Any]
     exchange = str(record.get("exchange") or "").strip().lower()
     api_base = str(record.get("api_base_url") or "").strip().lower()
     use_demo = bool(record.get("use_demo_mode")) or "demo-trading-openapi.blofin.com" in api_base
+
+    if "bitunix" in exchange:
+        normalized = dict(record)
+        normalized["exchange"] = "bitunix"
+        normalized["environment"] = "live"
+        normalized["api_base_url"] = bux.BITUNIX_LIVE_API_BASE_URL
+        normalized["use_demo_mode"] = False
+        return normalized
 
     if "blofin" in exchange and exchange not in ("", "unspecified"):
         normalized = dict(record)
@@ -1985,6 +2012,9 @@ def save_exchange_keys_record(
     exchange_passphrase: Optional[str] = None,
 ) -> dict[str, Any]:
     profile = resolve_citadel_exchange_profile(exchange, use_demo_mode)
+    effective_demo = use_demo_mode
+    if profile.get("exchange") == "bitunix":
+        effective_demo = False
     encrypted_secret = encrypt_secret_at_rest(exchange_secret)
     store = _load_citadel_key_store()
     prior = store.get(user_id) if isinstance(store.get(user_id), dict) else {}
@@ -2001,7 +2031,7 @@ def save_exchange_keys_record(
         "exchange_secret_encrypted": encrypted_secret,
         "risk_percent": risk_percent,
         "exchange": profile["exchange"],
-        "use_demo_mode": use_demo_mode,
+        "use_demo_mode": effective_demo,
         "environment": profile["environment"],
         "api_base_url": profile["api_base_url"],
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -2128,6 +2158,40 @@ def _resolve_execute_trade_blofin_profile(
         "api_base_url": api_base,
         "use_demo_mode": use_demo,
     }
+
+
+def _resolve_execute_trade_exchange_profile(
+    record: dict[str, Any],
+    raw_body: dict[str, Any],
+    *,
+    user_id: str,
+    req_id: str,
+) -> dict[str, Any]:
+    """Route execute_trade to BloFin (demo/live) or Bitunix (live only)."""
+    exchange = str(record.get("exchange") or "blofin").strip().lower()
+    if "bitunix" in exchange:
+        client_demo = _coerce_demo_mode_flag(
+            raw_body.get("use_demo_mode", raw_body.get("demo_mode"))
+        )
+        if client_demo:
+            logger.info(
+                "execute_trade_bitunix_demo_ignored request_id=%s user_id=%s",
+                req_id,
+                user_id,
+            )
+        return {
+            "exchange": "bitunix",
+            "environment": "live",
+            "api_base_url": bux.BITUNIX_LIVE_API_BASE_URL,
+            "use_demo_mode": False,
+        }
+    return _resolve_execute_trade_blofin_profile(
+        record, raw_body, user_id=user_id, req_id=req_id
+    )
+
+
+def _record_is_bitunix(record: dict[str, Any]) -> bool:
+    return "bitunix" in str(record.get("exchange") or "").lower()
 
 
 def _execute_trade_log_payload(body: dict[str, Any]) -> dict[str, Any]:
@@ -3666,6 +3730,133 @@ def _citadel_resolve_blofin_session(
     return {
         "req_id": req_id,
         "user_id": user_id,
+        "api_key": exchange_api_key,
+        "api_secret": exchange_secret,
+        "passphrase": passphrase,
+        "api_base_url": api_base_url,
+        "record": record,
+    }, None
+
+
+def _citadel_resolve_exchange_session(
+    http_request: Request,
+    user_id: str,
+) -> tuple[Optional[dict[str, Any]], Optional[JSONResponse]]:
+    """Auth + decrypt exchange credentials for Citadel position/trade endpoints."""
+    req_id = getattr(http_request.state, "request_id", "?")
+    header_app_key = (http_request.headers.get("X-API-Key") or http_request.headers.get("x-api-key") or "").strip()
+    if not user_id:
+        return None, JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": "user_id is required.",
+                "user_message": "Citadel user id missing.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+    if not header_app_key:
+        return None, JSONResponse(
+            status_code=401,
+            content={
+                "success": False,
+                "detail": "X-API-Key header is required.",
+                "user_message": "App API Key required. Open Oracle Citadel Setup.",
+                "error_code": "credentials_missing",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+    record = get_citadel_user_record(user_id)
+    if not record:
+        return None, JSONResponse(
+            status_code=404,
+            content={
+                "success": False,
+                "detail": f"No exchange keys for user_id={user_id}.",
+                "user_message": "Exchange keys not found. Re-link in Citadel Setup.",
+                "error_code": "credentials_missing",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+    stored_app_key = (record.get("app_api_key") or "").strip()
+    if not stored_app_key or stored_app_key != header_app_key:
+        return None, JSONResponse(
+            status_code=403,
+            content={
+                "success": False,
+                "detail": "X-API-Key mismatch.",
+                "user_message": "App API Key mismatch. Re-save Citadel Setup.",
+                "error_code": "credentials_mismatch",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+    exchange_api_key = (record.get("exchange_api_key") or "").strip()
+    exchange_secret_enc = record.get("exchange_secret_encrypted") or ""
+    if not exchange_api_key or not exchange_secret_enc:
+        return None, JSONResponse(
+            status_code=404,
+            content={
+                "success": False,
+                "detail": "Exchange credentials incomplete.",
+                "user_message": "Exchange keys incomplete. Re-link in Citadel Setup.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+    exchange_secret = decrypt_secret_at_rest(exchange_secret_enc)
+    if exchange_secret is None:
+        return None, JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "detail": "Could not decrypt exchange secret.",
+                "user_message": "Server credential error. Re-save exchange keys.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    if _record_is_bitunix(record):
+        return {
+            "req_id": req_id,
+            "user_id": user_id,
+            "exchange": "bitunix",
+            "api_key": exchange_api_key,
+            "api_secret": exchange_secret,
+            "passphrase": None,
+            "api_base_url": bux.BITUNIX_LIVE_API_BASE_URL,
+            "record": record,
+        }, None
+
+    passphrase = _resolve_blofin_passphrase(
+        record,
+        use_demo=_record_prefers_blofin_demo(record),
+    )
+    if not passphrase:
+        return None, JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "detail": "BloFin passphrase not configured.",
+                "user_message": (
+                    "BloFin passphrase missing for this environment. "
+                    "Re-save keys with passphrase in Citadel Setup, or set BLOFIN_PASSPHRASE_LIVE / "
+                    "Blofin_Passpharse_live on Railway for live."
+                ),
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+    blofin_profile = _resolve_execute_trade_blofin_profile(record, {}, user_id=user_id, req_id=req_id)
+    api_base_url = blofin_profile.get("api_base_url") or BLOFIN_LIVE_API_BASE_URL
+    return {
+        "req_id": req_id,
+        "user_id": user_id,
+        "exchange": "blofin",
         "api_key": exchange_api_key,
         "api_secret": exchange_secret,
         "passphrase": passphrase,
@@ -6503,12 +6694,17 @@ async def _handle_exchange_keys(http_request: Request) -> JSONResponse:
 
     profile = resolve_citadel_exchange_profile(request.exchange, request.use_demo_mode)
     if profile.get("demo_rejected"):
+        exchange_hint = (request.exchange or "").strip().lower()
+        if "bitunix" in exchange_hint:
+            user_msg = "Bitunix supports live trading only. Turn off Demo Mode in Citadel Setup."
+        else:
+            user_msg = "Demo mode is for BloFin only. Turn off Demo or set exchange to blofin."
         return JSONResponse(
             status_code=400,
             content={
                 "success": False,
-                "detail": "Demo/Testnet mode is only supported for BloFin (exchange must contain 'blofin').",
-                "user_message": "Demo mode is for BloFin only. Turn off Demo or set exchange to blofin.",
+                "detail": "Demo/Testnet mode is only supported for BloFin.",
+                "user_message": user_msg,
                 "request_id": req_id,
             },
             headers={"X-Request-ID": req_id},
@@ -6523,7 +6719,8 @@ async def _handle_exchange_keys(http_request: Request) -> JSONResponse:
         )
 
     exchange_name = (request.exchange or "blofin").strip().lower()
-    is_blofin = "blofin" in exchange_name or not request.exchange
+    is_bitunix = "bitunix" in exchange_name
+    is_blofin = ("blofin" in exchange_name or not request.exchange) and not is_bitunix
     prior_record = get_citadel_user_record(user_id) or {}
     passphrase_input = (request.exchange_passphrase or "").strip()
     effective_passphrase = passphrase_input or _resolve_blofin_passphrase(
@@ -6580,6 +6777,35 @@ async def _handle_exchange_keys(http_request: Request) -> JSONResponse:
             return JSONResponse(
                 status_code=400,
                 content=fail_body,
+                headers={"X-Request-ID": req_id},
+            )
+
+    if is_bitunix:
+        verify = await asyncio.to_thread(
+            bux.verify_credentials,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            request_id=req_id,
+        )
+        if not verify.get("ok"):
+            friendly = bux.user_friendly_error(verify.get("code"), verify.get("msg"))
+            logger.warning(
+                "exchange_keys_bitunix_verify_failed request_id=%s user_id=%s http=%s code=%s msg=%s",
+                req_id,
+                user_id,
+                verify.get("http_status"),
+                verify.get("code"),
+                verify.get("msg"),
+            )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "detail": verify.get("msg") or "Bitunix rejected these API credentials.",
+                    "user_message": friendly,
+                    "bitunix_code": verify.get("code"),
+                    "request_id": req_id,
+                },
                 headers={"X-Request-ID": req_id},
             )
 
@@ -6797,6 +7023,396 @@ async def exchange_keys(http_request: Request) -> JSONResponse:
     return await _handle_exchange_keys(http_request)
 
 
+async def _execute_bitunix_citadel_trade(
+    *,
+    req_id: str,
+    trade_id: str,
+    trade: ExecuteTradeRequest,
+    user_id: str,
+    exchange_api_key: str,
+    exchange_secret: str,
+    effective_risk: float,
+    requested_risk: float,
+    is_market: bool,
+    order_type: str,
+    environment: str,
+) -> JSONResponse:
+    """Oracle Citadel MARKET/LIMIT execution on Bitunix (live network)."""
+    geometry_err = _validate_citadel_trade_geometry(
+        direction=trade.direction,
+        entry=trade.entry_price,
+        sl=trade.stop_loss,
+        tp1=trade.tp1,
+        tp2=trade.tp2,
+    )
+    if geometry_err:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": geometry_err,
+                "user_message": geometry_err,
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    effective_leverage = _normalize_citadel_leverage(trade.leverage)
+    remember_citadel_leverage(user_id, effective_leverage)
+
+    lev_result = await asyncio.to_thread(
+        bux.set_leverage,
+        api_key=exchange_api_key,
+        api_secret=exchange_secret,
+        coin=trade.coin,
+        leverage=effective_leverage,
+        request_id=req_id,
+    )
+    if lev_result.get("ok"):
+        logger.info("bitunix_set_leverage_ok request_id=%s leverage=%sx", req_id, effective_leverage)
+    else:
+        logger.warning(
+            "bitunix_set_leverage_failed request_id=%s leverage=%sx code=%s msg=%s",
+            req_id,
+            effective_leverage,
+            lev_result.get("code"),
+            lev_result.get("msg"),
+        )
+
+    if not is_market:
+        limit_entry = float(trade.entry_price)
+        order_size, size_meta = await asyncio.to_thread(
+            bux.calculate_order_size,
+            entry_price=limit_entry,
+            stop_loss=trade.stop_loss,
+            risk_percent=effective_risk,
+            leverage=effective_leverage,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            request_id=req_id,
+        )
+        entry_result = await asyncio.to_thread(
+            bux.place_order,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            coin=trade.coin,
+            direction=trade.direction,
+            order_type="limit",
+            qty=order_size,
+            price=str(limit_entry),
+            sl=trade.stop_loss,
+            client_id=trade_id[:32],
+            request_id=req_id,
+        )
+        entry_order_id = entry_result.get("order_id")
+        if not entry_result.get("ok") or not entry_order_id:
+            friendly = bux.user_friendly_error(entry_result.get("code"), entry_result.get("msg"))
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "success": False,
+                    "status": "failed",
+                    "order_type": "limit",
+                    "trade_id": trade_id,
+                    "detail": entry_result.get("msg") or "Bitunix LIMIT order rejected.",
+                    "user_message": friendly,
+                    "bitunix_code": entry_result.get("code"),
+                    "request_id": req_id,
+                },
+                headers={"X-Request-ID": req_id},
+            )
+
+        confirm = await asyncio.to_thread(
+            bux.confirm_limit_order,
+            api_key=exchange_api_key,
+            api_secret=exchange_secret,
+            order_id=entry_order_id,
+            request_id=req_id,
+        )
+        if not confirm.get("limit_ok"):
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "success": False,
+                    "status": "failed",
+                    "order_type": "limit",
+                    "trade_id": trade_id,
+                    "order_id": entry_order_id,
+                    "detail": "Bitunix accepted the LIMIT order but Citadel could not confirm it.",
+                    "user_message": (
+                        f"LIMIT order was submitted to Bitunix but could not be confirmed. "
+                        f"Check order history on Bitunix. Order ID {entry_order_id}."
+                    ),
+                    "request_id": req_id,
+                },
+                headers={"X-Request-ID": req_id},
+            )
+
+        limit_status = confirm.get("limit_status") or "resting"
+        rr = compute_rr(limit_entry, trade.tp1, trade.stop_loss)
+        tp1_size: Optional[str] = None
+        tp2_size: Optional[str] = None
+        tp1_order_id: Optional[str] = None
+        tp2_order_id: Optional[str] = None
+        tp_warnings: list[str] = []
+
+        if limit_status == "filled":
+            position_size_str = str(confirm.get("filled_size") or order_size)
+            tp1_size, tp2_size = bux.dual_tp_sizes(position_size_str)
+            tp1_result = await asyncio.to_thread(
+                bux.place_tp_close_order,
+                api_key=exchange_api_key,
+                api_secret=exchange_secret,
+                coin=trade.coin,
+                direction=trade.direction,
+                qty=tp1_size,
+                tp_price=trade.tp1,
+                client_id=f"{trade_id[:28]}l1",
+                request_id=req_id,
+            )
+            tp1_order_id = tp1_result.get("order_id")
+            if not tp1_result.get("ok"):
+                tp_warnings.append(f"TP1 (40%) not placed: {tp1_result.get('msg') or 'unknown'}")
+            tp2_result = await asyncio.to_thread(
+                bux.place_tp_close_order,
+                api_key=exchange_api_key,
+                api_secret=exchange_secret,
+                coin=trade.coin,
+                direction=trade.direction,
+                qty=tp2_size,
+                tp_price=trade.tp2,
+                client_id=f"{trade_id[:28]}l2",
+                request_id=req_id,
+            )
+            tp2_order_id = tp2_result.get("order_id")
+            if not tp2_result.get("ok"):
+                tp_warnings.append(f"TP2 (60%) not placed: {tp2_result.get('msg') or 'unknown'}")
+
+        fill_entry = _parse_blofin_price_token(confirm.get("average_price")) or limit_entry
+        if limit_status == "filled":
+            user_message = (
+                f"LIMIT order filled on Bitunix ({environment}). "
+                f"{trade.coin} {trade.direction.upper()} · Fill {format_usd(fill_entry)} · "
+                f"Order ID {entry_order_id}"
+            )
+            message = f"LIMIT order filled for {trade.coin} {trade.direction.upper()}."
+        else:
+            user_message = (
+                f"Limit order resting on Bitunix ({environment}). "
+                f"{trade.coin} {trade.direction.upper()} · Entry {format_usd(limit_entry)} · "
+                f"Order ID {entry_order_id}. TP legs apply after fill."
+            )
+            message = f"LIMIT order placed for {trade.coin} {trade.direction.upper()}."
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "status": "success",
+                "order_type": "limit",
+                "limit_status": limit_status,
+                "trade_id": trade_id,
+                "order_id": entry_order_id,
+                "tp1_tpsl_id": tp1_order_id,
+                "tp2_tpsl_id": tp2_order_id,
+                "tp1_size": tp1_size,
+                "tp2_size": tp2_size,
+                "tp_warnings": tp_warnings,
+                "user_id": user_id,
+                "coin": trade.coin,
+                "direction": trade.direction,
+                "entry_price": limit_entry,
+                "fill_entry_price": fill_entry if limit_status == "filled" else None,
+                "stop_loss": trade.stop_loss,
+                "tp1": trade.tp1,
+                "tp2": trade.tp2,
+                "risk_percent": effective_risk,
+                "risk_percent_requested": requested_risk,
+                "order_size": order_size,
+                "leverage": effective_leverage,
+                "rr": rr,
+                "exchange": "bitunix",
+                "environment": environment,
+                "api_base_url": bux.BITUNIX_LIVE_API_BASE_URL,
+                "message": message,
+                "user_message": user_message,
+                "bitunix_confirm": {
+                    "status": confirm.get("status"),
+                    "filled_size": confirm.get("filled_size"),
+                    "average_price": confirm.get("average_price"),
+                },
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    try:
+        live = fetch_live_price_for_analysis(trade.coin)
+        reference_price = float(live["price"])
+    except Exception as exc:
+        logger.warning(
+            "execute_trade_bitunix_price_fallback request_id=%s coin=%s err=%s entry=%s",
+            req_id,
+            trade.coin,
+            exc,
+            trade.entry_price,
+        )
+        reference_price = float(trade.entry_price)
+
+    order_size, size_meta = await asyncio.to_thread(
+        bux.calculate_order_size,
+        entry_price=reference_price,
+        stop_loss=trade.stop_loss,
+        risk_percent=effective_risk,
+        leverage=effective_leverage,
+        api_key=exchange_api_key,
+        api_secret=exchange_secret,
+        request_id=req_id,
+    )
+
+    market_result = await asyncio.to_thread(
+        bux.place_order,
+        api_key=exchange_api_key,
+        api_secret=exchange_secret,
+        coin=trade.coin,
+        direction=trade.direction,
+        order_type="market",
+        qty=order_size,
+        sl=trade.stop_loss,
+        client_id=trade_id[:32],
+        request_id=req_id,
+    )
+    market_order_id = market_result.get("order_id")
+    if not market_result.get("ok") or not market_order_id:
+        friendly = bux.user_friendly_error(market_result.get("code"), market_result.get("msg"))
+        return JSONResponse(
+            status_code=502,
+            content={
+                "success": False,
+                "status": "failed",
+                "order_type": "market",
+                "trade_id": trade_id,
+                "detail": market_result.get("msg") or "Bitunix MARKET order rejected.",
+                "user_message": friendly,
+                "bitunix_code": market_result.get("code"),
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    confirm = await asyncio.to_thread(
+        bux.confirm_order_fill,
+        api_key=exchange_api_key,
+        api_secret=exchange_secret,
+        order_id=market_order_id,
+        request_id=req_id,
+    )
+    if not confirm.get("ok"):
+        return JSONResponse(
+            status_code=502,
+            content={
+                "success": False,
+                "status": "failed",
+                "order_type": "market",
+                "trade_id": trade_id,
+                "order_id": market_order_id,
+                "detail": "Bitunix accepted the MARKET order but no fill was confirmed.",
+                "user_message": (
+                    "MARKET order was submitted to Bitunix but did not fill — no position opened. "
+                    f"Check margin and minimum size. Order ID {market_order_id}."
+                ),
+                "bitunix_confirm": confirm,
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    position_size_str = str(confirm.get("filled_size") or order_size)
+    tp1_size, tp2_size = bux.dual_tp_sizes(position_size_str)
+    tp1_order_id: Optional[str] = None
+    tp2_order_id: Optional[str] = None
+    tp_warnings: list[str] = []
+
+    tp1_result = await asyncio.to_thread(
+        bux.place_tp_close_order,
+        api_key=exchange_api_key,
+        api_secret=exchange_secret,
+        coin=trade.coin,
+        direction=trade.direction,
+        qty=tp1_size,
+        tp_price=trade.tp1,
+        client_id=f"{trade_id[:28]}t1",
+        request_id=req_id,
+    )
+    tp1_order_id = tp1_result.get("order_id")
+    if not tp1_result.get("ok"):
+        tp_warnings.append(f"TP1 (40%) not placed: {tp1_result.get('msg') or 'unknown'}")
+
+    tp2_result = await asyncio.to_thread(
+        bux.place_tp_close_order,
+        api_key=exchange_api_key,
+        api_secret=exchange_secret,
+        coin=trade.coin,
+        direction=trade.direction,
+        qty=tp2_size,
+        tp_price=trade.tp2,
+        client_id=f"{trade_id[:28]}t2",
+        request_id=req_id,
+    )
+    tp2_order_id = tp2_result.get("order_id")
+    if not tp2_result.get("ok"):
+        tp_warnings.append(f"TP2 (60%) not placed: {tp2_result.get('msg') or 'unknown'}")
+
+    fill_row = confirm.get("row") if isinstance(confirm.get("row"), dict) else {}
+    fill_entry = _parse_blofin_price_token(fill_row.get("avgPrice")) or reference_price
+    rr = compute_rr(fill_entry, trade.tp1, trade.stop_loss)
+    user_message = (
+        f"MARKET order filled on Bitunix ({environment}). "
+        f"{trade.coin} {trade.direction.upper()} · Fill {format_usd(fill_entry)} · "
+        f"Order ID {market_order_id}"
+    )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": True,
+            "status": "success",
+            "order_type": "market",
+            "trade_id": trade_id,
+            "order_id": market_order_id,
+            "tp1_tpsl_id": tp1_order_id,
+            "tp2_tpsl_id": tp2_order_id,
+            "tp1_size": tp1_size,
+            "tp2_size": tp2_size,
+            "tp_warnings": tp_warnings,
+            "user_id": user_id,
+            "coin": trade.coin,
+            "direction": trade.direction,
+            "entry_price": reference_price,
+            "fill_entry_price": fill_entry,
+            "stop_loss": trade.stop_loss,
+            "tp1": trade.tp1,
+            "tp2": trade.tp2,
+            "risk_percent": effective_risk,
+            "risk_percent_requested": requested_risk,
+            "order_size": order_size,
+            "leverage": effective_leverage,
+            "rr": rr,
+            "exchange": "bitunix",
+            "environment": environment,
+            "api_base_url": bux.BITUNIX_LIVE_API_BASE_URL,
+            "message": f"MARKET order filled for {trade.coin} {trade.direction.upper()}.",
+            "user_message": user_message,
+            "bitunix_confirm": {
+                "status": confirm.get("status"),
+                "filled_size": confirm.get("filled_size"),
+            },
+            "request_id": req_id,
+        },
+        headers={"X-Request-ID": req_id},
+    )
+
+
 async def _handle_execute_trade(http_request: Request) -> JSONResponse:
     """
     POST /execute_trade — Oracle Citadel MARKET or LIMIT execution (BloFin).
@@ -6958,15 +7574,15 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
     is_market = _is_market_trade_request(trade, raw_body)
     order_type = "market" if is_market else "limit"
     effective_risk, requested_risk = _resolve_effective_risk_percent(trade.risk_percent)
-    blofin_profile = _resolve_execute_trade_blofin_profile(
+    exchange_profile = _resolve_execute_trade_exchange_profile(
         record,
         raw_body,
         user_id=user_id,
         req_id=req_id,
     )
-    exchange = blofin_profile.get("exchange") or record.get("exchange") or "blofin"
-    environment = blofin_profile.get("environment") or "live"
-    api_base_url = blofin_profile.get("api_base_url") or BLOFIN_LIVE_API_BASE_URL
+    exchange = exchange_profile.get("exchange") or record.get("exchange") or "blofin"
+    environment = exchange_profile.get("environment") or "live"
+    api_base_url = exchange_profile.get("api_base_url") or BLOFIN_LIVE_API_BASE_URL
     trade_id = uuid.uuid4().hex[:16]
 
     if effective_risk < requested_risk:
@@ -6999,9 +7615,24 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
         api_base_url,
     )
 
+    if "bitunix" in str(exchange).lower():
+        return await _execute_bitunix_citadel_trade(
+            req_id=req_id,
+            trade_id=trade_id,
+            trade=trade,
+            user_id=user_id,
+            exchange_api_key=exchange_api_key,
+            exchange_secret=exchange_secret,
+            effective_risk=effective_risk,
+            requested_risk=requested_risk,
+            is_market=is_market,
+            order_type=order_type,
+            environment=environment,
+        )
+
     if "blofin" not in str(exchange).lower():
         logger.warning(
-            "execute_trade_market_unsupported_exchange request_id=%s exchange=%s",
+            "execute_trade_unsupported_exchange request_id=%s exchange=%s",
             req_id,
             exchange,
         )
@@ -7009,8 +7640,8 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             status_code=400,
             content={
                 "success": False,
-                "detail": f"Oracle Citadel requires BloFin (exchange={exchange}).",
-                "user_message": "Link BloFin keys in Oracle Citadel Setup to execute trades.",
+                "detail": f"Oracle Citadel does not support exchange={exchange}.",
+                "user_message": "Link BloFin or Bitunix keys in Oracle Citadel Setup to execute trades.",
                 "request_id": req_id,
             },
             headers={"X-Request-ID": req_id},
@@ -7042,7 +7673,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
 
     passphrase = _resolve_blofin_passphrase(
         record,
-        use_demo=bool(blofin_profile.get("use_demo_mode")),
+        use_demo=bool(exchange_profile.get("use_demo_mode")),
     )
     if not passphrase:
         env_hint = (
@@ -7759,20 +8390,30 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
 
 async def _handle_citadel_positions(http_request: Request) -> JSONResponse:
     user_id = (http_request.query_params.get("user_id") or "").strip()
-    session, err = _citadel_resolve_blofin_session(http_request, user_id)
+    session, err = _citadel_resolve_exchange_session(http_request, user_id)
     if err is not None:
         return err
     assert session is not None
     inst_id = (http_request.query_params.get("inst_id") or "").strip() or None
-    positions = await asyncio.to_thread(
-        _blofin_fetch_positions,
-        base_url=session["api_base_url"],
-        api_key=session["api_key"],
-        api_secret=session["api_secret"],
-        passphrase=session["passphrase"],
-        inst_id=inst_id,
-        request_id=session["req_id"],
-    )
+    if session.get("exchange") == "bitunix":
+        symbol = bux.bitunix_symbol(_citadel_coin_from_inst_id(inst_id)) if inst_id else None
+        positions = await asyncio.to_thread(
+            bux.fetch_positions,
+            api_key=session["api_key"],
+            api_secret=session["api_secret"],
+            symbol=symbol,
+            request_id=session["req_id"],
+        )
+    else:
+        positions = await asyncio.to_thread(
+            _blofin_fetch_positions,
+            base_url=session["api_base_url"],
+            api_key=session["api_key"],
+            api_secret=session["api_secret"],
+            passphrase=session["passphrase"],
+            inst_id=inst_id,
+            request_id=session["req_id"],
+        )
     return JSONResponse(
         status_code=200,
         content={
@@ -7794,11 +8435,61 @@ async def _handle_citadel_close_position(http_request: Request, *, flash: bool =
     if not isinstance(raw, dict):
         raw = {}
     user_id = (raw.get("user_id") or "").strip()
-    session, err = _citadel_resolve_blofin_session(http_request, user_id)
+    session, err = _citadel_resolve_exchange_session(http_request, user_id)
     if err is not None:
         return err
     assert session is not None
     inst_id = (raw.get("inst_id") or raw.get("instId") or "").strip()
+    position_id = (raw.get("position_id") or raw.get("positionId") or "").strip()
+    if session.get("exchange") == "bitunix":
+        close_id = position_id or inst_id
+        if not close_id:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "detail": "position_id is required for Bitunix.",
+                    "user_message": "Position id missing for close.",
+                    "request_id": session["req_id"],
+                },
+                headers={"X-Request-ID": session["req_id"]},
+            )
+        unrealized_pnl = float(raw.get("unrealized_pnl") or raw.get("unrealizedPnl") or 0)
+        result = await asyncio.to_thread(
+            bux.flash_close_position,
+            api_key=session["api_key"],
+            api_secret=session["api_secret"],
+            position_id=close_id,
+            request_id=session["req_id"],
+        )
+        if not result.get("ok"):
+            msg = bux.user_friendly_error(result.get("code"), result.get("msg"))
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "success": False,
+                    "detail": msg,
+                    "user_message": msg,
+                    "request_id": session["req_id"],
+                },
+                headers={"X-Request-ID": session["req_id"]},
+            )
+        coin = _citadel_coin_from_inst_id(inst_id) if inst_id else "?"
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "flash": flash,
+                "inst_id": inst_id or close_id,
+                "position_id": close_id,
+                "realized_pnl": unrealized_pnl,
+                "coin": coin,
+                "win": unrealized_pnl > 0,
+                "loss": unrealized_pnl < 0,
+                "request_id": session["req_id"],
+            },
+            headers={"X-Request-ID": session["req_id"]},
+        )
     if not inst_id:
         return JSONResponse(
             status_code=400,
@@ -7862,10 +8553,20 @@ async def _handle_citadel_trailing_stop(http_request: Request) -> JSONResponse:
     if not isinstance(raw, dict):
         raw = {}
     user_id = (raw.get("user_id") or "").strip()
-    session, err = _citadel_resolve_blofin_session(http_request, user_id)
+    session, err = _citadel_resolve_exchange_session(http_request, user_id)
     if err is not None:
         return err
     assert session is not None
+    if session.get("exchange") == "bitunix":
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "user_message": "Trailing stop is not supported on Bitunix. Manage stops on the exchange.",
+                "request_id": session["req_id"],
+            },
+            headers={"X-Request-ID": session["req_id"]},
+        )
     inst_id = (raw.get("inst_id") or raw.get("instId") or "").strip()
     direction = (raw.get("direction") or "long").strip().lower()
     try:
@@ -7931,10 +8632,21 @@ async def _handle_citadel_trailing_stop(http_request: Request) -> JSONResponse:
 
 async def _handle_citadel_tpsl_details(http_request: Request) -> JSONResponse:
     user_id = (http_request.query_params.get("user_id") or "").strip()
-    session, err = _citadel_resolve_blofin_session(http_request, user_id)
+    session, err = _citadel_resolve_exchange_session(http_request, user_id)
     if err is not None:
         return err
     assert session is not None
+    if session.get("exchange") == "bitunix":
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "orders": [],
+                "count": 0,
+                "request_id": session["req_id"],
+            },
+            headers={"X-Request-ID": session["req_id"]},
+        )
     inst_id = (http_request.query_params.get("inst_id") or "").strip() or None
     orders = await asyncio.to_thread(
         _blofin_fetch_tpsl_pending,
