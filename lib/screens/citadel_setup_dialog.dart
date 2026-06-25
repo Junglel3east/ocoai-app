@@ -65,18 +65,23 @@ Future<void> _citadelLinkExchangeKeys({
   required bool useDemoMode,
   required double riskPercent,
 }) async {
+  final appKey = await AppApiKeyService.ensureKey();
+  await OracleCitadelStore.load();
+  final uid = userId.trim().isNotEmpty ? userId.trim() : OracleCitadelStore.userId;
   final uri = Uri.parse('$kCitadelBaseUrl/exchange_keys');
   final response = await http
       .post(
         uri,
         headers: await AppApiKeyService.backendHeaders(),
         body: jsonEncode({
-          'user_id': userId,
-          'app_api_key': OracleCitadelStore.apiKey,
+          'user_id': uid,
+          'app_api_key': appKey,
           'api_key': exchangeApiKey,
           'api_secret': exchangeApiSecret,
-          'exchange_passphrase': exchangePassphrase,
-          'passphrase': exchangePassphrase,
+          if (exchangePassphrase.isNotEmpty) ...{
+            'exchange_passphrase': exchangePassphrase,
+            'passphrase': exchangePassphrase,
+          },
           'exchange': exchange,
           'use_demo_mode': useDemoMode,
           'demo_mode': useDemoMode,
@@ -1034,7 +1039,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
 
     var linked = prefs.getBool(_kCitadelExchangeLinkedPref) ?? false;
     final demoPref = prefs.getBool(_kCitadelDemoModePref) ?? true;
-    if (OracleCitadelStore.isConfigured) {
+    if (OracleCitadelStore.isConfigured && linked) {
       linked = await OracleCitadelService.verifyServerLinked();
       if (!linked) {
         await OracleCitadelStore.clearExchangeLinked();
@@ -1149,7 +1154,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
       final exchangeKey = _exchangeKeyController.text.trim();
       final exchangeSecret = _exchangeSecretController.text.trim();
       final exchangePassphrase = _exchangePassphraseController.text.trim();
-      if (_looksLikeDemoExchangeKeys()) {
+      if (_looksLikeDemoExchangeKeys() && _isBlofin) {
         if (!_useDemoMode) {
           setState(() => _useDemoMode = true);
         }

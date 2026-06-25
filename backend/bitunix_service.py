@@ -137,7 +137,13 @@ def _private_request(
 def user_friendly_error(code: Any, msg: Optional[str]) -> str:
     text = (msg or "").strip()
     code_s = str(code) if code is not None else ""
-    if code_s == "10007" or "signature" in text.lower():
+    lower = text.lower()
+    if "1010" in text or "access denied" in lower:
+        return (
+            "Bitunix blocked the server request (Cloudflare/WAF). "
+            "Try again in a few minutes or contact Bitunix support if it persists."
+        )
+    if code_s == "10007" or "signature" in lower:
         return "Bitunix rejected the API signature. Check API Key and Secret."
     if "permission" in text.lower() or code_s in {"10003", "10004"}:
         return "Bitunix API key lacks Trade permission. Enable Trading API on your key."
@@ -152,7 +158,7 @@ def verify_credentials(
     api_secret: str,
     request_id: str = "?",
 ) -> dict[str, Any]:
-    http_status, _raw, parsed = _private_request(
+    http_status, raw, parsed = _private_request(
         base_url=BITUNIX_LIVE_API_BASE_URL,
         api_key=api_key,
         api_secret=api_secret,
@@ -162,11 +168,19 @@ def verify_credentials(
         request_id=request_id,
         log_tag="bitunix_verify",
     )
-    ok = http_status == 200 and isinstance(parsed, dict) and str(parsed.get("code")) == "0"
+    if not isinstance(parsed, dict):
+        return {
+            "ok": False,
+            "http_status": http_status,
+            "code": None,
+            "msg": (raw or "Invalid response").strip()[:300] or "Invalid response",
+        }
+    code = parsed.get("code")
+    ok = http_status == 200 and str(code) == "0"
     return {
         "ok": ok,
         "http_status": http_status,
-        "code": parsed.get("code") if isinstance(parsed, dict) else None,
+        "code": code,
         "msg": parsed.get("msg") if isinstance(parsed, dict) else "Invalid response",
     }
 

@@ -1827,6 +1827,7 @@ abstract final class OracleCitadelService {
 
   /// Confirms exchange keys exist on the Railway server (not just local prefs).
   static Future<CitadelServerLinkStatus> checkServerLinked() async {
+    await OracleCitadelStore.load();
     if (!OracleCitadelStore.isConfigured) {
       return const CitadelServerLinkStatus(
         linked: false,

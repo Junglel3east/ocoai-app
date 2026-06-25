@@ -1880,13 +1880,8 @@ def resolve_citadel_exchange_profile(
 
     if is_bitunix:
         if use_demo_mode:
-            return {
-                "exchange": "bitunix",
-                "environment": "live",
-                "api_base_url": bux.BITUNIX_LIVE_API_BASE_URL,
-                "blofin_demo": False,
-                "demo_rejected": True,
-            }
+            # Bitunix is live-only — coerce demo off instead of rejecting the save.
+            use_demo_mode = False
         return {
             "exchange": "bitunix",
             "environment": "live",
@@ -6790,23 +6785,20 @@ async def _handle_exchange_keys(http_request: Request) -> JSONResponse:
         if not verify.get("ok"):
             friendly = bux.user_friendly_error(verify.get("code"), verify.get("msg"))
             logger.warning(
-                "exchange_keys_bitunix_verify_failed request_id=%s user_id=%s http=%s code=%s msg=%s",
+                "exchange_keys_bitunix_verify_failed request_id=%s user_id=%s http=%s code=%s msg=%s "
+                "— saving keys anyway; execute_trade will re-validate",
                 req_id,
                 user_id,
                 verify.get("http_status"),
                 verify.get("code"),
                 verify.get("msg"),
             )
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "success": False,
-                    "detail": verify.get("msg") or "Bitunix rejected these API credentials.",
-                    "user_message": friendly,
-                    "bitunix_code": verify.get("code"),
-                    "request_id": req_id,
-                },
-                headers={"X-Request-ID": req_id},
+            # Do not block save — Bitunix account probe can fail from WAF/IP while trade keys are valid.
+        else:
+            logger.info(
+                "exchange_keys_bitunix_verify_ok request_id=%s user_id=%s",
+                req_id,
+                user_id,
             )
 
     try:
@@ -6817,7 +6809,7 @@ async def _handle_exchange_keys(http_request: Request) -> JSONResponse:
             exchange_secret=exchange_secret,
             risk_percent=float(request.risk_percent),
             exchange=request.exchange,
-            use_demo_mode=request.use_demo_mode,
+            use_demo_mode=False if is_bitunix else request.use_demo_mode,
             exchange_passphrase=passphrase_input or None,
         )
         if saved_profile.get("blofin_demo"):
@@ -6928,7 +6920,7 @@ async def _handle_exchange_keys_status(http_request: Request) -> JSONResponse:
                 "success": False,
                 "linked": False,
                 "detail": f"No exchange keys on file for user_id={user_id}.",
-                "user_message": "Exchange keys not found on server. Re-link BloFin keys in Oracle Citadel Setup.",
+                "user_message": "Exchange keys not found on server. Re-link keys in Oracle Citadel Setup.",
                 "error_code": "credentials_missing",
                 "request_id": req_id,
             },
@@ -7512,7 +7504,7 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
             content={
                 "success": False,
                 "detail": f"No exchange keys on file for user_id={user_id}.",
-                "user_message": "Exchange keys not found on server. Re-link BloFin keys in Oracle Citadel Setup (Save with API Key + Secret).",
+                "user_message": "Exchange keys not found on server. Re-link keys in Oracle Citadel Setup (Save with API Key + Secret).",
                 "error_code": "credentials_missing",
                 "request_id": req_id,
             },
