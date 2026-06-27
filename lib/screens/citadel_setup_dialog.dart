@@ -802,6 +802,15 @@ class _CitadelApiKeysHowToSection extends StatelessWidget {
               ],
             ),
             _CitadelHowToBlock(
+              title: 'Bitunix (LIVE trading only)',
+              steps: [
+                'API Management → Create key → enable Trade only; disable Withdrawals.',
+                'Leave Bind IP address EMPTY — Bitunix IP binding breaks cloud/server API access (known exchange bug).',
+                'Re-save Citadel Setup after any Bitunix key change.',
+                'Bitunix has no demo mode — all Citadel orders use real funds.',
+              ],
+            ),
+            _CitadelHowToBlock(
               title: 'BloFin (LIVE trading or demo testing)',
               steps: [
                 'LIVE (default): use BloFin live API keys with Demo Mode OFF.',
@@ -1397,6 +1406,43 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                         Text(
                           'Bitunix is live-only (API Key + Secret). No passphrase required.',
                           style: TextStyle(fontSize: 11.5, color: Colors.grey[500], height: 1.35),
+                        ),
+                        const SizedBox(height: 10),
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(14),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFFF9800).withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(14),
+                            border: Border.all(color: const Color(0xFFFF9800).withValues(alpha: 0.45)),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              const Row(
+                                children: [
+                                  Icon(Icons.warning_amber_rounded, color: Color(0xFFFF9800), size: 18),
+                                  SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      'Do NOT bind IPs on Bitunix',
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w700,
+                                        color: Color(0xFFFF9800),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                'Bitunix IP whitelisting breaks server-side API calls (Cloudflare error 1010). '
+                                'Leave Bind IP address empty on your API key, then re-save keys here.',
+                                style: TextStyle(fontSize: 11.5, color: Colors.grey[400], height: 1.35),
+                              ),
+                            ],
+                          ),
                         ),
                       ],
                       const SizedBox(height: 12),
