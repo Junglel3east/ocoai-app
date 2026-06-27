@@ -2311,12 +2311,12 @@ def _citadel_suggested_stop_loss(
 # ---------------------------------------------------------------------------
 
 _INSTRUMENT_SPEC_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-# Cached egress IP — fetched only when BloFin reports IP whitelist failure (for Railway → BloFin setup).
+# Cached egress IP — fetched when an exchange reports IP/WAF failure (Railway → exchange API whitelist).
 _CITADEL_EGRESS_IP_CACHE: tuple[float, str] = (0.0, "")
 
 
-def _citadel_egress_ip_for_whitelist() -> str:
-    """Public IP Railway uses for outbound REST (whitelist this in BloFin Demo API settings)."""
+def _citadel_egress_ip_live_lookup() -> str:
+    """Live outbound IP from this service (ipify), cached 5 minutes."""
     global _CITADEL_EGRESS_IP_CACHE
     now = time.time()
     if _CITADEL_EGRESS_IP_CACHE[1] and (now - _CITADEL_EGRESS_IP_CACHE[0]) < 300:
@@ -2331,6 +2331,30 @@ def _citadel_egress_ip_for_whitelist() -> str:
     except Exception as exc:
         logger.warning("citadel_egress_ip_lookup_failed err=%s", exc)
     return ""
+
+
+def _citadel_egress_ips_for_whitelist() -> list[str]:
+    """
+    IPs to whitelist at the exchange. Prefer CITADEL_EGRESS_IPS (comma-separated Railway static pool),
+    plus live ipify lookup from the running service.
+    """
+    ips: list[str] = []
+    env_raw = (os.getenv("CITADEL_EGRESS_IPS") or "").strip()
+    if env_raw:
+        for part in env_raw.split(","):
+            ip = part.strip()
+            if ip and ip not in ips:
+                ips.append(ip)
+    live = _citadel_egress_ip_live_lookup()
+    if live and live not in ips:
+        ips.insert(0, live)
+    return ips
+
+
+def _citadel_egress_ip_for_whitelist() -> str:
+    """Primary outbound IP (live lookup first, else first static pool entry)."""
+    ips = _citadel_egress_ips_for_whitelist()
+    return ips[0] if ips else ""
 
 
 def _resolve_effective_risk_percent(risk_percent: Optional[float]) -> tuple[float, float]:
@@ -3951,6 +3975,23 @@ def _blofin_is_ip_whitelist_error(code: Any, msg: Optional[str]) -> bool:
     text = (msg or "").lower()
     code_str = str(code or "")
     return code_str == "152406" or ("ip" in text and "whitelist" in text)
+
+
+def _attach_bitunix_whitelist_ip_if_needed(
+    fail_body: dict[str, Any],
+    *,
+    code: Any = None,
+    msg: Optional[str] = None,
+    http_status: Optional[int] = None,
+) -> None:
+    if not bux.is_waf_or_ip_block(code, msg, http_status):
+        return
+    ips = _citadel_egress_ips_for_whitelist()
+    if not ips:
+        return
+    fail_body["whitelist_ip"] = ips[0]
+    fail_body["whitelist_ips"] = ips
+    logger.info("bitunix_whitelist_ips_attached ips=%s", ",".join(ips))
 
 
 def _validate_citadel_trade_geometry(
@@ -7148,18 +7189,25 @@ async def _execute_bitunix_citadel_trade(
         entry_order_id = entry_result.get("order_id")
         if not entry_result.get("ok") or not entry_order_id:
             friendly = bux.user_friendly_error(entry_result.get("code"), entry_result.get("msg"))
+            fail_body: dict[str, Any] = {
+                "success": False,
+                "status": "failed",
+                "order_type": "limit",
+                "trade_id": trade_id,
+                "detail": entry_result.get("msg") or "Bitunix LIMIT order rejected.",
+                "user_message": friendly,
+                "bitunix_code": entry_result.get("code"),
+                "request_id": req_id,
+            }
+            _attach_bitunix_whitelist_ip_if_needed(
+                fail_body,
+                code=entry_result.get("code"),
+                msg=entry_result.get("msg"),
+                http_status=entry_result.get("http_status"),
+            )
             return JSONResponse(
                 status_code=502,
-                content={
-                    "success": False,
-                    "status": "failed",
-                    "order_type": "limit",
-                    "trade_id": trade_id,
-                    "detail": entry_result.get("msg") or "Bitunix LIMIT order rejected.",
-                    "user_message": friendly,
-                    "bitunix_code": entry_result.get("code"),
-                    "request_id": req_id,
-                },
+                content=fail_body,
                 headers={"X-Request-ID": req_id},
             )
 
@@ -7329,18 +7377,25 @@ async def _execute_bitunix_citadel_trade(
     market_order_id = market_result.get("order_id")
     if not market_result.get("ok") or not market_order_id:
         friendly = bux.user_friendly_error(market_result.get("code"), market_result.get("msg"))
+        fail_body = {
+            "success": False,
+            "status": "failed",
+            "order_type": "market",
+            "trade_id": trade_id,
+            "detail": market_result.get("msg") or "Bitunix MARKET order rejected.",
+            "user_message": friendly,
+            "bitunix_code": market_result.get("code"),
+            "request_id": req_id,
+        }
+        _attach_bitunix_whitelist_ip_if_needed(
+            fail_body,
+            code=market_result.get("code"),
+            msg=market_result.get("msg"),
+            http_status=market_result.get("http_status"),
+        )
         return JSONResponse(
             status_code=502,
-            content={
-                "success": False,
-                "status": "failed",
-                "order_type": "market",
-                "trade_id": trade_id,
-                "detail": market_result.get("msg") or "Bitunix MARKET order rejected.",
-                "user_message": friendly,
-                "bitunix_code": market_result.get("code"),
-                "request_id": req_id,
-            },
+            content=fail_body,
             headers={"X-Request-ID": req_id},
         )
 
@@ -8510,14 +8565,21 @@ async def _handle_citadel_close_position(http_request: Request, *, flash: bool =
         )
         if not result.get("ok"):
             msg = bux.user_friendly_error(result.get("code"), result.get("msg"))
+            fail_body = {
+                "success": False,
+                "detail": msg,
+                "user_message": msg,
+                "request_id": session["req_id"],
+            }
+            _attach_bitunix_whitelist_ip_if_needed(
+                fail_body,
+                code=result.get("code"),
+                msg=result.get("msg"),
+                http_status=result.get("http_status"),
+            )
             return JSONResponse(
                 status_code=502,
-                content={
-                    "success": False,
-                    "detail": msg,
-                    "user_message": msg,
-                    "request_id": session["req_id"],
-                },
+                content=fail_body,
                 headers={"X-Request-ID": session["req_id"]},
             )
         coin = _citadel_coin_from_inst_id(inst_id) if inst_id else "?"
@@ -8712,6 +8774,103 @@ async def _handle_citadel_tpsl_details(http_request: Request) -> JSONResponse:
             "request_id": session["req_id"],
         },
         headers={"X-Request-ID": session["req_id"]},
+    )
+
+
+@app.post("/citadel/bitunix_probe")
+@app.post("/citadel/bitunix_probe/")
+@app.post("/api/citadel/bitunix_probe")
+@app.post("/api/citadel/bitunix_probe/")
+async def citadel_bitunix_probe(http_request: Request) -> JSONResponse:
+    """Test Bitunix account API from Railway (no order placed)."""
+    req_id = getattr(http_request.state, "request_id", "?")
+    try:
+        raw = await http_request.json()
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    user_id = (raw.get("user_id") or "").strip()
+    session, err = _citadel_resolve_exchange_session(http_request, user_id)
+    if err is not None:
+        return err
+    assert session is not None
+    if session.get("exchange") != "bitunix":
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": "Linked exchange is not Bitunix.",
+                "user_message": "Switch Citadel to Bitunix and re-link API keys to run this probe.",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+    verify = await asyncio.to_thread(
+        bux.verify_credentials,
+        api_key=session["api_key"],
+        api_secret=session["api_secret"],
+        request_id=req_id,
+    )
+    ips = _citadel_egress_ips_for_whitelist()
+    friendly = bux.user_friendly_error(verify.get("code"), verify.get("msg"))
+    body: dict[str, Any] = {
+        "success": bool(verify.get("ok")),
+        "bitunix_code": verify.get("code"),
+        "bitunix_msg": verify.get("msg"),
+        "http_status": verify.get("http_status"),
+        "egress_ips": ips,
+        "user_message": friendly,
+        "request_id": req_id,
+    }
+    if ips:
+        body["whitelist_ip"] = ips[0]
+        body["whitelist_ips"] = ips
+    _attach_bitunix_whitelist_ip_if_needed(
+        body,
+        code=verify.get("code"),
+        msg=verify.get("msg"),
+        http_status=verify.get("http_status"),
+    )
+    logger.info(
+        "citadel_bitunix_probe request_id=%s user_id=%s ok=%s code=%s http=%s ips=%s",
+        req_id,
+        user_id,
+        verify.get("ok"),
+        verify.get("code"),
+        verify.get("http_status"),
+        ",".join(ips),
+    )
+    return JSONResponse(
+        status_code=200 if verify.get("ok") else 502,
+        content=body,
+        headers={"X-Request-ID": req_id},
+    )
+
+
+@app.get("/citadel/egress_ip")
+@app.get("/citadel/egress_ip/")
+@app.get("/api/citadel/egress_ip")
+@app.get("/api/citadel/egress_ip/")
+async def citadel_egress_ip(http_request: Request) -> JSONResponse:
+    """Railway outbound IP(s) — whitelist in BloFin/Bitunix API key settings when IP restriction is on."""
+    req_id = getattr(http_request.state, "request_id", "?")
+    ips = _citadel_egress_ips_for_whitelist()
+    primary = ips[0] if ips else ""
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": True,
+            "egress_ip": primary,
+            "whitelist_ip": primary,
+            "whitelist_ips": ips,
+            "message": (
+                "Whitelist all listed IPs in your exchange API Management settings "
+                "when Railway static outbound or IP restriction is enabled."
+            ),
+            "request_id": req_id,
+        },
+        headers={"X-Request-ID": req_id},
     )
 
 

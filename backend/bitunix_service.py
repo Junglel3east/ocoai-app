@@ -8,12 +8,23 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import secrets
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from typing import Any, Optional
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+try:
+    from curl_cffi import requests as curl_requests
+
+    _HAS_CURL_CFFI = True
+except ImportError:
+    curl_requests = None  # type: ignore[assignment,misc]
+    _HAS_CURL_CFFI = False
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +46,37 @@ BITUNIX_POST_ORDER_CONFIRM_DELAY_SEC = 1.5
 BITUNIX_FILL_CONFIRM_MAX_POLLS = 6
 BITUNIX_FILL_CONFIRM_POLL_SEC = 0.6
 
+_BITUNIX_USER_AGENT = (
+    os.getenv("BITUNIX_USER_AGENT")
+    or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+_BITUNIX_CURL_IMPERSONATE = (os.getenv("BITUNIX_CURL_IMPERSONATE") or "chrome124").strip()
+
+
+def _bitunix_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=2,
+        connect=2,
+        read=2,
+        backoff_factor=0.4,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST"}),
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.headers.update(
+        {
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": _BITUNIX_USER_AGENT,
+        }
+    )
+    return session
+
+
+_BITUNIX_HTTP = _bitunix_session()
+
 
 def bitunix_symbol(coin: str) -> str:
     c = (coin or "BTC").strip().upper().replace("-", "").replace("/", "")
@@ -46,6 +88,20 @@ def bitunix_symbol(coin: str) -> str:
 def _canonical_json(body: dict[str, Any]) -> str:
     # Bitunix signature requires sorted keys and no spaces (official docs + community libs).
     return json.dumps(body, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
+
+
+def is_waf_or_ip_block(code: Any, msg: Optional[str], http_status: Optional[int] = None) -> bool:
+    text = (msg or "").lower()
+    raw = msg or ""
+    if "1010" in raw or "cloudflare" in text or "waf" in text or "firewall" in text:
+        return True
+    if str(code or "") == "10004" or ("ip" in text and "whitelist" in text):
+        return True
+    if http_status in {403, 503} and ("blocked" in text or "denied" in text or "access denied" in text):
+        return True
+    if str(code or "") == "invalid_json" and ("cloudflare" in text or "firewall" in text or "1010" in raw):
+        return True
+    return False
 
 
 def _format_api_error(raw: str, http_status: int) -> str:
@@ -62,8 +118,9 @@ def _format_api_error(raw: str, http_status: int) -> str:
     lower = text.lower()
     if "1010" in text or "cloudflare" in lower:
         return (
-            "Bitunix blocked the server request (WAF/firewall). "
-            "Add your Railway server IP to Bitunix API whitelist if required."
+            "Bitunix Cloudflare blocked this server (error 1010). "
+            "Remove ALL IPs from your Bitunix API key (IP binding is broken on Bitunix for cloud servers). "
+            "If it still fails, email Bitunix support to allowlist Oracle Citadel / Railway server traffic."
         )
     if http_status == 403:
         return "Bitunix denied the request (HTTP 403). Check Trade permission and IP whitelist on your API key."
@@ -128,33 +185,59 @@ def _private_request(
     if query:
         url = f"{url}?{urllib.parse.urlencode(query)}"
 
-    req = urllib.request.Request(
-        url,
-        data=body_str.encode("utf-8") if body_str else None,
-        headers=headers,
-        method=method.upper(),
-    )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            parsed = json.loads(raw) if raw else None
-            return resp.status, raw, parsed if isinstance(parsed, dict) else None
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        try:
-            parsed = json.loads(raw) if raw else None
-        except json.JSONDecodeError:
-            parsed = None
-        logger.warning(
-            "%s_http_error request_id=%s status=%s path=%s body=%s",
-            log_tag,
-            request_id,
-            exc.code,
-            path,
-            (raw or "")[:500],
-        )
-        return exc.code, raw, parsed if isinstance(parsed, dict) else None
-    except Exception as exc:
+        browser_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://www.bitunix.com",
+            "Referer": "https://www.bitunix.com/",
+            "User-Agent": _BITUNIX_USER_AGENT,
+        }
+        merged_headers = {**browser_headers, **headers}
+        payload = body_str.encode("utf-8") if body_str else None
+
+        if _HAS_CURL_CFFI and curl_requests is not None:
+            response = curl_requests.request(
+                method.upper(),
+                url,
+                headers=merged_headers,
+                data=payload,
+                timeout=30,
+                impersonate=_BITUNIX_CURL_IMPERSONATE,
+            )
+        else:
+            response = _BITUNIX_HTTP.request(
+                method.upper(),
+                url,
+                headers=merged_headers,
+                data=payload,
+                timeout=30,
+            )
+        raw = response.text or ""
+        parsed: Optional[dict[str, Any]] = None
+        if raw:
+            try:
+                loaded = json.loads(raw)
+                if isinstance(loaded, dict):
+                    parsed = loaded
+            except json.JSONDecodeError:
+                parsed = None
+        if response.status_code >= 400 or (
+            isinstance(parsed, dict)
+            and parsed.get("code") is not None
+            and str(parsed.get("code")) != "0"
+        ):
+            logger.warning(
+                "%s_http request_id=%s status=%s path=%s code=%s body=%s",
+                log_tag,
+                request_id,
+                response.status_code,
+                path,
+                parsed.get("code") if isinstance(parsed, dict) else None,
+                (raw or "")[:500],
+            )
+        return response.status_code, raw, parsed
+    except requests.RequestException as exc:
         logger.warning("%s_request_failed request_id=%s path=%s err=%s", log_tag, request_id, path, exc)
         return 0, str(exc), None
 
@@ -165,14 +248,20 @@ def user_friendly_error(code: Any, msg: Optional[str]) -> str:
         return text
     code_s = str(code) if code is not None else ""
     lower = text.lower()
-    if "1010" in text or "access denied" in lower:
+    if is_waf_or_ip_block(code, msg):
         return (
-            "Bitunix blocked the server request (Cloudflare/WAF). "
-            "Try again in a few minutes or contact Bitunix support if it persists."
+            "Bitunix Cloudflare blocked this server (error 1010). "
+            "Remove ALL IPs from your Bitunix API key — IP binding breaks cloud/server API access. "
+            "Re-save keys in Citadel Setup after clearing IP binding."
+        )
+    if code_s == "10004" or "current ip is not in" in lower:
+        return (
+            "Bitunix rejected this server IP (code 10004). "
+            "Add all Railway static outbound IPs to your Bitunix API key whitelist."
         )
     if code_s == "10007" or "signature" in lower:
         return "Bitunix rejected the API signature. Check API Key and Secret."
-    if "permission" in text.lower() or code_s in {"10003", "10004"}:
+    if "permission" in text.lower() or code_s == "10003":
         return "Bitunix API key lacks Trade permission. Enable Trading API on your key."
     if text:
         return f"Bitunix: {text}"
@@ -228,7 +317,7 @@ def verify_credentials(
             "ok": False,
             "http_status": http_status,
             "code": None,
-            "msg": (raw or "Invalid response").strip()[:300] or "Invalid response",
+            "msg": _format_api_error(raw or "", http_status),
         }
     code = parsed.get("code")
     ok = http_status == 200 and str(code) == "0"
