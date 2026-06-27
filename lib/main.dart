@@ -1478,6 +1478,9 @@ abstract final class OracleCitadelStore {
     return 'BloFin Live';
   }
 
+  static String get exchangeBrandName =>
+      selectedExchange == 'bitunix' ? 'Bitunix' : 'BloFin';
+
   static Future<void> saveSelectedExchange(String exchange) async {
     selectedExchange = exchange == 'bitunix' ? 'bitunix' : 'blofin';
     final prefs = await SharedPreferences.getInstance();
@@ -5339,7 +5342,7 @@ class _CitadelPendingDeployCard extends StatelessWidget {
           FilledButton.icon(
             onPressed: onDeploy,
             icon: const Icon(Icons.bolt_rounded, size: 20),
-            label: const Text('Deploy to BloFin now'),
+            label: Text('Deploy to ${OracleCitadelStore.exchangeBrandName} now'),
             style: FilledButton.styleFrom(
               backgroundColor: const Color(0xFF43A047),
               foregroundColor: Colors.white,
@@ -5414,7 +5417,9 @@ class _CitadelExpertViewState extends State<_CitadelExpertView> {
     setState(() {
       _serverLinked = linked;
       _linkMessage = message;
-      _exchangeLabel = (label != null && label.trim().isNotEmpty) ? label : 'BloFin';
+      _exchangeLabel = (label != null && label.trim().isNotEmpty)
+          ? label
+          : OracleCitadelStore.exchangeDisplayLabel;
       _lastConnected = iso != null ? DateTime.tryParse(iso) : null;
       _leverage = OracleCitadelStore.defaultLeverage;
       _riskPercent = OracleCitadelStore.defaultRiskPercent;
@@ -5481,7 +5486,7 @@ class _CitadelExpertViewState extends State<_CitadelExpertView> {
               ),
               const SizedBox(height: 8),
               Text(
-                'MARKET & LIMIT execution via BloFin',
+                'MARKET & LIMIT execution via ${OracleCitadelStore.exchangeBrandName}',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 14,
@@ -5530,7 +5535,8 @@ class _CitadelExpertViewState extends State<_CitadelExpertView> {
                       const SizedBox(width: 12),
                       Expanded(
                         child: Text(
-                          _linkMessage ?? 'Not connected — open setup to link your BloFin API keys.',
+                          _linkMessage ??
+                              'Not connected — open setup to link your ${OracleCitadelStore.exchangeBrandName} API keys.',
                           style: TextStyle(fontSize: 13, height: 1.45, color: Colors.grey[300]),
                         ),
                       ),
@@ -5553,7 +5559,7 @@ class _CitadelExpertViewState extends State<_CitadelExpertView> {
                       const SizedBox(width: 10),
                       Expanded(
                         child: Text(
-                          'Connected means your BloFin keys are linked — it does not place orders by itself. '
+                          'Connected means your ${OracleCitadelStore.exchangeBrandName} keys are linked — it does not place orders by itself. '
                           'Deploy from Trade Setup: generate a report, scroll down, tap Send to Oracle Citadel, '
                           'then choose MARKET or LIMIT.',
                           style: TextStyle(fontSize: 12.5, height: 1.45, color: Colors.grey[400]),
@@ -5634,9 +5640,11 @@ class _CitadelExpertViewState extends State<_CitadelExpertView> {
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        OracleCitadelStore.useDemoMode
-                            ? 'Mode: BloFin Demo (recommended for testing)'
-                            : 'Mode: BloFin Live',
+                        OracleCitadelStore.selectedExchange == 'bitunix'
+                            ? 'Mode: Bitunix Live'
+                            : OracleCitadelStore.useDemoMode
+                                ? 'Mode: BloFin Demo (recommended for testing)'
+                                : 'Mode: BloFin Live',
                         style: TextStyle(fontSize: 13, color: Colors.grey[400]),
                       ),
                       const SizedBox(height: 4),
@@ -5733,7 +5741,7 @@ class _CitadelUpgradeView extends StatelessWidget {
               ),
               const SizedBox(height: 8),
               Text(
-                'MARKET & LIMIT execution via BloFin',
+                'MARKET & LIMIT execution via ${OracleCitadelStore.exchangeBrandName}',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 14,

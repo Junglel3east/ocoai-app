@@ -331,7 +331,7 @@ class _EmptyPositionsCard extends StatelessWidget {
           const SizedBox(width: 12),
           Expanded(
             child: Text(
-              'No open BloFin positions yet.\n'
+              'No open ${OracleCitadelStore.exchangeBrandName} positions yet.\n'
               '1. Trade Setup → generate a report\n'
               '2. Scroll down → Send to Oracle Citadel\n'
               '3. Choose MARKET or LIMIT and confirm',

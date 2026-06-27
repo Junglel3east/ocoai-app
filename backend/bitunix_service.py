@@ -44,7 +44,32 @@ def bitunix_symbol(coin: str) -> str:
 
 
 def _canonical_json(body: dict[str, Any]) -> str:
-    return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+    # Bitunix signature requires sorted keys and no spaces (official docs + community libs).
+    return json.dumps(body, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
+
+
+def _format_api_error(raw: str, http_status: int) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return f"Bitunix API returned an empty response (HTTP {http_status})."
+    if text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return user_friendly_error(parsed.get("code"), parsed.get("msg") or parsed.get("message"))
+        except json.JSONDecodeError:
+            pass
+    lower = text.lower()
+    if "1010" in text or "cloudflare" in lower:
+        return (
+            "Bitunix blocked the server request (WAF/firewall). "
+            "Add your Railway server IP to Bitunix API whitelist if required."
+        )
+    if http_status == 403:
+        return "Bitunix denied the request (HTTP 403). Check Trade permission and IP whitelist on your API key."
+    if http_status == 401:
+        return "Bitunix rejected API credentials (HTTP 401). Check API Key and Secret."
+    return f"Bitunix error (HTTP {http_status}): {text[:240]}"
 
 
 def _query_params_string(params: dict[str, Any]) -> str:
@@ -136,6 +161,8 @@ def _private_request(
 
 def user_friendly_error(code: Any, msg: Optional[str]) -> str:
     text = (msg or "").strip()
+    if text.lower().startswith("bitunix"):
+        return text
     code_s = str(code) if code is not None else ""
     lower = text.lower()
     if "1010" in text or "access denied" in lower:
@@ -150,6 +177,34 @@ def user_friendly_error(code: Any, msg: Optional[str]) -> str:
     if text:
         return f"Bitunix: {text}"
     return "Bitunix API request failed. Check keys and try again."
+
+
+def fetch_position_mode(
+    *,
+    api_key: str,
+    api_secret: str,
+    request_id: str = "?",
+) -> str:
+    http_status, raw, parsed = _private_request(
+        base_url=BITUNIX_LIVE_API_BASE_URL,
+        api_key=api_key,
+        api_secret=api_secret,
+        method="GET",
+        path=BITUNIX_ACCOUNT_PATH,
+        query={"marginCoin": BITUNIX_MARGIN_COIN},
+        request_id=request_id,
+        log_tag="bitunix_position_mode",
+    )
+    if not isinstance(parsed, dict) or http_status != 200 or str(parsed.get("code")) != "0":
+        return "HEDGE"
+    data = parsed.get("data")
+    rows = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+    for row in rows:
+        if isinstance(row, dict):
+            mode = str(row.get("positionMode") or "").upper()
+            if mode in {"ONE_WAY", "HEDGE"}:
+                return mode
+    return "HEDGE"
 
 
 def verify_credentials(
@@ -322,9 +377,11 @@ def place_order(
     client_id: Optional[str] = None,
     reduce_only: bool = False,
     trade_side: Optional[str] = None,
+    position_mode: Optional[str] = None,
     request_id: str = "?",
 ) -> dict[str, Any]:
     symbol = bitunix_symbol(coin)
+    mode = (position_mode or "HEDGE").upper()
     if trade_side:
         side = "BUY" if direction.lower() == "long" and trade_side == "OPEN" else (
             "SELL" if direction.lower() == "short" and trade_side == "OPEN" else _close_side(direction)[0]
@@ -339,10 +396,12 @@ def place_order(
         "symbol": symbol,
         "qty": str(qty),
         "side": side,
-        "tradeSide": ts,
         "orderType": "MARKET" if order_type.lower() == "market" else "LIMIT",
-        "reduceOnly": bool(reduce_only),
     }
+    if mode == "HEDGE":
+        body["tradeSide"] = ts
+    if reduce_only:
+        body["reduceOnly"] = True
     if client_id:
         body["clientId"] = client_id[:32]
     if body["orderType"] == "LIMIT" and price is not None:
@@ -350,7 +409,7 @@ def place_order(
         body["effect"] = "GTC"
     if sl is not None and not reduce_only:
         body["slPrice"] = str(sl)
-        body["slStopType"] = "LAST_PRICE"
+        body["slStopType"] = "MARK_PRICE"
         body["slOrderType"] = "MARKET"
 
     http_status, raw, parsed = _private_request(
@@ -368,7 +427,7 @@ def place_order(
             "ok": False,
             "http_status": http_status,
             "code": "invalid_json",
-            "msg": "Bitunix returned non-JSON",
+            "msg": _format_api_error(raw or "", http_status),
             "order_id": None,
             "raw_preview": (raw or "")[:500],
         }
@@ -492,22 +551,25 @@ def place_tp_close_order(
     qty: str,
     tp_price: float,
     client_id: Optional[str] = None,
+    position_mode: Optional[str] = None,
     request_id: str = "?",
 ) -> dict[str, Any]:
     side, trade_side = _close_side(direction)
-    body = {
+    mode = (position_mode or "HEDGE").upper()
+    body: dict[str, Any] = {
         "symbol": bitunix_symbol(coin),
         "qty": str(qty),
         "side": side,
-        "tradeSide": trade_side,
         "orderType": "LIMIT",
         "price": str(tp_price),
         "effect": "GTC",
         "reduceOnly": True,
     }
+    if mode == "HEDGE":
+        body["tradeSide"] = trade_side
     if client_id:
         body["clientId"] = client_id[:32]
-    http_status, _raw, parsed = _private_request(
+    http_status, raw, parsed = _private_request(
         base_url=BITUNIX_LIVE_API_BASE_URL,
         api_key=api_key,
         api_secret=api_secret,
@@ -517,13 +579,21 @@ def place_tp_close_order(
         request_id=request_id,
         log_tag="bitunix_tp_close",
     )
-    ok = http_status == 200 and isinstance(parsed, dict) and str(parsed.get("code")) == "0"
-    data = parsed.get("data") if isinstance(parsed, dict) and isinstance(parsed.get("data"), dict) else {}
+    if not isinstance(parsed, dict):
+        return {
+            "ok": False,
+            "http_status": http_status,
+            "code": "invalid_json",
+            "msg": _format_api_error(raw or "", http_status),
+            "order_id": None,
+        }
+    ok = http_status == 200 and str(parsed.get("code")) == "0"
+    data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
     return {
         "ok": ok,
         "http_status": http_status,
-        "code": parsed.get("code") if isinstance(parsed, dict) else None,
-        "msg": parsed.get("msg") if isinstance(parsed, dict) else None,
+        "code": parsed.get("code"),
+        "msg": parsed.get("msg"),
         "order_id": data.get("orderId"),
     }
 

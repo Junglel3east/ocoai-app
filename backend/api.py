@@ -236,6 +236,41 @@ class GrokError(Exception):
         self.cause = cause
 
 
+def _grok_user_friendly_message(status_code: int, body: str) -> str:
+    """Turn xAI HTTP errors into actionable Citadel/analyze messages."""
+    preview = (body or "").strip()
+    parsed: dict[str, Any] = {}
+    if preview.startswith("{"):
+        try:
+            raw = json.loads(preview)
+            if isinstance(raw, dict):
+                parsed = raw
+        except json.JSONDecodeError:
+            parsed = {}
+
+    err_text = str(parsed.get("error") or parsed.get("message") or "").strip()
+    code = str(parsed.get("code") or "").strip().lower()
+    combined = f"{code} {err_text} {preview}".lower()
+
+    if status_code == 403 and (
+        "credit" in combined
+        or "permission-denied" in combined
+        or "subscription" in combined
+        or "available resources" in combined
+    ):
+        return (
+            "xAI API credits exhausted or access denied. "
+            "Add credits at https://console.x.ai/ and confirm GROK_API_KEY on Railway has an active balance."
+        )
+    if status_code == 401:
+        return "Grok API key rejected (HTTP 401). Verify GROK_API_KEY on Railway."
+    if status_code == 429:
+        return "Grok rate limit hit (HTTP 429). Wait 1–2 minutes and retry Trade Setup."
+    if err_text:
+        return f"Grok HTTP {status_code}: {err_text[:240]}"
+    return f"Grok HTTP {status_code}."
+
+
 # Symbol (uppercase) → CoinGecko coin id (seed + dynamic refresh)
 _SYMBOL_TO_COINGECKO_ID: dict[str, str] = {
     "BTC": "bitcoin",
@@ -4032,7 +4067,7 @@ def call_grok(
             body_preview,
         )
         raise GrokError(
-            f"Grok HTTP {response.status_code}.",
+            _grok_user_friendly_message(response.status_code, body_preview),
             status_code=response.status_code,
             response_body=body_preview,
         )
@@ -4149,7 +4184,8 @@ def build_analyze_fallback_report(
 **If I Were to Trade Today...**: Stand flat until Oracle AI completes a full read. Forced entries without the model are negative EV.
 
 **Risks & Watchlist**:
-• Grok/xAI latency or rate limits on Railway
+• xAI/Grok credits or rate limits — add credits at https://console.x.ai/ if Oracle Status shows HTTP 403
+• Grok/xAI latency on Railway
 • Verify `GROK_API_KEY` in Railway Variables if this repeats
 {trade_levels_note}
 """
@@ -7071,6 +7107,18 @@ async def _execute_bitunix_citadel_trade(
             lev_result.get("msg"),
         )
 
+    position_mode = await asyncio.to_thread(
+        bux.fetch_position_mode,
+        api_key=exchange_api_key,
+        api_secret=exchange_secret,
+        request_id=req_id,
+    )
+    logger.info(
+        "execute_trade_bitunix_position_mode request_id=%s mode=%s",
+        req_id,
+        position_mode,
+    )
+
     if not is_market:
         limit_entry = float(trade.entry_price)
         order_size, size_meta = await asyncio.to_thread(
@@ -7094,6 +7142,7 @@ async def _execute_bitunix_citadel_trade(
             price=str(limit_entry),
             sl=trade.stop_loss,
             client_id=trade_id[:32],
+            position_mode=position_mode,
             request_id=req_id,
         )
         entry_order_id = entry_result.get("order_id")
@@ -7160,6 +7209,7 @@ async def _execute_bitunix_citadel_trade(
                 qty=tp1_size,
                 tp_price=trade.tp1,
                 client_id=f"{trade_id[:28]}l1",
+                position_mode=position_mode,
                 request_id=req_id,
             )
             tp1_order_id = tp1_result.get("order_id")
@@ -7174,6 +7224,7 @@ async def _execute_bitunix_citadel_trade(
                 qty=tp2_size,
                 tp_price=trade.tp2,
                 client_id=f"{trade_id[:28]}l2",
+                position_mode=position_mode,
                 request_id=req_id,
             )
             tp2_order_id = tp2_result.get("order_id")
@@ -7272,6 +7323,7 @@ async def _execute_bitunix_citadel_trade(
         qty=order_size,
         sl=trade.stop_loss,
         client_id=trade_id[:32],
+        position_mode=position_mode,
         request_id=req_id,
     )
     market_order_id = market_result.get("order_id")
@@ -7334,6 +7386,7 @@ async def _execute_bitunix_citadel_trade(
         qty=tp1_size,
         tp_price=trade.tp1,
         client_id=f"{trade_id[:28]}t1",
+        position_mode=position_mode,
         request_id=req_id,
     )
     tp1_order_id = tp1_result.get("order_id")
@@ -7349,6 +7402,7 @@ async def _execute_bitunix_citadel_trade(
         qty=tp2_size,
         tp_price=trade.tp2,
         client_id=f"{trade_id[:28]}t2",
+        position_mode=position_mode,
         request_id=req_id,
     )
     tp2_order_id = tp2_result.get("order_id")
