@@ -41,6 +41,8 @@ BITUNIX_PLACE_ORDER_PATH = "/api/v1/futures/trade/place_order"
 BITUNIX_ORDER_DETAIL_PATH = "/api/v1/futures/trade/get_order_detail"
 BITUNIX_POSITIONS_PATH = "/api/v1/futures/position/get_pending_positions"
 BITUNIX_FLASH_CLOSE_PATH = "/api/v1/futures/trade/flash_close_position"
+BITUNIX_PLACE_TPSL_PATH = "/api/v1/futures/tpsl/place_order"
+BITUNIX_TPSL_PENDING_PATH = "/api/v1/futures/tpsl/get_pending_orders"
 
 BITUNIX_POST_ORDER_CONFIRM_DELAY_SEC = 1.5
 BITUNIX_FILL_CONFIRM_MAX_POLLS = 6
@@ -685,6 +687,267 @@ def confirm_limit_order(
             "row": row,
         }
     return {"limit_ok": False, "limit_status": "unknown", "filled_size": "0", "status": status, "row": row}
+
+
+def resolve_position_id(
+    *,
+    api_key: str,
+    api_secret: str,
+    coin: str,
+    direction: str,
+    request_id: str = "?",
+    max_attempts: int = 6,
+    poll_sec: float = 0.5,
+) -> Optional[str]:
+    """Poll pending positions until the new fill appears (needed for TP/SL API)."""
+    symbol = bitunix_symbol(coin)
+    want = direction.lower()
+    for attempt in range(1, max_attempts + 1):
+        positions = fetch_positions(
+            api_key=api_key,
+            api_secret=api_secret,
+            symbol=symbol,
+            request_id=request_id,
+        )
+        for row in positions:
+            if str(row.get("direction") or "").lower() == want and row.get("positionId"):
+                return str(row["positionId"])
+        if attempt < max_attempts:
+            time.sleep(poll_sec)
+    logger.warning(
+        "bitunix_position_id_not_found request_id=%s coin=%s direction=%s attempts=%s",
+        request_id,
+        coin,
+        direction,
+        max_attempts,
+    )
+    return None
+
+
+def place_tpsl_order(
+    *,
+    api_key: str,
+    api_secret: str,
+    coin: str,
+    position_id: str,
+    qty: str,
+    tp_price: Optional[float] = None,
+    sl_price: Optional[float] = None,
+    request_id: str = "?",
+    log_tag: str = "bitunix_tpsl",
+) -> dict[str, Any]:
+    """Native Bitunix TP/SL order (shows in exchange TP/SL UI like BloFin order-tpsl)."""
+    body: dict[str, Any] = {
+        "symbol": bitunix_symbol(coin),
+        "positionId": str(position_id),
+    }
+    if tp_price is not None:
+        body["tpPrice"] = str(tp_price)
+        body["tpQty"] = str(qty)
+        body["tpStopType"] = "MARK_PRICE"
+        body["tpOrderType"] = "MARKET"
+    if sl_price is not None:
+        body["slPrice"] = str(sl_price)
+        body["slQty"] = str(qty)
+        body["slStopType"] = "MARK_PRICE"
+        body["slOrderType"] = "MARKET"
+    if "tpPrice" not in body and "slPrice" not in body:
+        return {
+            "ok": False,
+            "http_status": 0,
+            "code": "invalid_tpsl",
+            "msg": "TP or SL price required.",
+            "tpsl_id": None,
+        }
+
+    http_status, raw, parsed = _private_request(
+        base_url=BITUNIX_LIVE_API_BASE_URL,
+        api_key=api_key,
+        api_secret=api_secret,
+        method="POST",
+        path=BITUNIX_PLACE_TPSL_PATH,
+        body=body,
+        request_id=request_id,
+        log_tag=log_tag,
+    )
+    if not isinstance(parsed, dict):
+        return {
+            "ok": False,
+            "http_status": http_status,
+            "code": "invalid_json",
+            "msg": _format_api_error(raw or "", http_status),
+            "tpsl_id": None,
+        }
+    data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
+    tpsl_id = data.get("orderId")
+    ok = http_status == 200 and str(parsed.get("code")) == "0" and bool(tpsl_id)
+    return {
+        "ok": ok,
+        "http_status": http_status,
+        "code": parsed.get("code"),
+        "msg": parsed.get("msg"),
+        "tpsl_id": str(tpsl_id) if tpsl_id else None,
+        "body": body,
+    }
+
+
+def attach_dual_tpsl_after_fill(
+    *,
+    api_key: str,
+    api_secret: str,
+    coin: str,
+    direction: str,
+    position_size_str: str,
+    stop_loss: float,
+    tp1: float,
+    tp2: float,
+    include_sl: bool = True,
+    request_id: str = "?",
+) -> dict[str, Any]:
+    """
+    After a confirmed fill: attach SL (optional) + dual TP (40%/60%) via Bitunix TP/SL API.
+    Mirrors BloFin Citadel post-fill order-tpsl legs.
+    """
+    warnings: list[str] = []
+    position_id = resolve_position_id(
+        api_key=api_key,
+        api_secret=api_secret,
+        coin=coin,
+        direction=direction,
+        request_id=request_id,
+    )
+    if not position_id:
+        return {
+            "ok": False,
+            "position_id": None,
+            "sl_tpsl_id": None,
+            "tp1_tpsl_id": None,
+            "tp2_tpsl_id": None,
+            "tp1_size": None,
+            "tp2_size": None,
+            "warnings": ["Could not resolve Bitunix position for TP/SL attachment."],
+        }
+
+    tp1_size, tp2_size = dual_tp_sizes(position_size_str)
+    sl_tpsl_id: Optional[str] = None
+    tp1_tpsl_id: Optional[str] = None
+    tp2_tpsl_id: Optional[str] = None
+
+    if include_sl:
+        sl_result = place_tpsl_order(
+            api_key=api_key,
+            api_secret=api_secret,
+            coin=coin,
+            position_id=position_id,
+            qty=position_size_str,
+            sl_price=stop_loss,
+            request_id=request_id,
+            log_tag="bitunix_tpsl_sl",
+        )
+        sl_tpsl_id = sl_result.get("tpsl_id")
+        if sl_result.get("ok"):
+            logger.info(
+                "bitunix_sl_tpsl_ok request_id=%s position_id=%s tpsl_id=%s size=%s sl=%s",
+                request_id,
+                position_id,
+                sl_tpsl_id,
+                position_size_str,
+                stop_loss,
+            )
+        else:
+            warnings.append(f"Stop loss not placed: {sl_result.get('msg') or 'unknown'}")
+            logger.warning(
+                "bitunix_sl_tpsl_failed request_id=%s code=%s msg=%s",
+                request_id,
+                sl_result.get("code"),
+                sl_result.get("msg"),
+            )
+
+    tp1_result = place_tpsl_order(
+        api_key=api_key,
+        api_secret=api_secret,
+        coin=coin,
+        position_id=position_id,
+        qty=tp1_size,
+        tp_price=tp1,
+        request_id=request_id,
+        log_tag="bitunix_tpsl_tp1",
+    )
+    tp1_tpsl_id = tp1_result.get("tpsl_id")
+    if tp1_result.get("ok"):
+        logger.info(
+            "bitunix_tp1_tpsl_ok request_id=%s tpsl_id=%s size=%s trigger=%s",
+            request_id,
+            tp1_tpsl_id,
+            tp1_size,
+            tp1,
+        )
+    else:
+        warnings.append(f"TP1 (40%) not placed: {tp1_result.get('msg') or 'unknown'}")
+
+    tp2_result = place_tpsl_order(
+        api_key=api_key,
+        api_secret=api_secret,
+        coin=coin,
+        position_id=position_id,
+        qty=tp2_size,
+        tp_price=tp2,
+        request_id=request_id,
+        log_tag="bitunix_tpsl_tp2",
+    )
+    tp2_tpsl_id = tp2_result.get("tpsl_id")
+    if tp2_result.get("ok"):
+        logger.info(
+            "bitunix_tp2_tpsl_ok request_id=%s tpsl_id=%s size=%s trigger=%s",
+            request_id,
+            tp2_tpsl_id,
+            tp2_size,
+            tp2,
+        )
+    else:
+        warnings.append(f"TP2 (60%) not placed: {tp2_result.get('msg') or 'unknown'}")
+
+    return {
+        "ok": not warnings,
+        "position_id": position_id,
+        "sl_tpsl_id": sl_tpsl_id,
+        "tp1_tpsl_id": tp1_tpsl_id,
+        "tp2_tpsl_id": tp2_tpsl_id,
+        "tp1_size": tp1_size,
+        "tp2_size": tp2_size,
+        "warnings": warnings,
+    }
+
+
+def fetch_tpsl_pending(
+    *,
+    api_key: str,
+    api_secret: str,
+    symbol: Optional[str] = None,
+    position_id: Optional[str] = None,
+    request_id: str = "?",
+) -> list[dict[str, Any]]:
+    query: dict[str, Any] = {"limit": 100}
+    if symbol:
+        query["symbol"] = symbol
+    if position_id:
+        query["positionId"] = position_id
+    http_status, _raw, parsed = _private_request(
+        base_url=BITUNIX_LIVE_API_BASE_URL,
+        api_key=api_key,
+        api_secret=api_secret,
+        method="GET",
+        path=BITUNIX_TPSL_PENDING_PATH,
+        query=query,
+        request_id=request_id,
+        log_tag="bitunix_tpsl_pending",
+    )
+    if not isinstance(parsed, dict) or http_status != 200 or str(parsed.get("code")) != "0":
+        return []
+    rows = parsed.get("data")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
 
 
 def place_tp_close_order(

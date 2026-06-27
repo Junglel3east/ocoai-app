@@ -7247,37 +7247,24 @@ async def _execute_bitunix_citadel_trade(
 
         if limit_status == "filled":
             position_size_str = str(confirm.get("filled_size") or order_size)
-            tp1_size, tp2_size = bux.dual_tp_sizes(position_size_str)
-            tp1_result = await asyncio.to_thread(
-                bux.place_tp_close_order,
+            tpsl_bundle = await asyncio.to_thread(
+                bux.attach_dual_tpsl_after_fill,
                 api_key=exchange_api_key,
                 api_secret=exchange_secret,
                 coin=trade.coin,
                 direction=trade.direction,
-                qty=tp1_size,
-                tp_price=trade.tp1,
-                client_id=f"{trade_id[:28]}l1",
-                position_mode=position_mode,
+                position_size_str=position_size_str,
+                stop_loss=trade.stop_loss,
+                tp1=trade.tp1,
+                tp2=trade.tp2,
+                include_sl=False,
                 request_id=req_id,
             )
-            tp1_order_id = tp1_result.get("order_id")
-            if not tp1_result.get("ok"):
-                tp_warnings.append(f"TP1 (40%) not placed: {tp1_result.get('msg') or 'unknown'}")
-            tp2_result = await asyncio.to_thread(
-                bux.place_tp_close_order,
-                api_key=exchange_api_key,
-                api_secret=exchange_secret,
-                coin=trade.coin,
-                direction=trade.direction,
-                qty=tp2_size,
-                tp_price=trade.tp2,
-                client_id=f"{trade_id[:28]}l2",
-                position_mode=position_mode,
-                request_id=req_id,
-            )
-            tp2_order_id = tp2_result.get("order_id")
-            if not tp2_result.get("ok"):
-                tp_warnings.append(f"TP2 (60%) not placed: {tp2_result.get('msg') or 'unknown'}")
+            tp1_order_id = tpsl_bundle.get("tp1_tpsl_id")
+            tp2_order_id = tpsl_bundle.get("tp2_tpsl_id")
+            tp1_size = tpsl_bundle.get("tp1_size")
+            tp2_size = tpsl_bundle.get("tp2_size")
+            tp_warnings = list(tpsl_bundle.get("warnings") or [])
 
         fill_entry = _parse_blofin_price_token(confirm.get("average_price")) or limit_entry
         if limit_status == "filled":
@@ -7369,7 +7356,7 @@ async def _execute_bitunix_citadel_trade(
         direction=trade.direction,
         order_type="market",
         qty=order_size,
-        sl=trade.stop_loss,
+        sl=None,
         client_id=trade_id[:32],
         position_mode=position_mode,
         request_id=req_id,
@@ -7427,42 +7414,25 @@ async def _execute_bitunix_citadel_trade(
         )
 
     position_size_str = str(confirm.get("filled_size") or order_size)
-    tp1_size, tp2_size = bux.dual_tp_sizes(position_size_str)
-    tp1_order_id: Optional[str] = None
-    tp2_order_id: Optional[str] = None
-    tp_warnings: list[str] = []
-
-    tp1_result = await asyncio.to_thread(
-        bux.place_tp_close_order,
+    tpsl_bundle = await asyncio.to_thread(
+        bux.attach_dual_tpsl_after_fill,
         api_key=exchange_api_key,
         api_secret=exchange_secret,
         coin=trade.coin,
         direction=trade.direction,
-        qty=tp1_size,
-        tp_price=trade.tp1,
-        client_id=f"{trade_id[:28]}t1",
-        position_mode=position_mode,
+        position_size_str=position_size_str,
+        stop_loss=trade.stop_loss,
+        tp1=trade.tp1,
+        tp2=trade.tp2,
+        include_sl=True,
         request_id=req_id,
     )
-    tp1_order_id = tp1_result.get("order_id")
-    if not tp1_result.get("ok"):
-        tp_warnings.append(f"TP1 (40%) not placed: {tp1_result.get('msg') or 'unknown'}")
-
-    tp2_result = await asyncio.to_thread(
-        bux.place_tp_close_order,
-        api_key=exchange_api_key,
-        api_secret=exchange_secret,
-        coin=trade.coin,
-        direction=trade.direction,
-        qty=tp2_size,
-        tp_price=trade.tp2,
-        client_id=f"{trade_id[:28]}t2",
-        position_mode=position_mode,
-        request_id=req_id,
-    )
-    tp2_order_id = tp2_result.get("order_id")
-    if not tp2_result.get("ok"):
-        tp_warnings.append(f"TP2 (60%) not placed: {tp2_result.get('msg') or 'unknown'}")
+    tp1_order_id = tpsl_bundle.get("tp1_tpsl_id")
+    tp2_order_id = tpsl_bundle.get("tp2_tpsl_id")
+    sl_tpsl_id = tpsl_bundle.get("sl_tpsl_id")
+    tp1_size = tpsl_bundle.get("tp1_size")
+    tp2_size = tpsl_bundle.get("tp2_size")
+    tp_warnings: list[str] = list(tpsl_bundle.get("warnings") or [])
 
     fill_row = confirm.get("row") if isinstance(confirm.get("row"), dict) else {}
     fill_entry = _parse_blofin_price_token(fill_row.get("avgPrice")) or reference_price
@@ -7472,6 +7442,10 @@ async def _execute_bitunix_citadel_trade(
         f"{trade.coin} {trade.direction.upper()} · Fill {format_usd(fill_entry)} · "
         f"Order ID {market_order_id}"
     )
+    if not tp_warnings:
+        user_message += (
+            f" · SL {format_usd(trade.stop_loss)} · TP1 {format_usd(trade.tp1)} · TP2 {format_usd(trade.tp2)}"
+        )
 
     return JSONResponse(
         status_code=200,
@@ -7481,6 +7455,7 @@ async def _execute_bitunix_citadel_trade(
             "order_type": "market",
             "trade_id": trade_id,
             "order_id": market_order_id,
+            "sl_tpsl_id": sl_tpsl_id,
             "tp1_tpsl_id": tp1_order_id,
             "tp2_tpsl_id": tp2_order_id,
             "tp1_size": tp1_size,
@@ -8745,12 +8720,22 @@ async def _handle_citadel_tpsl_details(http_request: Request) -> JSONResponse:
         return err
     assert session is not None
     if session.get("exchange") == "bitunix":
+        symbol = (http_request.query_params.get("inst_id") or http_request.query_params.get("symbol") or "").strip()
+        position_id = (http_request.query_params.get("position_id") or "").strip() or None
+        orders = await asyncio.to_thread(
+            bux.fetch_tpsl_pending,
+            api_key=session["api_key"],
+            api_secret=session["api_secret"],
+            symbol=symbol or None,
+            position_id=position_id,
+            request_id=session["req_id"],
+        )
         return JSONResponse(
             status_code=200,
             content={
                 "success": True,
-                "orders": [],
-                "count": 0,
+                "orders": orders,
+                "count": len(orders),
                 "request_id": session["req_id"],
             },
             headers={"X-Request-ID": session["req_id"]},
