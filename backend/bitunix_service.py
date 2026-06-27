@@ -261,6 +261,11 @@ def user_friendly_error(code: Any, msg: Optional[str]) -> str:
         )
     if code_s == "10007" or "signature" in lower:
         return "Bitunix rejected the API signature. Check API Key and Secret."
+    if code_s == "20003" or "insufficient balance" in lower:
+        return (
+            "Bitunix: Insufficient balance for this order size. "
+            "Lower position size % or leverage, or add USDT to your Bitunix Futures wallet."
+        )
     if "permission" in text.lower() or code_s == "10003":
         return "Bitunix API key lacks Trade permission. Enable Trading API on your key."
     if text:
@@ -375,21 +380,72 @@ def calculate_order_size(
     api_secret: str,
     request_id: str = "?",
 ) -> tuple[str, dict[str, Any]]:
+    """
+    Position-size % of account → margin budget → notional (× leverage) → base qty.
+    Matches BloFin Citadel sizing: risk_percent is % of available USDT used as margin,
+    not % of account lost if stop hits.
+    """
     available = fetch_available_usdt(api_key=api_key, api_secret=api_secret, request_id=request_id)
-    risk_frac = max(0.1, min(float(risk_percent), 100.0)) / 100.0
+    risk_pct = max(0.1, min(float(risk_percent), 100.0))
     lev = max(1.0, float(leverage))
     entry = max(float(entry_price), 1e-9)
     stop_dist = abs(entry - float(stop_loss))
     if stop_dist <= 0:
         stop_dist = entry * 0.01
-    if available and available > 0:
-        risk_usd = available * risk_frac
-        notional = risk_usd * lev / (stop_dist / entry)
-        qty = notional / entry
-        qty = max(BITUNIX_MIN_QTY, qty)
-        meta = {"source": "balance", "available_usdt": available, "risk_usd": risk_usd}
-        return _format_qty(qty), meta
-    return BITUNIX_DEFAULT_QTY, {"source": "fallback", "available_usdt": available}
+
+    meta: dict[str, Any] = {
+        "risk_percent": risk_pct,
+        "leverage": lev,
+        "entry_price": entry,
+        "sl_distance": stop_dist,
+        "available_usdt": available,
+    }
+
+    if not available or available <= 0:
+        meta["fallback"] = "balance_unavailable"
+        logger.warning("bitunix_size_fallback_balance request_id=%s qty=%s", request_id, BITUNIX_DEFAULT_QTY)
+        return BITUNIX_DEFAULT_QTY, meta
+
+    # Position size slider = % of available USDT deployed as margin (same as BloFin).
+    margin_budget = available * (risk_pct / 100.0)
+    margin_budget = min(margin_budget, available * 0.98)
+    notional_target = margin_budget * lev
+    qty = notional_target / entry
+
+    # Hard cap: required margin must fit available balance.
+    max_margin = available * 0.98
+    max_qty_by_balance = (max_margin * lev) / entry
+    qty = min(qty, max_qty_by_balance)
+
+    # Soft cap: if SL is very tight, don't oversize beyond loss implied by margin budget.
+    if stop_dist > 0:
+        loss_per_unit = stop_dist
+        if loss_per_unit > 0:
+            max_by_sl = margin_budget / loss_per_unit
+            qty = min(qty, max_by_sl)
+            meta["loss_per_unit"] = loss_per_unit
+
+    qty = max(BITUNIX_MIN_QTY, qty)
+    required_margin = (qty * entry) / lev if lev > 0 else None
+    meta.update(
+        {
+            "source": "balance",
+            "margin_budget_usdt": margin_budget,
+            "notional_target_usdt": qty * entry,
+            "qty": qty,
+            "required_margin_usdt": required_margin,
+        }
+    )
+    logger.info(
+        "bitunix_size_ok request_id=%s available=%.4f margin_budget=%.4f lev=%sx qty=%s required_margin=%s",
+        request_id,
+        available,
+        margin_budget,
+        lev,
+        _format_qty(qty),
+        f"{required_margin:.4f}" if required_margin is not None else "?",
+    )
+    return _format_qty(qty), meta
 
 
 def dual_tp_sizes(total_qty: str) -> tuple[str, str]:
