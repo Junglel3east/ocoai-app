@@ -1788,24 +1788,6 @@ abstract final class OracleCitadelService {
     return null;
   }
 
-  static String _appendWhitelistHint(String friendly, Map<String, dynamic> body) {
-    final ips = <String>[];
-    final multi = body['whitelist_ips'];
-    if (multi is List) {
-      for (final item in multi) {
-        final ip = item?.toString().trim();
-        if (ip != null && ip.isNotEmpty) ips.add(ip);
-      }
-    }
-    if (ips.isEmpty) {
-      final single = body['whitelist_ip']?.toString().trim();
-      if (single != null && single.isNotEmpty) ips.add(single);
-    }
-    if (ips.isEmpty) return friendly;
-    final envLabel = OracleCitadelStore.exchangeDisplayLabel;
-    return '$friendly\n\nWhitelist in $envLabel → API Management:\n${ips.join(', ')}';
-  }
-
   static Future<void> linkExchangeKeys({
     required String userId,
     required String exchangeApiKey,
@@ -1963,7 +1945,11 @@ abstract final class OracleCitadelService {
     var friendly = _parseUserMessage(response) ??
         body['user_message']?.toString() ??
         'MARKET order could not be sent (${response.statusCode}).';
-    friendly = _appendWhitelistHint(friendly, body);
+    final whitelistIp = body['whitelist_ip']?.toString().trim();
+    if (whitelistIp != null && whitelistIp.isNotEmpty) {
+      final envLabel = OracleCitadelStore.exchangeDisplayLabel;
+      friendly = '$friendly\n\nWhitelist this IP in $envLabel → API Management: $whitelistIp';
+    }
     throw OracleCitadelException(
       friendly,
       errorCode: body['error_code']?.toString(),
@@ -2020,7 +2006,11 @@ abstract final class OracleCitadelService {
     var friendly = _parseUserMessage(response) ??
         body['user_message']?.toString() ??
         'LIMIT order could not be sent (${response.statusCode}).';
-    friendly = _appendWhitelistHint(friendly, body);
+    final whitelistIp = body['whitelist_ip']?.toString().trim();
+    if (whitelistIp != null && whitelistIp.isNotEmpty) {
+      final envLabel = OracleCitadelStore.exchangeDisplayLabel;
+      friendly = '$friendly\n\nWhitelist this IP in $envLabel → API Management: $whitelistIp';
+    }
     throw OracleCitadelException(
       friendly,
       errorCode: body['error_code']?.toString(),
