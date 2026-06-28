@@ -3984,7 +3984,7 @@ def _attach_bitunix_whitelist_ip_if_needed(
     msg: Optional[str] = None,
     http_status: Optional[int] = None,
 ) -> None:
-    if not bux.is_ip_whitelist_block(code, msg, http_status):
+    if not bux.is_waf_or_ip_block(code, msg, http_status):
         return
     ips = _citadel_egress_ips_for_whitelist()
     if not ips:
@@ -7188,11 +7188,7 @@ async def _execute_bitunix_citadel_trade(
         )
         entry_order_id = entry_result.get("order_id")
         if not entry_result.get("ok") or not entry_order_id:
-            friendly = bux.user_friendly_error(
-                entry_result.get("code"),
-                entry_result.get("msg"),
-                entry_result.get("http_status"),
-            )
+            friendly = bux.user_friendly_error(entry_result.get("code"), entry_result.get("msg"))
             fail_body: dict[str, Any] = {
                 "success": False,
                 "status": "failed",
@@ -7367,11 +7363,7 @@ async def _execute_bitunix_citadel_trade(
     )
     market_order_id = market_result.get("order_id")
     if not market_result.get("ok") or not market_order_id:
-        friendly = bux.user_friendly_error(
-            market_result.get("code"),
-            market_result.get("msg"),
-            market_result.get("http_status"),
-        )
+        friendly = bux.user_friendly_error(market_result.get("code"), market_result.get("msg"))
         fail_body = {
             "success": False,
             "status": "failed",

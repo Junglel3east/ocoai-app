@@ -92,25 +92,18 @@ def _canonical_json(body: dict[str, Any]) -> str:
     return json.dumps(body, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
 
 
-def is_cloudflare_waf_block(code: Any, msg: Optional[str], http_status: Optional[int] = None) -> bool:
+def is_waf_or_ip_block(code: Any, msg: Optional[str], http_status: Optional[int] = None) -> bool:
+    text = (msg or "").lower()
     raw = msg or ""
-    text = raw.lower()
-    if "1010" in raw or ("cloudflare" in text and str(code or "") != "10004"):
+    if "1010" in raw or "cloudflare" in text or "waf" in text or "firewall" in text:
         return True
-    if http_status in {403, 503} and ("1010" in raw or "access denied" in text):
+    if str(code or "") == "10004" or ("ip" in text and "whitelist" in text):
         return True
-    if str(code or "") == "invalid_json" and ("cloudflare" in text or "1010" in raw):
+    if http_status in {403, 503} and ("blocked" in text or "denied" in text or "access denied" in text):
+        return True
+    if str(code or "") == "invalid_json" and ("cloudflare" in text or "firewall" in text or "1010" in raw):
         return True
     return False
-
-
-def is_ip_whitelist_block(code: Any, msg: Optional[str], http_status: Optional[int] = None) -> bool:
-    text = (msg or "").lower()
-    return str(code or "") == "10004" or "current ip is not in" in text
-
-
-def is_waf_or_ip_block(code: Any, msg: Optional[str], http_status: Optional[int] = None) -> bool:
-    return is_cloudflare_waf_block(code, msg, http_status) or is_ip_whitelist_block(code, msg, http_status)
 
 
 def _format_api_error(raw: str, http_status: int) -> str:
@@ -121,11 +114,7 @@ def _format_api_error(raw: str, http_status: int) -> str:
         try:
             parsed = json.loads(text)
             if isinstance(parsed, dict):
-                return user_friendly_error(
-                    parsed.get("code"),
-                    parsed.get("msg") or parsed.get("message"),
-                    http_status,
-                )
+                return user_friendly_error(parsed.get("code"), parsed.get("msg") or parsed.get("message"))
         except json.JSONDecodeError:
             pass
     lower = text.lower()
@@ -172,37 +161,6 @@ def _sign_headers(
     }
 
 
-def _response_is_cloudflare_1010(status: int, raw: str) -> bool:
-    return status == 403 and "1010" in (raw or "")
-
-
-def _transport_request(
-    *,
-    transport: str,
-    impersonate: Optional[str],
-    method: str,
-    url: str,
-    merged_headers: dict[str, str],
-    payload: Optional[bytes],
-) -> Any:
-    if transport == "curl" and _HAS_CURL_CFFI and curl_requests is not None:
-        return curl_requests.request(
-            method,
-            url,
-            headers=merged_headers,
-            data=payload,
-            timeout=30,
-            impersonate=impersonate or _BITUNIX_CURL_IMPERSONATE,
-        )
-    return _BITUNIX_HTTP.request(
-        method,
-        url,
-        headers=merged_headers,
-        data=payload,
-        timeout=30,
-    )
-
-
 def _private_request(
     *,
     base_url: str,
@@ -239,117 +197,66 @@ def _private_request(
         }
         merged_headers = {**browser_headers, **headers}
         payload = body_str.encode("utf-8") if body_str else None
-        method_upper = method.upper()
 
-        impersonates: list[str] = []
-        if _HAS_CURL_CFFI:
-            for imp in (_BITUNIX_CURL_IMPERSONATE, "chrome120", "chrome110", "chrome101", "edge101"):
-                if imp and imp not in impersonates:
-                    impersonates.append(imp)
-
-        transports: list[tuple[str, Optional[str]]] = [("curl", imp) for imp in impersonates]
-        transports.append(("requests", None))
-
-        last_status = 0
-        last_raw = ""
-        last_parsed: Optional[dict[str, Any]] = None
-
-        for attempt, (transport, impersonate) in enumerate(transports, start=1):
+        if _HAS_CURL_CFFI and curl_requests is not None:
+            response = curl_requests.request(
+                method.upper(),
+                url,
+                headers=merged_headers,
+                data=payload,
+                timeout=30,
+                impersonate=_BITUNIX_CURL_IMPERSONATE,
+            )
+        else:
+            response = _BITUNIX_HTTP.request(
+                method.upper(),
+                url,
+                headers=merged_headers,
+                data=payload,
+                timeout=30,
+            )
+        raw = response.text or ""
+        parsed: Optional[dict[str, Any]] = None
+        if raw:
             try:
-                response = _transport_request(
-                    transport=transport,
-                    impersonate=impersonate,
-                    method=method_upper,
-                    url=url,
-                    merged_headers=merged_headers,
-                    payload=payload,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "%s_transport_failed request_id=%s path=%s transport=%s imp=%s err=%s",
-                    log_tag,
-                    request_id,
-                    path,
-                    transport,
-                    impersonate,
-                    exc,
-                )
-                continue
-
-            raw = response.text or ""
-            parsed: Optional[dict[str, Any]] = None
-            if raw:
-                try:
-                    loaded = json.loads(raw)
-                    if isinstance(loaded, dict):
-                        parsed = loaded
-                except json.JSONDecodeError:
-                    parsed = None
-
-            last_status = response.status_code
-            last_raw = raw
-            last_parsed = parsed
-
-            if _response_is_cloudflare_1010(last_status, last_raw):
-                logger.warning(
-                    "%s_cloudflare_1010 request_id=%s path=%s transport=%s imp=%s attempt=%s/%s",
-                    log_tag,
-                    request_id,
-                    path,
-                    transport,
-                    impersonate,
-                    attempt,
-                    len(transports),
-                )
-                if attempt < len(transports):
-                    time.sleep(0.35 * attempt)
-                continue
-
-            if last_status >= 400 or (
-                isinstance(parsed, dict)
-                and parsed.get("code") is not None
-                and str(parsed.get("code")) != "0"
-            ):
-                logger.warning(
-                    "%s_http request_id=%s status=%s path=%s transport=%s code=%s body=%s",
-                    log_tag,
-                    request_id,
-                    last_status,
-                    path,
-                    transport,
-                    parsed.get("code") if isinstance(parsed, dict) else None,
-                    (raw or "")[:500],
-                )
-            elif attempt > 1:
-                logger.info(
-                    "%s_transport_recovered request_id=%s path=%s transport=%s imp=%s",
-                    log_tag,
-                    request_id,
-                    path,
-                    transport,
-                    impersonate,
-                )
-            return last_status, last_raw, last_parsed
-
-        return last_status, last_raw, last_parsed
+                loaded = json.loads(raw)
+                if isinstance(loaded, dict):
+                    parsed = loaded
+            except json.JSONDecodeError:
+                parsed = None
+        if response.status_code >= 400 or (
+            isinstance(parsed, dict)
+            and parsed.get("code") is not None
+            and str(parsed.get("code")) != "0"
+        ):
+            logger.warning(
+                "%s_http request_id=%s status=%s path=%s code=%s body=%s",
+                log_tag,
+                request_id,
+                response.status_code,
+                path,
+                parsed.get("code") if isinstance(parsed, dict) else None,
+                (raw or "")[:500],
+            )
+        return response.status_code, raw, parsed
     except requests.RequestException as exc:
         logger.warning("%s_request_failed request_id=%s path=%s err=%s", log_tag, request_id, path, exc)
         return 0, str(exc), None
 
 
-def user_friendly_error(code: Any, msg: Optional[str], http_status: Optional[int] = None) -> str:
+def user_friendly_error(code: Any, msg: Optional[str]) -> str:
     text = (msg or "").strip()
     if text.lower().startswith("bitunix"):
         return text
     code_s = str(code) if code is not None else ""
     lower = text.lower()
-    if is_cloudflare_waf_block(code, msg, http_status):
+    if is_waf_or_ip_block(code, msg):
         return (
             "Bitunix Cloudflare blocked this server (error 1010). "
             "Remove ALL IPs from your Bitunix API key — IP binding breaks cloud/server API access. "
-            "Wait 30 seconds and retry, or re-save keys in Citadel Setup."
+            "Re-save keys in Citadel Setup after clearing IP binding."
         )
-    if is_ip_whitelist_block(code, msg, http_status):
+    if code_s == "10004" or "current ip is not in" in lower:
         return (
             "Bitunix rejected this server IP (code 10004). "
             "Add all Railway static outbound IPs to your Bitunix API key whitelist."
