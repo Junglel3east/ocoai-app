@@ -22,8 +22,6 @@ class OracleDeskScreen extends StatefulWidget {
 
 class _OracleDeskScreenState extends State<OracleDeskScreen> with SingleTickerProviderStateMixin {
   OracleDeskBias _bias = OracleDeskBias.loading;
-  bool _biasLoading = true;
-  String? _biasError;
   List<OraclePulseOpportunity> _oraclePulse = const [];
   late final AnimationController _radarController;
 
@@ -52,10 +50,6 @@ class _OracleDeskScreenState extends State<OracleDeskScreen> with SingleTickerPr
   }
 
   Future<void> _loadBias() async {
-    setState(() {
-      _biasLoading = true;
-      _biasError = null;
-    });
     try {
       final bundle = await OracleDeskService.fetchDeskBundle(
         watchlist: widget.watchlist,
@@ -72,7 +66,6 @@ class _OracleDeskScreenState extends State<OracleDeskScreen> with SingleTickerPr
         setState(() {
           _bias = bundle.bias;
           _oraclePulse = pulses;
-          _biasLoading = false;
         });
       }
     } catch (_) {
@@ -87,8 +80,6 @@ class _OracleDeskScreenState extends State<OracleDeskScreen> with SingleTickerPr
           avgMomentum: 0,
         );
         setState(() {
-          _biasError = 'Market sync delayed — showing cached desk metrics.';
-          _biasLoading = false;
           _bias = fallback;
           _oraclePulse = OracleDeskService.buildOraclePulse(
             bias: fallback,
@@ -105,17 +96,6 @@ class _OracleDeskScreenState extends State<OracleDeskScreen> with SingleTickerPr
     await _loadBias();
   }
 
-  Color _biasColor(OracleDeskBiasKind kind) {
-    switch (kind) {
-      case OracleDeskBiasKind.bullish:
-        return const Color(0xFF00E676);
-      case OracleDeskBiasKind.bearish:
-        return const Color(0xFFFF5252);
-      case OracleDeskBiasKind.neutral:
-        return const Color(0xFF00BFFF);
-    }
-  }
-
   String _formatUsd(double v) {
     final sign = v >= 0 ? '+' : '-';
     final abs = v.abs();
@@ -129,7 +109,6 @@ class _OracleDeskScreenState extends State<OracleDeskScreen> with SingleTickerPr
       trades: widget.trades,
       watchlist: widget.watchlist,
     );
-    final accent = _biasColor(_bias.kind);
 
     final bottomInset = MediaQuery.paddingOf(context).bottom;
 
@@ -148,10 +127,6 @@ class _OracleDeskScreenState extends State<OracleDeskScreen> with SingleTickerPr
               crossAxisAlignment: CrossAxisAlignment.stretch,
               mainAxisSize: MainAxisSize.min,
               children: [
-                _deskHeader(accent),
-                const SizedBox(height: _AppSpacing.section),
-                _biasSection(accent, perf),
-                const SizedBox(height: _AppSpacing.section),
                 _WarRoomSection(
                   bias: _bias,
                   opportunities: _oraclePulse,
@@ -170,286 +145,6 @@ class _OracleDeskScreenState extends State<OracleDeskScreen> with SingleTickerPr
     );
   }
 
-  Widget _deskHeader(Color accent) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(color: accent.withValues(alpha: 0.35)),
-                gradient: LinearGradient(
-                  colors: [
-                    accent.withValues(alpha: 0.12),
-                    Colors.white.withValues(alpha: 0.04),
-                  ],
-                ),
-              ),
-              child: Text(
-                'COMMAND CENTER',
-                style: TextStyle(
-                  fontSize: 10,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 1.4,
-                  color: accent,
-                ),
-              ),
-            ),
-            const Spacer(),
-            Icon(Icons.auto_graph_rounded, color: accent.withValues(alpha: 0.7), size: 22),
-          ],
-        ),
-        const SizedBox(height: 10),
-        ShaderMask(
-          shaderCallback: (bounds) => LinearGradient(
-            colors: [Colors.white, accent.withValues(alpha: 0.85)],
-          ).createShader(bounds),
-          child: const Text(
-            'Oracle Desk',
-            style: TextStyle(
-              fontSize: 30,
-              fontWeight: FontWeight.w800,
-              letterSpacing: -0.8,
-              color: Colors.white,
-            ),
-          ),
-        ),
-        const SizedBox(height: 6),
-        Text(
-          'Your Personal Trading Command Center',
-          style: TextStyle(fontSize: 14, color: Colors.grey[500], height: 1.35),
-        ),
-      ],
-    );
-  }
-
-  Widget _biasSection(Color accent, OracleDeskPerformance perf) {
-    return _OracleDeskGlassCard(
-      accent: accent,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            "Today's Oracle Bias For You",
-            style: TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w600,
-              letterSpacing: 0.3,
-              color: Colors.grey[400],
-            ),
-          ),
-          const SizedBox(height: 18),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _BiasOrb(
-                kind: _bias.kind,
-                confidencePct: _biasLoading ? null : _bias.confidencePct,
-                accent: accent,
-              ),
-              const SizedBox(width: 18),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    if (_biasLoading)
-                      const SizedBox(
-                        height: 22,
-                        width: 22,
-                        child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00BFFF)),
-                      )
-                    else
-                      Text(
-                        _bias.title,
-                        style: const TextStyle(
-                          fontSize: 22,
-                          fontWeight: FontWeight.w800,
-                          letterSpacing: -0.4,
-                        ),
-                      ),
-                    if (_biasError != null) ...[
-                      const SizedBox(height: 6),
-                      Text(_biasError!, style: const TextStyle(fontSize: 11, color: Color(0xFFFFB74D))),
-                    ],
-                    const SizedBox(height: 10),
-                    Text(
-                      _bias.reasoning,
-                      style: TextStyle(fontSize: 13, height: 1.5, color: Colors.grey[400]),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 18),
-          Text(
-            'Recommended for you today',
-            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.grey[500]),
-          ),
-          const SizedBox(height: 10),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: _bias.recommendedCoins.map((coin) {
-              return Container(
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(24),
-                  gradient: LinearGradient(
-                    colors: [
-                      accent.withValues(alpha: 0.22),
-                      const Color(0xFF1A1A22),
-                    ],
-                  ),
-                  border: Border.all(color: accent.withValues(alpha: 0.35)),
-                  boxShadow: [
-                    BoxShadow(
-                      color: accent.withValues(alpha: 0.12),
-                      blurRadius: 12,
-                      offset: const Offset(0, 4),
-                    ),
-                  ],
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.bolt, size: 14, color: accent),
-                    const SizedBox(width: 6),
-                    Text(
-                      coin,
-                      style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13),
-                    ),
-                  ],
-                ),
-              );
-            }).toList(),
-          ),
-        ],
-      ),
-    );
-  }
-
-}
-
-class _OracleDeskGlassCard extends StatelessWidget {
-  final Widget child;
-  final Color accent;
-
-  const _OracleDeskGlassCard({required this.child, required this.accent});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(18),
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            const Color(0xFF1A1A22).withValues(alpha: 0.95),
-            const Color(0xFF0F0F14),
-          ],
-        ),
-        border: Border.all(color: accent.withValues(alpha: 0.22)),
-        boxShadow: [
-          BoxShadow(
-            color: accent.withValues(alpha: 0.08),
-            blurRadius: 28,
-            spreadRadius: 0,
-            offset: const Offset(0, 8),
-          ),
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.45),
-            blurRadius: 16,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      child: child,
-    );
-  }
-}
-
-class _BiasOrb extends StatelessWidget {
-  final OracleDeskBiasKind kind;
-  final int? confidencePct;
-  final Color accent;
-
-  const _BiasOrb({
-    required this.kind,
-    required this.confidencePct,
-    required this.accent,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      width: 96,
-      height: 96,
-      child: Stack(
-        alignment: Alignment.center,
-        children: [
-          Container(
-            width: 96,
-            height: 96,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              boxShadow: [
-                BoxShadow(color: accent.withValues(alpha: 0.55), blurRadius: 28, spreadRadius: 2),
-                BoxShadow(color: accent.withValues(alpha: 0.2), blurRadius: 48, spreadRadius: 8),
-              ],
-            ),
-          ),
-          Container(
-            width: 88,
-            height: 88,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              gradient: RadialGradient(
-                colors: [
-                  accent.withValues(alpha: 0.9),
-                  accent.withValues(alpha: 0.35),
-                  const Color(0xFF0A0A0C),
-                ],
-                stops: const [0.0, 0.55, 1.0],
-              ),
-              border: Border.all(color: Colors.white.withValues(alpha: 0.15), width: 1.5),
-            ),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                if (confidencePct != null) ...[
-                  Text(
-                    '$confidencePct%',
-                    style: const TextStyle(
-                      fontSize: 22,
-                      fontWeight: FontWeight.w800,
-                      color: Colors.white,
-                      height: 1,
-                    ),
-                  ),
-                  Text(
-                    'conf.',
-                    style: TextStyle(fontSize: 10, color: Colors.white.withValues(alpha: 0.75)),
-                  ),
-                ] else
-                  const SizedBox(
-                    width: 24,
-                    height: 24,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                  ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
 }
 
 // ─── Performance Snapshot + Edge Breakdown ─────────────────────────────────

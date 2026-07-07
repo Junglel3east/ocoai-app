@@ -57,7 +57,7 @@ part 'screens/oracle_desk_screen.dart';
 
 const String kNewsApiKey = String.fromEnvironment(
   'NEWS_API_KEY',
-  defaultValue: '',
+  defaultValue: '0164e1b479294ae581c5097fdcf0d69a',
 );
 
 /// Production FastAPI backend (Railway live). Override: --dart-define=BACKEND_BASE_URL=...
@@ -1470,12 +1470,15 @@ abstract final class OracleCitadelStore {
     useDemoMode = prefs.getBool(_demoModeKey) ?? true;
     selectedExchange = prefs.getString(_selectedExchangeKey) ?? 'blofin';
     if (selectedExchange != 'bitunix') selectedExchange = 'blofin';
+    useDemoMode = _demoModeForExchange(selectedExchange);
   }
+
+  /// Mode is dictated by the exchange: BloFin = demo-only, Bitunix = live-only.
+  static bool _demoModeForExchange(String exchange) => exchange != 'bitunix';
 
   static String get exchangeDisplayLabel {
     if (selectedExchange == 'bitunix') return 'Bitunix Live';
-    if (useDemoMode) return 'BloFin Demo';
-    return 'BloFin Live';
+    return 'BloFin Demo';
   }
 
   static String get exchangeBrandName =>
@@ -1485,16 +1488,16 @@ abstract final class OracleCitadelStore {
     selectedExchange = exchange == 'bitunix' ? 'bitunix' : 'blofin';
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_selectedExchangeKey, selectedExchange);
-    if (selectedExchange == 'bitunix') {
-      useDemoMode = false;
-      await prefs.setBool(_demoModeKey, false);
-    }
+    useDemoMode = _demoModeForExchange(selectedExchange);
+    await prefs.setBool(_demoModeKey, useDemoMode);
   }
 
   static Future<void> saveDemoMode(bool enabled) async {
-    useDemoMode = enabled;
+    // Exchange dictates mode (BloFin demo-only, Bitunix live-only) —
+    // coerce so no caller can put BloFin in live or Bitunix in demo.
+    useDemoMode = _demoModeForExchange(selectedExchange);
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_demoModeKey, enabled);
+    await prefs.setBool(_demoModeKey, useDemoMode);
   }
 
   static Future<void> saveLeverage(double leverage) async {
@@ -5642,9 +5645,7 @@ class _CitadelExpertViewState extends State<_CitadelExpertView> {
                       Text(
                         OracleCitadelStore.selectedExchange == 'bitunix'
                             ? 'Mode: Bitunix Live'
-                            : OracleCitadelStore.useDemoMode
-                                ? 'Mode: BloFin Demo (recommended for testing)'
-                                : 'Mode: BloFin Live',
+                            : 'Mode: BloFin Demo (demo only — testing)',
                         style: TextStyle(fontSize: 13, color: Colors.grey[400]),
                       ),
                       const SizedBox(height: 4),

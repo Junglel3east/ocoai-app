@@ -42,9 +42,10 @@ const String _kCitadelPrimaryRecommendedTitle = 'Kraken (Recommended)';
 const String _kCitadelPrimaryRecommendedReason =
     'US & EU regulated • Up to 50x leverage • Strongest compliance & security';
 
-const String _kCitadelNotRecommendedTitle = 'BloFin';
+const String _kCitadelNotRecommendedTitle = 'BloFin (Demo Mode Only)';
 const String _kCitadelNotRecommendedWarning =
-    'Strong leverage (up to 150x) for live high-risk trading. Demo mode available for testing only.';
+    'Demo/testnet trading only in Citadel — simulated funds for testing. '
+    'Live execution uses Bitunix or other supported exchanges.';
 
 // ─── Premium palette (Citadel Setup only) ───────────────────────────────────
 
@@ -172,14 +173,14 @@ void _showCitadelSetupGuideSheet(BuildContext context) {
                   ],
                 ),
                 _CitadelGuideSection(
-                  exchange: 'BloFin (LIVE or demo testing)',
+                  exchange: 'BloFin (Demo Mode Only — testing)',
                   steps: const [
-                    'For LIVE: use BloFin live API keys with Demo Mode OFF (default).',
-                    'For testing only: enable Use Demo/Testnet Mode and use BloFin Demo API keys.',
+                    'BloFin in Citadel is demo/testnet only — simulated funds, no live orders.',
+                    'Use BloFin Demo API keys; Demo Mode is enabled automatically for BloFin.',
                     'API Management → Create key → Trade permissions only; disable Withdrawals.',
                     'Set the API Passphrase when creating the key — you must enter the same passphrase in Citadel Setup.',
-                    'Whitelist Railway/server IP if prompted (see BloFin API docs).',
                     'Copy API Key and Secret immediately; paste Key, Secret, and Passphrase into Oracle Citadel Setup.',
+                    'For LIVE trading, connect Bitunix (or another supported live exchange) instead.',
                   ],
                 ),
                 const SizedBox(height: 8),
@@ -802,13 +803,13 @@ class _CitadelApiKeysHowToSection extends StatelessWidget {
               ],
             ),
             _CitadelHowToBlock(
-              title: 'BloFin (LIVE trading or demo testing)',
+              title: 'BloFin (Demo Mode Only — testing)',
               steps: [
-                'LIVE (default): use BloFin live API keys with Demo Mode OFF.',
-                'Testing only: enable Demo Mode and use BloFin Demo API keys (simulated funds).',
+                'BloFin in Citadel is demo/testnet only — orders use simulated funds, never real money.',
+                'Use BloFin Demo API keys; Demo Mode turns on automatically when BloFin is selected.',
                 'API Management → Create key → Trade only; disable Withdrawals and Transfers.',
-                'Whitelist outbound IP if required (Railway server IP for production backend).',
-                'Understand up to 150x leverage — live orders use real funds when Demo Mode is off.',
+                'Set and remember the API Passphrase — Citadel requires it for BloFin.',
+                'For LIVE trading, connect Bitunix (or another supported live exchange).',
               ],
             ),
             _CitadelHowToBlock(
@@ -824,9 +825,9 @@ class _CitadelApiKeysHowToSection extends StatelessWidget {
               title: 'Demo vs live mode',
               isWarning: true,
               bullets: [
-                'Live trading is the default: real MARKET orders on your connected exchange.',
-                'Demo Mode is for internal testing only (BloFin Demo with simulated funds).',
-                'Never enable Demo Mode unless you intend to test — all other connections are LIVE.',
+                'Mode is set by exchange: BloFin = Demo only, Bitunix = Live only.',
+                'Live trading (Bitunix) places real MARKET orders with real funds.',
+                'Demo Mode (BloFin Demo) uses simulated funds for testing only.',
               ],
             ),
           ],
@@ -993,7 +994,6 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
   /// Shown after successful exchange key link (also restored from prefs on open).
   bool _isExchangeLinked = false;
   bool _saveJustCompleted = false;
-  String _connectedExchangeLabel = 'Exchange';
   DateTime? _lastConnectedAt;
   double _leverage = 5;
   String _appApiKey = '';
@@ -1025,7 +1025,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
 
   Future<void> _syncDemoModeFromExchangeKeys() async {
     if (!mounted || _saving || !_looksLikeDemoExchangeKeys()) return;
-    if (_useDemoMode) return;
+    if (!_isBlofin || _useDemoMode) return;
     setState(() => _useDemoMode = true);
     await OracleCitadelStore.saveDemoMode(true);
     await _persistCitadelUiPrefs();
@@ -1047,19 +1047,27 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
     } else {
       linked = false;
     }
-    final label = prefs.getString(_kCitadelConnectedExchangePref) ?? 'Exchange';
     final iso = prefs.getString(_kCitadelLastConnectedPref);
     DateTime? lastConnected;
     if (iso != null && iso.isNotEmpty) {
       lastConnected = DateTime.tryParse(iso);
     }
 
+    // Mode follows the exchange: Bitunix = live-only, BloFin = demo-only.
+    final restoredExchange = OracleCitadelStore.selectedExchange;
+    final coercedDemo =
+        restoredExchange == _kCitadelBitunixExchangeId ? false : true;
+    if (coercedDemo != demoPref) {
+      await OracleCitadelStore.saveDemoMode(coercedDemo);
+      await prefs.setBool(_kCitadelDemoModePref, coercedDemo);
+    }
+    if (!mounted) return;
+
     setState(() {
-      _useDemoMode = demoPref;
-      OracleCitadelStore.useDemoMode = demoPref;
-      _selectedExchange = OracleCitadelStore.selectedExchange;
+      _useDemoMode = coercedDemo;
+      OracleCitadelStore.useDemoMode = coercedDemo;
+      _selectedExchange = restoredExchange;
       _isExchangeLinked = linked && OracleCitadelStore.isConfigured;
-      _connectedExchangeLabel = label;
       _lastConnectedAt = lastConnected;
       _leverage = OracleCitadelStore.defaultLeverage;
       _appApiKey = OracleCitadelStore.apiKey;
@@ -1092,8 +1100,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
 
   String get _displayExchangeLabel {
     if (_isBitunix) return 'Bitunix Live';
-    if (_useDemoMode) return 'BloFin Demo';
-    return _connectedExchangeLabel.isNotEmpty ? _connectedExchangeLabel : 'BloFin Live';
+    return 'BloFin Demo';
   }
 
   @override
@@ -1171,6 +1178,11 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
           setState(() => _useDemoMode = false);
           await OracleCitadelStore.saveDemoMode(false);
         }
+        if (_isBlofin && !_useDemoMode) {
+          // BloFin is demo-only in Citadel — never send live mode.
+          setState(() => _useDemoMode = true);
+          await OracleCitadelStore.saveDemoMode(true);
+        }
         await OracleCitadelStore.saveSelectedExchange(_selectedExchange);
         await _persistCitadelUiPrefs();
         if (!mounted) return;
@@ -1180,7 +1192,8 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
           exchangeApiSecret: exchangeSecret,
           exchangePassphrase: exchangePassphrase,
           exchange: _selectedExchange,
-          useDemoMode: _isBitunix ? false : _useDemoMode,
+          // Bitunix = live-only; BloFin = demo-only.
+          useDemoMode: _isBitunix ? false : true,
           riskPercent: risk,
         );
         final verified = await OracleCitadelService.verifyServerLinked();
@@ -1190,15 +1203,12 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
             'Try Save & Connect again, or contact support if this persists.',
           );
         }
-        final label = _isBitunix
-            ? 'Bitunix Live'
-            : (_useDemoMode ? 'BloFin Demo' : 'BloFin Live');
+        final label = _isBitunix ? 'Bitunix Live' : 'BloFin Demo';
         await _persistConnectionStatus(exchangeLabel: label, demoMode: _useDemoMode);
         if (!mounted) return;
         setState(() {
           _isExchangeLinked = true;
           _saveJustCompleted = true;
-          _connectedExchangeLabel = label;
           _lastConnectedAt = DateTime.now();
         });
         final pending = await CitadelPendingTradeStore.load();
@@ -1365,8 +1375,12 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                         segments: const [
                           ButtonSegment(
                             value: _kCitadelBlofinExchangeId,
-                            label: Text('BloFin'),
-                            icon: Icon(Icons.swap_horiz_rounded, size: 18),
+                            label: Text(
+                              'BloFin (Demo Mode Only)',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(fontSize: 12),
+                            ),
+                            icon: Icon(Icons.science_outlined, size: 18),
                           ),
                           ButtonSegment(
                             value: _kCitadelBitunixExchangeId,
@@ -1387,15 +1401,27 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                                   _selectedExchange = next;
                                   if (next == _kCitadelBitunixExchangeId) {
                                     _useDemoMode = false;
+                                  } else if (next == _kCitadelBlofinExchangeId) {
+                                    // BloFin is demo-only — live execution uses Bitunix.
+                                    _useDemoMode = true;
                                   }
                                 });
                                 await OracleCitadelStore.saveSelectedExchange(next);
+                                await OracleCitadelStore.saveDemoMode(_useDemoMode);
+                                await _persistCitadelUiPrefs();
                               },
                       ),
                       if (_isBitunix) ...[
                         const SizedBox(height: 8),
                         Text(
                           'Bitunix is live-only (API Key + Secret). No passphrase required.',
+                          style: TextStyle(fontSize: 11.5, color: Colors.grey[500], height: 1.35),
+                        ),
+                      ],
+                      if (_isBlofin) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          'BloFin is demo/testnet only in Citadel — simulated funds. For live trading use Bitunix.',
                           style: TextStyle(fontSize: 11.5, color: Colors.grey[500], height: 1.35),
                         ),
                       ],
@@ -1434,7 +1460,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                                   SizedBox(width: 8),
                                   Expanded(
                                     child: Text(
-                                      'BloFin API Passphrase — required for live & demo trades',
+                                      'BloFin API Passphrase — required for demo trades',
                                       style: TextStyle(
                                         fontSize: 13,
                                         fontWeight: FontWeight.w700,
@@ -1454,7 +1480,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                               ),
                               const SizedBox(height: 6),
                               Text(
-                                'Without this, live orders fail with signature errors. Each API key has its own passphrase.',
+                                'Without this, demo orders fail with signature errors. Each API key has its own passphrase.',
                                 style: TextStyle(fontSize: 11.5, color: Colors.grey[500], height: 1.35),
                               ),
                             ],
@@ -1487,25 +1513,21 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                           ),
                           subtitle: Text(
                             _isBitunix
-                                ? 'Bitunix supports live trading only — keep Demo OFF.'
-                                : 'Leave OFF for LIVE trading (default). ON enables BloFin Demo for testing.',
+                                ? 'Bitunix supports live trading only — Demo stays OFF.'
+                                : 'BloFin is Demo Mode only — Demo stays ON. Use Bitunix for live trading.',
                             style: TextStyle(fontSize: 12, color: Colors.grey[500]),
                           ),
                           value: _useDemoMode,
                           activeThumbColor: const Color(0xFF00BFFF),
-                          onChanged: (_saving || _isBitunix)
-                              ? null
-                              : (value) async {
-                                  if (!mounted) return;
-                                  setState(() => _useDemoMode = value);
-                                  await OracleCitadelStore.saveDemoMode(value);
-                                },
+                          // Mode is dictated by the exchange: Bitunix = live-only,
+                          // BloFin = demo-only. The toggle is informational.
+                          onChanged: null,
                         ),
                       ),
                       Padding(
                         padding: const EdgeInsets.only(top: 6, left: 2, right: 2),
                         child: Text(
-                          '(Demo mode available for testing only. Default is Live trading.)',
+                          '(Set automatically by exchange: BloFin = Demo only, Bitunix = Live only.)',
                           style: TextStyle(fontSize: 11.5, color: Colors.grey[600], height: 1.35),
                         ),
                       ),
@@ -1562,7 +1584,7 @@ class _CitadelSetupDialogState extends State<_CitadelSetupDialog> {
                       ),
                       const SizedBox(height: 8),
                       const Text(
-                        'BloFin and Bitunix are supported for live Citadel execution. More exchanges coming soon.',
+                        'Bitunix is supported for live Citadel execution; BloFin is demo-only for testing. More exchanges coming soon.',
                         style: TextStyle(
                           fontSize: 12,
                           fontStyle: FontStyle.italic,
