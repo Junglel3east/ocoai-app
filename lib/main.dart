@@ -1234,7 +1234,8 @@ REPORT FORMAT
 
 **Asset**: [COIN] | \$[PRICE] | [24h %]
 **Overall Bias**: [Mildly Bullish / Mildly Bearish / Neutral] (Confidence: XX%)
-**Key Drivers**: Volume-Weighted Analysis, Liquidity & Sentiment, Heikin Ashi, Fibonacci, Technicals, Market Structure
+**Key Drivers**: Oracle Flux Analysis, Volume-Weighted Analysis, Heikin Ashi Analysis, Market Structure
+(never output Liquidity & Sentiment, Fibonacci Retracements, or Technicals as separate bullets)
 **Confluence Summary**: One decisive sentence.
 **If I Were to Trade Today...**: Execution card — trigger, entry, invalidation, time box.
 **Risks & Watchlist**: 2–3 bullets.
