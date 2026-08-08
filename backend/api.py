@@ -6673,16 +6673,36 @@ async def review(request: ReviewRequest, http_request: Request):
             detail="previous_report is a placeholder — regenerate the original analysis first.",
         )
 
-    market = fetch_market_snapshot(coin)
+    # Same price chain as /analyze — Binance-only snapshot fails on Railway (WAF/geo).
+    market = fetch_live_price_for_analysis(coin)
     req_id = getattr(http_request.state, "request_id", "?")
-    logger.info("review request_id=%s coin=%s price=%.6f", req_id, coin, market["price"])
+    logger.info(
+        "review request_id=%s coin=%s price=%.6f src=%s",
+        req_id,
+        coin,
+        market["price"],
+        market.get("source"),
+    )
 
     try:
-        review_text = call_grok(
+        review_text = await run_grok_in_executor(
             system_prompt=build_review_system_prompt(),
             user_prompt=build_review_user_prompt(coin, previous_report, market),
             temperature=0.50,
             max_tokens=1150,
+        )
+    except asyncio.TimeoutError:
+        logger.error("review_grok_timeout request_id=%s coin=%s", req_id, coin)
+        return JSONResponse(
+            status_code=502,
+            content={
+                "success": False,
+                "detail": f"Review timed out after {ANALYZE_ROUTE_TIMEOUT}s. Try again.",
+                "coin": coin,
+                "request_id": req_id,
+                "error": "grok_timeout",
+            },
+            headers={"X-Request-ID": req_id},
         )
     except GrokError as exc:
         logger.error("review_grok_failed request_id=%s coin=%s msg=%s", req_id, coin, exc.user_message)
