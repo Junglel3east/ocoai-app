@@ -85,6 +85,7 @@ if _root_env.is_file():
 # Dedicated CoinGecko Pro service (imported after load_dotenv so env is resolved).
 import coingecko_service as cg
 import bitunix_service as bux
+import alert_watcher as alert_watch
 
 # Required on Railway: Variables → GROK_API_KEY
 GROK_API_KEY = (os.getenv("GROK_API_KEY") or "").strip()
@@ -136,6 +137,7 @@ DAILY_ANALYSIS_MINUTE = int(os.getenv("DAILY_ANALYSIS_MINUTE", "30"))
 DAILY_ANALYSIS_COINS: tuple[str, ...] = ("BTC", "ETH", "SOL", "XRP")
 _DAILY_ANALYSIS_FILE = _CITADEL_DATA_DIR / "daily_analyses.json"
 _daily_scheduler_task: Optional[asyncio.Task] = None
+_alert_watch_task: Optional[asyncio.Task] = None
 _x_daily_post_scheduler_task: Optional[asyncio.Task] = None
 _last_daily_run_day: Optional[str] = None
 
@@ -343,11 +345,32 @@ class AnalyzeRequest(BaseModel):
     )
     # User's chosen leverage — Citadel-configured when sent by Flutter; else server defaults to 5x.
     leverage: Optional[float] = Field(None, ge=1.0, le=100.0)
+    # Where the trader actually executes (may not be Citadel-supported yet).
+    trading_venue: Optional[str] = Field(
+        None,
+        max_length=48,
+        validation_alias=AliasChoices(
+            "trading_venue",
+            "tradingVenue",
+            "preferred_exchange",
+            "preferredExchange",
+        ),
+    )
 
 
 class ReviewRequest(BaseModel):
     coin: str
     previous_report: str = Field(..., min_length=1)
+    trading_venue: Optional[str] = Field(
+        None,
+        max_length=48,
+        validation_alias=AliasChoices(
+            "trading_venue",
+            "tradingVenue",
+            "preferred_exchange",
+            "preferredExchange",
+        ),
+    )
 
 
 class ChatMessage(BaseModel):
@@ -360,6 +383,16 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] = Field(default_factory=list)
     system_prompt: Optional[str] = None
     request_ts: Optional[int] = None
+    trading_venue: Optional[str] = Field(
+        None,
+        max_length=48,
+        validation_alias=AliasChoices(
+            "trading_venue",
+            "tradingVenue",
+            "preferred_exchange",
+            "preferredExchange",
+        ),
+    )
 
 
 class ExchangeKeysRequest(BaseModel):
@@ -1494,6 +1527,76 @@ def format_usd(price: float) -> str:
     if price >= 0.01:
         return f"${price:,.4f}"
     return f"${price:,.6f}"
+
+
+_TRADING_VENUE_LABELS: dict[str, str] = {
+    "auto": "Auto (best available live feed)",
+    "bitunix": "Bitunix",
+    "blofin": "BloFin",
+    "blofin_demo": "BloFin Demo",
+    "binance": "Binance",
+    "bybit": "Bybit",
+    "okx": "OKX",
+    "kraken": "Kraken",
+    "coinbase": "Coinbase",
+    "hyperliquid": "Hyperliquid",
+    "kucoin": "KuCoin",
+    "gate": "Gate.io",
+    "mexc": "MEXC",
+    "bitget": "Bitget",
+    "htx": "HTX",
+    "phemex": "Phemex",
+    "deribit": "Deribit",
+}
+
+_CITADEL_VENUES = {"bitunix", "blofin", "blofin_demo"}
+
+
+def normalize_trading_venue(raw: Optional[str]) -> Optional[str]:
+    """Canonical venue id, or None when Auto / empty / unknown."""
+    if not raw:
+        return None
+    token = raw.strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "auto": None,
+        "best": None,
+        "best_available": None,
+        "blofin_demo": "blofin_demo",
+        "blofin": "blofin",
+        "gate_io": "gate",
+        "gateio": "gate",
+        "huobi": "htx",
+        "coinbase_advanced": "coinbase",
+        "coinbasepro": "coinbase",
+    }
+    if token in aliases:
+        return aliases[token]
+    if token in _TRADING_VENUE_LABELS:
+        return None if token == "auto" else token
+    return None
+
+
+def format_trading_venue_prompt_block(venue: Optional[str]) -> str:
+    """Tell Grok where the user actually executes — even if Citadel cannot trade there yet."""
+    normalized = normalize_trading_venue(venue)
+    if not normalized:
+        return ""
+    label = _TRADING_VENUE_LABELS.get(normalized, normalized.replace("_", " ").title())
+    citadel_note = (
+        "Citadel can execute here when keys are linked."
+        if normalized in _CITADEL_VENUES
+        else (
+            "Citadel cannot place orders on this venue yet — still write levels, invalidation, "
+            "and execution language as if they fill on this exchange (USDT-M perps unless they say spot)."
+        )
+    )
+    return f"""═══ USER TRADING VENUE — {label} ═══
+The trader executes on {label}. Live price in RULE 0 may come from another feed — disclose the price source
+once, then talk fills, slippage, lot size, and book as {label}.
+{citadel_note}
+Do not claim Oracle Citadel sent the order unless they asked to send to Citadel.
+
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -4870,18 +4973,28 @@ def build_chat_market_context_note(coin: str) -> tuple[str, list[str]]:
 def enrich_chat_user_message(
     message: str,
     history: list[dict[str, str]],
+    trading_venue: Optional[str] = None,
 ) -> tuple[str, Optional[str]]:
     """Append live market context when a coin is mentioned."""
     history_blob = " ".join(item.get("content", "") for item in history[-6:])
     coin = detect_chat_coin_symbol(message, history_blob)
+    venue_block = format_trading_venue_prompt_block(trading_venue).strip()
     if not coin:
-        return message.strip(), None
+        if not venue_block:
+            return message.strip(), None
+        enriched = (
+            f"{message.strip()}\n\n"
+            f"[Server context — trading venue only]\n"
+            f"{venue_block}"
+        )
+        return enriched, None
 
     context_note, _ = build_chat_market_context_note(coin)
+    extra = f"\n{venue_block}" if venue_block else ""
     enriched = (
         f"{message.strip()}\n\n"
         f"[Server context for {coin} — use if relevant, do not recite as a raw data dump]\n"
-        f"{context_note}"
+        f"{context_note}{extra}"
     )
     return enriched, coin
 
@@ -5590,6 +5703,7 @@ def build_analyze_user_prompt(
     user_id: Optional[str] = None,
     system_prompt: Optional[str] = None,
     leverage: Optional[float] = None,
+    trading_venue: Optional[str] = None,
 ) -> str:
     price = float(market["price"])
     change_pct = float(market["change_24h_pct"])
@@ -5606,6 +5720,7 @@ def build_analyze_user_prompt(
     mobula_block = format_mobula_market_prompt_block(market)
     coingecko_block = format_coingecko_pro_prompt_block(market)
     flux_block = format_oracle_flux_prompt_block(oracle_flux)
+    venue_block = format_trading_venue_prompt_block(trading_venue)
     market_fallback_note = format_market_data_fallback_note(market)
     live_price_banner = format_live_price_banner(market)
     prompt_leverage, leverage_is_user_set = resolve_prompt_leverage(
@@ -5725,7 +5840,7 @@ TONE EXEMPLAR (match cadence — technical but conversational):
 "BTC 1D reclaiming Daily VWAP with strong bid absorption + funding flipping positive. Clear liquidity sweep
 below previous lows — strong LONG bias here."
 {scalp_banner}
-{vision_block}{flux_block}
+{vision_block}{flux_block}{venue_block}
 ═══════════════════════════════════════════════════════════
 AUTHORITATIVE LIVE PRICE — RULE 0 (ZERO TOLERANCE)
 ═══════════════════════════════════════════════════════════
@@ -5802,7 +5917,18 @@ Rules:
 """
 
 
-def build_review_user_prompt(coin: str, previous_report: str, market: dict[str, Any]) -> str:
+def build_review_user_prompt(
+    coin: str,
+    previous_report: str,
+    market: dict[str, Any],
+    trading_venue: Optional[str] = None,
+) -> str:
+    venue_line = ""
+    normalized = normalize_trading_venue(trading_venue)
+    if normalized:
+        label = _TRADING_VENUE_LABELS.get(normalized, normalized)
+        venue_line = f"- Trading venue: {label} (user executes here)\n"
+
     return f"""Review this report for {coin.upper()}.
 
 Previous Report:
@@ -5812,7 +5938,7 @@ Current Market:
 - Price: {format_usd(market['price'])}
 - 24h Change: {market['change_24h_pct']:+.2f}%
 - Source: {market.get('source', 'unknown')}
-
+{venue_line}
 **What Got Right**
 - bullets
 
@@ -6098,7 +6224,7 @@ async def lifespan(app: FastAPI):
         bool(_blofin_env_passphrase(False)),
     )
 
-    global _daily_scheduler_task, _x_daily_post_scheduler_task
+    global _daily_scheduler_task, _x_daily_post_scheduler_task, _alert_watch_task
     _init_daily_scheduler_state()
     if DAILY_ANALYSIS_ENABLED:
         logger.info(
@@ -6130,6 +6256,8 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("startup | x_daily_post disabled (X_DAILY_POST_ENABLED=false)")
 
+    _alert_watch_task = asyncio.create_task(alert_watch.watcher_loop())
+
     yield
 
     if _daily_scheduler_task is not None:
@@ -6142,6 +6270,12 @@ async def lifespan(app: FastAPI):
         _x_daily_post_scheduler_task.cancel()
         try:
             await _x_daily_post_scheduler_task
+        except asyncio.CancelledError:
+            pass
+    if _alert_watch_task is not None:
+        _alert_watch_task.cancel()
+        try:
+            await _alert_watch_task
         except asyncio.CancelledError:
             pass
     logger.info("shutdown | shutting down Grok executor")
@@ -6312,6 +6446,24 @@ async def health() -> dict[str, Any]:
         # Last resort — still return 200 so Railway does not mark the service dead.
         logger.exception("health_endpoint_error: %s", exc)
         return {"status": "ok", "version": "2.5.0", "degraded": True}
+
+
+@app.post("/alerts/sync")
+async def sync_alert_watch(request: Request) -> dict[str, Any]:
+    """Register open setup / price levels so the free Binance watcher can FCM when the app is closed."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON body required.")
+    token = str((body or {}).get("fcm_token") or "").strip()
+    levels = (body or {}).get("levels") or []
+    mute_all = bool((body or {}).get("mute_all"))
+    if not token:
+        return {"success": False, "reason": "no_token"}
+    if not isinstance(levels, list):
+        raise HTTPException(status_code=400, detail="levels must be a list.")
+    alert_watch.upsert_watch(token, [row for row in levels if isinstance(row, dict)], mute_all)
+    return {"success": True, "count": 0 if mute_all else len(levels)}
 
 
 @app.get("/live_price")
@@ -6486,6 +6638,7 @@ async def _handle_analyze(
             user_id=user_id,
             system_prompt=request.system_prompt,
             leverage=effective_leverage,
+            trading_venue=request.trading_venue,
         )
 
         logger.info(
@@ -6687,7 +6840,9 @@ async def review(request: ReviewRequest, http_request: Request):
     try:
         review_text = await run_grok_in_executor(
             system_prompt=build_review_system_prompt(),
-            user_prompt=build_review_user_prompt(coin, previous_report, market),
+            user_prompt=build_review_user_prompt(
+                coin, previous_report, market, trading_venue=request.trading_venue
+            ),
             temperature=0.50,
             max_tokens=1150,
         )
@@ -6751,7 +6906,9 @@ async def chat(request: ChatRequest, http_request: Request):
             client_prompt_len,
         )
 
-    enriched_message, context_coin = enrich_chat_user_message(message, history)
+    enriched_message, context_coin = enrich_chat_user_message(
+        message, history, trading_venue=request.trading_venue
+    )
 
     logger.info(
         "chat_request request_id=%s msg_len=%d history=%d context_coin=%s enriched_len=%d",
