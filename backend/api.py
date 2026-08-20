@@ -25,6 +25,7 @@ Endpoints (lib/main.dart):
   POST /execute_trade — Oracle Citadel trade execution (Flutter Send to Citadel)
   GET  /daily_analyses — today's scheduled Home daily analysis batch (BTC, ETH, SOL, XRP)
   POST /internal/cron/post_daily_x — optional Railway cron: post today's analyses to X
+  POST /internal/cron/post_daily_discord — optional Railway cron: post BTC/ETH daily embeds to Discord webhook
 
 Price chain (analysis): Mobula → CoinGecko Pro → CoinGecko free → Binance Spot/Futures → BloFin (Citadel-linked fallback)
 Derivatives (/analyze): funding, OI, long/short ratio, liquidations (Binance Futures)
@@ -61,6 +62,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from discord_daily_poster import (
+    DiscordDailyPosterConfig,
+    post_daily_analyses_to_discord,
+    post_today_from_store as post_discord_today_from_store,
+    redact_webhook_url,
+)
 from x_daily_poster import (
     XDailyPosterConfig,
     post_daily_analyses_to_x,
@@ -139,6 +146,7 @@ _DAILY_ANALYSIS_FILE = _CITADEL_DATA_DIR / "daily_analyses.json"
 _daily_scheduler_task: Optional[asyncio.Task] = None
 _alert_watch_task: Optional[asyncio.Task] = None
 _x_daily_post_scheduler_task: Optional[asyncio.Task] = None
+_discord_daily_post_scheduler_task: Optional[asyncio.Task] = None
 _last_daily_run_day: Optional[str] = None
 
 # X (Twitter) — auto-post daily analysis thread after batch save (OAuth 1.0a User Context).
@@ -147,6 +155,13 @@ X_DAILY_POST_ENABLED = _X_DAILY_CONFIG.enabled
 X_CRON_SECRET = (os.getenv("X_CRON_SECRET") or os.getenv("CRON_SECRET") or "").strip()
 # Seconds after 7:30 AM Chicago before the X scheduler reads persisted analyses (batch may still be running).
 X_DAILY_POST_DELAY_SECONDS = int(os.getenv("X_DAILY_POST_DELAY_SECONDS", "120"))
+
+# Discord — daily BTC/ETH embeds via Incoming Webhook (set DISCORD_WEBHOOK_URL on Railway).
+_DISCORD_DAILY_CONFIG = DiscordDailyPosterConfig()
+DISCORD_DAILY_ENABLED = _DISCORD_DAILY_CONFIG.enabled
+DISCORD_DAILY_POST_DELAY_SECONDS = int(
+    os.getenv("DISCORD_DAILY_POST_DELAY_SECONDS", str(X_DAILY_POST_DELAY_SECONDS))
+)
 
 # BloFin Open API — demo/testnet uses a separate host from live production.
 BLOFIN_DEMO_API_BASE_URL = "https://demo-trading-openapi.blofin.com"
@@ -6067,6 +6082,7 @@ async def _run_daily_analysis_batch(*, reason: str = "scheduled") -> None:
         _last_daily_run_day = day
         logger.info("daily_analysis_batch_saved day=%s count=%s", day, len(entries))
         _schedule_x_daily_post_after_batch(day, entries)
+        _schedule_discord_daily_post_after_batch(day, entries)
     else:
         logger.error("daily_analysis_batch_empty day=%s reason=%s", day, reason)
 
@@ -6177,6 +6193,93 @@ async def _x_daily_post_scheduler_loop() -> None:
         await asyncio.sleep(30)
 
 
+# ---------------------------------------------------------------------------
+# Discord — daily BTC/ETH embeds via Incoming Webhook (channel: #🔮-oracle-vision)
+# ---------------------------------------------------------------------------
+
+
+async def _run_discord_daily_post(day: str, entries: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
+    """Post today's analyses to Discord. Idempotent per day (see data/discord_daily_posts.json)."""
+    if not DISCORD_DAILY_ENABLED:
+        return {"skipped": True, "reason": "disabled"}
+    try:
+        if entries is not None:
+            result = await asyncio.to_thread(
+                post_daily_analyses_to_discord,
+                day,
+                entries,
+                parse_trade_levels=parse_trade_levels,
+                format_usd=format_usd,
+                config=_DISCORD_DAILY_CONFIG,
+            )
+        else:
+            result = await asyncio.to_thread(
+                post_discord_today_from_store,
+                load_store=_load_daily_analysis_store,
+                day_key=day,
+                parse_trade_levels=parse_trade_levels,
+                format_usd=format_usd,
+                config=_DISCORD_DAILY_CONFIG,
+            )
+        logger.info("discord_daily_post_done day=%s result=%s", day, result)
+        return result
+    except Exception as exc:
+        logger.exception("discord_daily_post_failed day=%s err=%s", day, exc)
+        return {"success": False, "day": day, "error": str(exc)}
+
+
+def _schedule_discord_daily_post_after_batch(day: str, entries: list[dict[str, Any]]) -> None:
+    """Fire-and-forget Discord post when a daily batch is saved (does not block analysis)."""
+    if not DISCORD_DAILY_ENABLED:
+        return
+    asyncio.create_task(_run_discord_daily_post(day, entries))
+
+
+async def _maybe_catchup_discord_daily_post() -> None:
+    """
+    If today's analyses already exist (after 7:30 Chicago), post Discord now.
+    Used on deploy so #oracle-vision does not wait until tomorrow. Deduped per day.
+    """
+    if not DISCORD_DAILY_ENABLED or not _DISCORD_DAILY_CONFIG.webhook_ready():
+        return
+    day = _chicago_day_key()
+    store = _load_daily_analysis_store()
+    if store.get("day") != day:
+        return
+    raw = store.get("analyses")
+    if not isinstance(raw, list) or not raw:
+        return
+    logger.info("discord_daily_catchup_start day=%s count=%s", day, len(raw))
+    await _run_discord_daily_post(day, raw)
+
+
+async def _discord_daily_post_scheduler_loop() -> None:
+    """
+    Backup scheduler at the same Chicago time as daily analysis.
+    Waits DISCORD_DAILY_POST_DELAY_SECONDS so Grok batch can finish, then posts from disk.
+    """
+    posted_days: set[str] = set()
+    while True:
+        try:
+            if DISCORD_DAILY_ENABLED:
+                now = datetime.now(ZoneInfo(DAILY_ANALYSIS_TZ))
+                day = _chicago_day_key(now)
+                slot_key = f"{day}:{now.hour}:{now.minute}"
+                if (
+                    now.hour == DAILY_ANALYSIS_HOUR
+                    and now.minute == DAILY_ANALYSIS_MINUTE
+                    and slot_key not in posted_days
+                ):
+                    posted_days.add(slot_key)
+                    await asyncio.sleep(max(0, DISCORD_DAILY_POST_DELAY_SECONDS))
+                    await _run_discord_daily_post(day)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("discord_daily_post_scheduler err=%s", exc)
+        await asyncio.sleep(30)
+
+
 def _verify_cron_secret(request: Request) -> None:
     if not X_CRON_SECRET:
         raise HTTPException(status_code=503, detail="X_CRON_SECRET not configured.")
@@ -6224,7 +6327,7 @@ async def lifespan(app: FastAPI):
         bool(_blofin_env_passphrase(False)),
     )
 
-    global _daily_scheduler_task, _x_daily_post_scheduler_task, _alert_watch_task
+    global _daily_scheduler_task, _x_daily_post_scheduler_task, _discord_daily_post_scheduler_task, _alert_watch_task
     _init_daily_scheduler_state()
     if DAILY_ANALYSIS_ENABLED:
         logger.info(
@@ -6256,6 +6359,25 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("startup | x_daily_post disabled (X_DAILY_POST_ENABLED=false)")
 
+    if DISCORD_DAILY_ENABLED and _DISCORD_DAILY_CONFIG.webhook_ready():
+        logger.info(
+            "startup | discord_daily_post enabled coins=%s webhook=%s delay=%ss",
+            ",".join(_DISCORD_DAILY_CONFIG.post_coins),
+            redact_webhook_url(_DISCORD_DAILY_CONFIG.webhook_url),
+            DISCORD_DAILY_POST_DELAY_SECONDS,
+        )
+        _discord_daily_post_scheduler_task = asyncio.create_task(_discord_daily_post_scheduler_loop())
+        asyncio.create_task(_maybe_catchup_discord_daily_post())
+    elif not _DISCORD_DAILY_CONFIG.webhook_url:
+        logger.info("startup | discord_daily_post disabled (set DISCORD_WEBHOOK_URL on Railway)")
+    elif not _DISCORD_DAILY_CONFIG.webhook_ready():
+        logger.warning(
+            "startup | discord_daily_post webhook present but invalid: %s",
+            ", ".join(_DISCORD_DAILY_CONFIG.missing_fields()),
+        )
+    else:
+        logger.info("startup | discord_daily_post disabled (DISCORD_DAILY_ENABLED=false)")
+
     _alert_watch_task = asyncio.create_task(alert_watch.watcher_loop())
 
     yield
@@ -6270,6 +6392,12 @@ async def lifespan(app: FastAPI):
         _x_daily_post_scheduler_task.cancel()
         try:
             await _x_daily_post_scheduler_task
+        except asyncio.CancelledError:
+            pass
+    if _discord_daily_post_scheduler_task is not None:
+        _discord_daily_post_scheduler_task.cancel()
+        try:
+            await _discord_daily_post_scheduler_task
         except asyncio.CancelledError:
             pass
     if _alert_watch_task is not None:
@@ -6779,6 +6907,19 @@ async def cron_post_daily_x(http_request: Request) -> dict[str, Any]:
     _verify_cron_secret(http_request)
     day = _chicago_day_key()
     result = await _run_x_daily_post(day)
+    return {"success": result.get("success", result.get("skipped", False)), "day": day, "result": result}
+
+
+@app.post("/internal/cron/post_daily_discord")
+@app.post("/internal/cron/post_daily_discord/")
+async def cron_post_daily_discord(http_request: Request) -> dict[str, Any]:
+    """
+    Optional Railway cron / manual trigger — posts today's persisted BTC/ETH daily embeds to Discord.
+    Header: X-Cron-Secret: <X_CRON_SECRET>
+    """
+    _verify_cron_secret(http_request)
+    day = _chicago_day_key()
+    result = await _run_discord_daily_post(day)
     return {"success": result.get("success", result.get("skipped", False)), "day": day, "result": result}
 
 
