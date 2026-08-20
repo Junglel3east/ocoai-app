@@ -6185,7 +6185,7 @@ async def _maybe_catchup_x_daily_post() -> None:
     raw = store.get("analyses")
     if not isinstance(raw, list) or not raw:
         return
-    logger.info("x_daily_catchup_start day=%s count=%s", day, len(raw))
+    logger.info("x_daily_catchup_start day=%s count=%s reason=startup_retry", day, len(raw))
     await _run_x_daily_post(day, raw)
 
 
