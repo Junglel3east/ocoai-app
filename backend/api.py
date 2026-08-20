@@ -1654,6 +1654,10 @@ _LEVEL_FIELD_PATTERNS: dict[str, list[re.Pattern[str]]] = {
             re.IGNORECASE | re.MULTILINE,
         ),
         re.compile(r"entry\s*[=:]\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", re.IGNORECASE),
+        re.compile(
+            r"entry\s*:[^\n$]{0,80}?\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+            re.IGNORECASE,
+        ),
         re.compile(r"buy\s+(?:at|@|:)\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", re.IGNORECASE),
     ],
     "tp1": [
@@ -6030,12 +6034,18 @@ async def _generate_daily_analysis_entry(coin: str, day: str) -> dict[str, Any]:
         scalp_mode=False,
         derivatives=derivatives,
     )
+    user_prompt += (
+        "\n\nDAILY PUBLIC POST: You MUST include this block before the Disclaimer, with real numbers:\n"
+        "**TRADE LEVELS**:\n"
+        "Entry at $X, TP1 (40%) at $X, TP2 (60%) at $X, SL at $X (R:R X.X:1)\n"
+        "Use the long-setup Entry as Entry and Invalidation as SL. Do not omit TRADE LEVELS."
+    )
     try:
         report = await run_grok_in_executor(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=0.36,
-            max_tokens=1520,
+            max_tokens=2048,
         )
     except asyncio.TimeoutError:
         reason = f"daily analysis exceeded {ANALYZE_ROUTE_TIMEOUT}s"
@@ -6083,27 +6093,45 @@ async def _run_daily_analysis_batch(*, reason: str = "scheduled") -> None:
         _persist_daily_analysis_batch(day, entries)
         _last_daily_run_day = day
         logger.info("daily_analysis_batch_saved day=%s count=%s", day, len(entries))
-        _schedule_x_daily_post_after_batch(day, entries)
+        _schedule_x_daily_post_after_batch(
+            day, entries, force=reason.startswith("repair")
+        )
         _schedule_discord_daily_post_after_batch(day, entries)
     else:
         logger.error("daily_analysis_batch_empty day=%s reason=%s", day, reason)
 
 
+def _daily_entries_have_trade_levels(entries: list[Any]) -> bool:
+    """True when each analysis has parseable Entry, TP1, TP2, and SL."""
+    if not entries:
+        return False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return False
+        levels = parse_trade_levels(str(entry.get("report") or ""))
+        if any(levels.get(key) is None for key in ("entry", "tp1", "tp2", "sl")):
+            return False
+    return True
+
+
 async def _maybe_catchup_daily_analyses() -> None:
-    """If server starts after 7:30 AM Chicago and today's batch is missing, generate it."""
+    """If server starts after 7:30 AM Chicago and today's batch is missing or incomplete, generate it."""
     if not DAILY_ANALYSIS_ENABLED or not GROK_API_KEY:
         return
     day = _chicago_day_key()
     store = _load_daily_analysis_store()
     existing = store.get("analyses") if store.get("day") == day else []
-    if isinstance(existing, list) and len(existing) >= len(DAILY_ANALYSIS_COINS):
+    has_full_set = isinstance(existing, list) and len(existing) >= len(DAILY_ANALYSIS_COINS)
+    levels_ok = has_full_set and _daily_entries_have_trade_levels(existing)
+    if has_full_set and levels_ok:
         return
     now = datetime.now(ZoneInfo(DAILY_ANALYSIS_TZ))
     if now.hour < DAILY_ANALYSIS_HOUR or (
         now.hour == DAILY_ANALYSIS_HOUR and now.minute < DAILY_ANALYSIS_MINUTE
     ):
         return
-    await _run_daily_analysis_batch(reason="startup_catchup")
+    reason = "repair_trade_levels" if has_full_set and not levels_ok else "startup_catchup"
+    await _run_daily_analysis_batch(reason=reason)
 
 
 async def _daily_analysis_scheduler_loop() -> None:
@@ -6131,7 +6159,12 @@ async def _daily_analysis_scheduler_loop() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _run_x_daily_post(day: str, entries: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
+async def _run_x_daily_post(
+    day: str,
+    entries: Optional[list[dict[str, Any]]] = None,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
     """Post today's analyses to X. Idempotent per day (see data/x_daily_posts.json)."""
     global _x_last_post_result
     if not X_DAILY_POST_ENABLED:
@@ -6147,6 +6180,7 @@ async def _run_x_daily_post(day: str, entries: Optional[list[dict[str, Any]]] = 
                 parse_trade_levels=parse_trade_levels,
                 format_usd=format_usd,
                 config=_X_DAILY_CONFIG,
+                force=force,
             )
         else:
             result = await asyncio.to_thread(
@@ -6156,6 +6190,7 @@ async def _run_x_daily_post(day: str, entries: Optional[list[dict[str, Any]]] = 
                 parse_trade_levels=parse_trade_levels,
                 format_usd=format_usd,
                 config=_X_DAILY_CONFIG,
+                force=force,
             )
         logger.info("x_daily_post_done day=%s result=%s", day, result)
         _x_last_post_result = result if isinstance(result, dict) else {"result": result}
@@ -6167,11 +6202,13 @@ async def _run_x_daily_post(day: str, entries: Optional[list[dict[str, Any]]] = 
         return result
 
 
-def _schedule_x_daily_post_after_batch(day: str, entries: list[dict[str, Any]]) -> None:
+def _schedule_x_daily_post_after_batch(
+    day: str, entries: list[dict[str, Any]], *, force: bool = False
+) -> None:
     """Fire-and-forget X post when a daily batch is saved (does not block analysis)."""
     if not X_DAILY_POST_ENABLED:
         return
-    asyncio.create_task(_run_x_daily_post(day, entries))
+    asyncio.create_task(_run_x_daily_post(day, entries, force=force))
 
 
 async def _maybe_catchup_x_daily_post() -> None:

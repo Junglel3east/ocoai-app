@@ -281,6 +281,40 @@ class XDailyPoster:
             raise RuntimeError(f"X API unexpected response: {body!r}")
         return data
 
+    def delete_tweet(self, tweet_id: str) -> bool:
+        """Delete a tweet. 404 counts as success (already gone)."""
+        response = requests.delete(
+            f"{_X_API_TWEETS_URL}/{tweet_id}",
+            auth=self._oauth(),
+            timeout=30,
+        )
+        if response.status_code in {200, 204, 404}:
+            return True
+        logger.warning(
+            "x_daily_delete_failed tweet_id=%s status=%s body=%s",
+            tweet_id,
+            response.status_code,
+            response.text[:300],
+        )
+        return False
+
+    def _clear_posted_day(self, day: str) -> bool:
+        """Remove today's prior thread so a corrected one can be posted. Returns False if delete failed."""
+        state = _load_state(self.config.state_file)
+        record = state.get(day)
+        ids: list[str] = []
+        if isinstance(record, dict):
+            raw_ids = record.get("tweet_ids") or []
+            if isinstance(raw_ids, list):
+                ids = [str(i) for i in raw_ids if i]
+        for tweet_id in reversed(ids):
+            if not self.delete_tweet(tweet_id):
+                return False
+        if day in state:
+            del state[day]
+            _save_state(self.config.state_file, state)
+        return True
+
     def post_daily_thread(
         self,
         day: str,
@@ -288,8 +322,9 @@ class XDailyPoster:
         *,
         parse_trade_levels: Callable[[str], dict[str, Optional[float]]],
         format_usd: Callable[[float], str],
+        force: bool = False,
     ) -> dict[str, Any]:
-        """Post header + one reply per coin. Idempotent per calendar day."""
+        """Post header + one reply per coin. Idempotent per calendar day unless force=True."""
         cfg = self.config
         if not cfg.enabled:
             return {"skipped": True, "reason": "disabled"}
@@ -299,7 +334,10 @@ class XDailyPoster:
             return {"skipped": True, "reason": f"missing_oauth_credentials: {missing}"}
 
         if already_posted_today(cfg, day):
-            return {"skipped": True, "reason": "already_posted", "day": day}
+            if not force:
+                return {"skipped": True, "reason": "already_posted", "day": day}
+            if not self._clear_posted_day(day):
+                return {"success": False, "day": day, "error": "could_not_delete_previous_thread"}
 
         wanted = {c.upper() for c in cfg.post_coins}
         filtered = [e for e in entries if str(e.get("coin", "")).upper() in wanted]
@@ -350,6 +388,7 @@ def post_daily_analyses_to_x(
     parse_trade_levels: Callable[[str], dict[str, Optional[float]]],
     format_usd: Callable[[float], str],
     config: Optional[XDailyPosterConfig] = None,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Synchronous entry point (safe to run in asyncio.to_thread)."""
     poster = XDailyPoster(config)
@@ -359,6 +398,7 @@ def post_daily_analyses_to_x(
             entries,
             parse_trade_levels=parse_trade_levels,
             format_usd=format_usd,
+            force=force,
         )
     except Exception as exc:
         logger.exception("x_daily_post_failed day=%s err=%s", day, exc)
@@ -372,6 +412,7 @@ def post_today_from_store(
     parse_trade_levels: Callable[[str], dict[str, Optional[float]]],
     format_usd: Callable[[float], str],
     config: Optional[XDailyPosterConfig] = None,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Load today's persisted analyses and post (for cron / scheduler)."""
     store = load_store()
@@ -386,4 +427,5 @@ def post_today_from_store(
         parse_trade_levels=parse_trade_levels,
         format_usd=format_usd,
         config=config,
+        force=force,
     )
