@@ -70,6 +70,7 @@ from discord_daily_poster import (
 )
 from x_daily_poster import (
     XDailyPosterConfig,
+    already_posted_today,
     post_daily_analyses_to_x,
     post_today_from_store,
 )
@@ -155,6 +156,7 @@ X_DAILY_POST_ENABLED = _X_DAILY_CONFIG.enabled
 X_CRON_SECRET = (os.getenv("X_CRON_SECRET") or os.getenv("CRON_SECRET") or "").strip()
 # Seconds after 7:30 AM Chicago before the X scheduler reads persisted analyses (batch may still be running).
 X_DAILY_POST_DELAY_SECONDS = int(os.getenv("X_DAILY_POST_DELAY_SECONDS", "120"))
+_x_last_post_result: dict[str, Any] = {}
 
 # Discord — daily BTC/ETH embeds via Incoming Webhook (set DISCORD_WEBHOOK_URL on Railway).
 _DISCORD_DAILY_CONFIG = DiscordDailyPosterConfig()
@@ -6131,8 +6133,11 @@ async def _daily_analysis_scheduler_loop() -> None:
 
 async def _run_x_daily_post(day: str, entries: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
     """Post today's analyses to X. Idempotent per day (see data/x_daily_posts.json)."""
+    global _x_last_post_result
     if not X_DAILY_POST_ENABLED:
-        return {"skipped": True, "reason": "disabled"}
+        result = {"skipped": True, "reason": "disabled"}
+        _x_last_post_result = result
+        return result
     try:
         if entries is not None:
             result = await asyncio.to_thread(
@@ -6153,10 +6158,13 @@ async def _run_x_daily_post(day: str, entries: Optional[list[dict[str, Any]]] = 
                 config=_X_DAILY_CONFIG,
             )
         logger.info("x_daily_post_done day=%s result=%s", day, result)
+        _x_last_post_result = result if isinstance(result, dict) else {"result": result}
         return result
     except Exception as exc:
         logger.exception("x_daily_post_failed day=%s err=%s", day, exc)
-        return {"success": False, "day": day, "error": str(exc)}
+        result = {"success": False, "day": day, "error": str(exc)}
+        _x_last_post_result = result
+        return result
 
 
 def _schedule_x_daily_post_after_batch(day: str, entries: list[dict[str, Any]]) -> None:
@@ -6164,6 +6172,21 @@ def _schedule_x_daily_post_after_batch(day: str, entries: list[dict[str, Any]]) 
     if not X_DAILY_POST_ENABLED:
         return
     asyncio.create_task(_run_x_daily_post(day, entries))
+
+
+async def _maybe_catchup_x_daily_post() -> None:
+    """If today's analyses already exist, post the X thread now (deploy / test). Deduped per day."""
+    if not X_DAILY_POST_ENABLED:
+        return
+    day = _chicago_day_key()
+    store = _load_daily_analysis_store()
+    if store.get("day") != day:
+        return
+    raw = store.get("analyses")
+    if not isinstance(raw, list) or not raw:
+        return
+    logger.info("x_daily_catchup_start day=%s count=%s", day, len(raw))
+    await _run_x_daily_post(day, raw)
 
 
 async def _x_daily_post_scheduler_loop() -> None:
@@ -6356,6 +6379,7 @@ async def lifespan(app: FastAPI):
                 ", ".join(_X_DAILY_CONFIG.missing_fields()),
             )
         _x_daily_post_scheduler_task = asyncio.create_task(_x_daily_post_scheduler_loop())
+        asyncio.create_task(_maybe_catchup_x_daily_post())
     else:
         logger.info("startup | x_daily_post disabled (X_DAILY_POST_ENABLED=false)")
 
@@ -6569,6 +6593,14 @@ async def health() -> dict[str, Any]:
                 ],
             },
             "citadel_encryption_configured": bool(CITADEL_ENCRYPTION_KEY),
+            "x_daily": {
+                "enabled": X_DAILY_POST_ENABLED,
+                "oauth_ready": _X_DAILY_CONFIG.oauth_ready(),
+                "missing": _X_DAILY_CONFIG.missing_fields(),
+                "handle": _X_DAILY_CONFIG.handle,
+                "posted_today": already_posted_today(_X_DAILY_CONFIG, _chicago_day_key()),
+                "last": _x_last_post_result or None,
+            },
         }
     except Exception as exc:
         # Last resort — still return 200 so Railway does not mark the service dead.

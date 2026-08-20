@@ -200,10 +200,10 @@ def format_coin_tweet(
 
     summary = meta.get("summary") or ""
     if summary:
-        lines.extend(["", _truncate(summary, 120)])
+        lines.extend(["", _truncate(summary, 90)])
 
-    tags = f"#OnChainOracle #Crypto {_COIN_HASHTAGS.get(coin, f'#{coin}')}"
-    lines.extend(["", tags.strip()])
+    tags = f"#OnChainOracle {_COIN_HASHTAGS.get(coin, f'#{coin}')}"
+    lines.extend(["", "NFA · DYOR — not financial advice", tags.strip()])
 
     tweet = "\n".join(lines)
     return _truncate(tweet, _TWEET_MAX)
@@ -214,6 +214,7 @@ def format_thread_header(day: str, coins: list[str], handle: str) -> str:
     text = (
         f"🔮 On-Chain Oracle AI — Daily 1D Analysis\n"
         f"{day} · {coin_str}\n"
+        f"NFA · DYOR — not financial advice\n"
         f"Thread 👇 · {handle}\n"
         f"#OnChainOracle #Crypto #Trading"
     )
