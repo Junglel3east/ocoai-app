@@ -210,7 +210,8 @@ def format_coin_tweet(
 
 
 def format_thread_header(day: str, coins: list[str], handle: str) -> str:
-    coin_str = " · ".join(f"${c}" for c in coins)
+    # X allows at most one cashtag ($SYMBOL) per post — do not prefix every coin with $.
+    coin_str = " · ".join(coins)
     text = (
         f"🔮 On-Chain Oracle AI — Daily 1D Analysis\n"
         f"{day} · {coin_str}\n"
