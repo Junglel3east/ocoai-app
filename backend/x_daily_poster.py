@@ -209,12 +209,14 @@ def format_coin_tweet(
     return _truncate(tweet, _TWEET_MAX)
 
 
-def format_thread_header(day: str, coins: list[str], handle: str) -> str:
+def format_thread_header(day: str, coins: list[str], handle: str, *, updated: bool = False) -> str:
     # X allows at most one cashtag ($SYMBOL) per post — do not prefix every coin with $.
     coin_str = " · ".join(coins)
+    stamp = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    updated_line = "Updated levels · " if updated else ""
     text = (
         f"🔮 On-Chain Oracle AI — Daily 1D Analysis\n"
-        f"{day} · {coin_str}\n"
+        f"{updated_line}{day} {stamp} · {coin_str}\n"
         f"NFA · DYOR — not financial advice\n"
         f"Thread 👇 · {handle}\n"
         f"#OnChainOracle #Crypto #Trading"
@@ -348,7 +350,7 @@ class XDailyPoster:
         filtered.sort(key=lambda e: coins_order.index(str(e.get("coin", "")).upper()))
 
         tweet_ids: list[str] = []
-        header = format_thread_header(day, coins_order, cfg.handle)
+        header = format_thread_header(day, coins_order, cfg.handle, updated=force)
         header_data = self.post_tweet(header)
         root_id = str(header_data["id"])
         tweet_ids.append(root_id)
