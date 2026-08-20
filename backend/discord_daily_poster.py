@@ -28,6 +28,8 @@ logger = logging.getLogger("ocoai.discord_daily_poster")
 _DISCORD_WEBHOOK_HOSTS = {"discord.com", "discordapp.com"}
 _DESCRIPTION_MAX = 350
 _EMBED_COLOR_CYAN = 0x00BFFF
+_DISCLAIMER_FOOTER = "NFA · DYOR · not financial advice · full report in the app"
+_DISCLAIMER_LINE = "*NFA / DYOR — educational only, not financial advice.*"
 _BIAS_COLORS = {
     "Bullish": 0x22C55E,
     "Bearish": 0xEF4444,
@@ -172,7 +174,7 @@ def build_coin_embed(
             {"name": "TP2 (60%)", "value": _price_field(levels, "tp2", format_usd), "inline": True},
             {"name": "SL", "value": _price_field(levels, "sl", format_usd), "inline": True},
         ],
-        "footer": {"text": "On-Chain Oracle AI · full report in the app"},
+        "footer": {"text": _DISCLAIMER_FOOTER},
     }
 
 
@@ -192,7 +194,7 @@ def build_webhook_payload(
     ]
     return {
         "username": username[:80],
-        "content": f"🔮 **Daily 1D Analysis** — {day} · {coin_str}",
+        "content": f"🔮 **Daily 1D Analysis** — {day} · {coin_str}\n{_DISCLAIMER_LINE}",
         "allowed_mentions": {"parse": []},
         "embeds": embeds[:10],
     }
@@ -202,15 +204,22 @@ class DiscordDailyPoster:
     def __init__(self, config: Optional[DiscordDailyPosterConfig] = None) -> None:
         self.config = config or DiscordDailyPosterConfig()
 
-    def post_webhook(self, payload: dict[str, Any]) -> dict[str, Any]:
-        url = self.config.webhook_url
-        # wait=true returns the created message so we can store an id
-        response = requests.post(
-            url,
-            params={"wait": "true"},
-            json=payload,
-            timeout=30,
-        )
+    def post_webhook(self, payload: dict[str, Any], *, message_id: str = "") -> dict[str, Any]:
+        url = self.config.webhook_url.rstrip("/")
+        if message_id:
+            response = requests.patch(
+                f"{url}/messages/{message_id}",
+                json=payload,
+                timeout=30,
+            )
+        else:
+            # wait=true returns the created message so we can store an id
+            response = requests.post(
+                url,
+                params={"wait": "true"},
+                json=payload,
+                timeout=30,
+            )
         if response.status_code >= 400:
             raise RuntimeError(f"Discord webhook error {response.status_code}: {response.text[:400]}")
         if not response.text:
@@ -235,8 +244,6 @@ class DiscordDailyPoster:
         if not cfg.webhook_ready():
             missing = ", ".join(cfg.missing_fields())
             return {"skipped": True, "reason": f"missing_webhook: {missing}"}
-        if already_posted_today(cfg, day):
-            return {"skipped": True, "reason": "already_posted", "day": day}
 
         wanted = {c.upper() for c in cfg.post_coins}
         filtered = [e for e in entries if str(e.get("coin", "")).upper() in wanted]
@@ -253,14 +260,32 @@ class DiscordDailyPoster:
             parse_trade_levels=parse_trade_levels,
             format_usd=format_usd,
         )
-        message = self.post_webhook(payload)
-        message_id = str(message.get("id") or "")
+
+        existing_id = ""
+        if already_posted_today(cfg, day):
+            record = _load_state(cfg.state_file).get(day)
+            if isinstance(record, dict):
+                existing_id = str(record.get("message_id") or "").strip()
+            if not existing_id:
+                return {"skipped": True, "reason": "already_posted", "day": day}
+
+        try:
+            message = self.post_webhook(payload, message_id=existing_id)
+        except RuntimeError as exc:
+            if existing_id and "404" in str(exc):
+                logger.warning("discord_daily_message_missing day=%s id=%s — posting new", day, existing_id)
+                existing_id = ""
+                message = self.post_webhook(payload)
+            else:
+                raise
+        message_id = str(message.get("id") or existing_id)
         logger.info(
-            "discord_daily_posted day=%s coins=%s webhook=%s message_id=%s",
+            "discord_daily_posted day=%s coins=%s webhook=%s message_id=%s updated=%s",
             day,
             ",".join(coins_order),
             redact_webhook_url(cfg.webhook_url),
             message_id or "(none)",
+            bool(existing_id),
         )
 
         state = _load_state(cfg.state_file)
@@ -276,6 +301,7 @@ class DiscordDailyPoster:
             "day": day,
             "message_id": message_id,
             "coins": coins_order,
+            "updated": bool(existing_id),
         }
 
 
