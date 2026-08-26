@@ -7,12 +7,19 @@ import 'daily_analysis_store.dart';
 
 /// Aggregates watchlist, trade history, and market data for Oracle Desk.
 abstract final class OracleDeskService {
-  static const double _paperDollarsPerR = 312.0;
+  static const double _fallbackRiskPercent = 1.0;
+  static const double _fallbackLeverage = 5.0;
 
   static OracleDeskPerformance computePerformance({
     required List<Map<String, dynamic>> trades,
     required List<String> watchlist,
+    double startingCapitalUsd = 10000,
+    double defaultRiskPercent = _fallbackRiskPercent,
+    double defaultLeverage = _fallbackLeverage,
   }) {
+    final capital = startingCapitalUsd.clamp(0.0, 1000000.0);
+    final riskFallback = defaultRiskPercent.clamp(0.1, 100.0);
+    final levFallback = defaultLeverage.clamp(1.0, 100.0);
     final closed = trades.where((t) {
       final s = (t['status'] ?? '').toString();
       return s == 'Win' || s == 'Loss';
@@ -28,13 +35,33 @@ abstract final class OracleDeskService {
     final lossR = rrs.where((r) => r <= 0).map((r) => r.abs()).fold<double>(0, (a, b) => a + b);
     final profitFactor = lossR <= 0 ? (winR > 0 ? 99.0 : 0.0) : winR / lossR;
 
-    final totalAlphaR = rrs.fold<double>(0, (a, b) => a + b);
-    final totalAiAlpha = totalAlphaR * _paperDollarsPerR;
+    final totalAiAlpha = closed.fold<double>(
+      0,
+      (sum, t) => sum + _dollarPnl(t, capital, riskFallback: riskFallback, levFallback: levFallback),
+    );
 
     final now = DateTime.now();
-    final equity7 = _buildEquityCurve(trades, now.subtract(const Duration(days: 7)));
-    final equity30 = _buildEquityCurve(trades, now.subtract(const Duration(days: 30)));
-    final paperWeek = _paperPnlForWindow(trades, now.subtract(const Duration(days: 7)));
+    final equity7 = _buildEquityCurve(
+      trades,
+      now.subtract(const Duration(days: 7)),
+      capital,
+      riskFallback: riskFallback,
+      levFallback: levFallback,
+    );
+    final equity30 = _buildEquityCurve(
+      trades,
+      now.subtract(const Duration(days: 30)),
+      capital,
+      riskFallback: riskFallback,
+      levFallback: levFallback,
+    );
+    final paperWeek = _paperPnlForWindow(
+      trades,
+      now.subtract(const Duration(days: 7)),
+      capital,
+      riskFallback: riskFallback,
+      levFallback: levFallback,
+    );
     final streak = _computeStreak(trades);
     final edge = _buildEdgeBreakdown(trades, watchlist);
 
@@ -50,6 +77,7 @@ abstract final class OracleDeskService {
       winCount: wins,
       streak: streak,
       edge: edge,
+      startingCapitalUsd: capital,
     );
   }
 
@@ -120,23 +148,35 @@ abstract final class OracleDeskService {
           coin: 'ETH',
           direction: OraclePulseDirection.long,
           convictionPct: 68,
-          whyNow: 'ETH bid absorption building — sweep below equal lows possible.',
+          whyNow: 'ETH buyers stepping in — sweep below equal lows possible.',
           signalTimeframe: signalTimeframe,
         ),
       ];
     }
 
     return top.map((s) {
-      final dir = _pulseDirection(s.change24h, bias.kind);
-      final conviction = (58 + s.change24h.abs() * 4.5 + (s.aligned ? 14 : 0) + (s.hasDaily ? 6 : 0))
+      final read = _pulseRead(s.coin, s.change24h, bias.kind);
+      var conviction = (58 + s.change24h.abs() * 4.5 + (s.aligned ? 14 : 0) + (s.hasDaily ? 6 : 0))
           .round()
-          .clamp(64, 96);
+          .clamp(50, 96);
+      if (read.play != OraclePulsePlay.trend) {
+        conviction = conviction.clamp(50, 72);
+      }
       return OraclePulseOpportunity(
         coin: s.coin,
-        direction: dir,
+        direction: read.direction,
         convictionPct: conviction,
-        whyNow: _pulseWhyNow(s.coin, s.change24h, dir, s.aligned, s.hasDaily, history),
+        whyNow: _pulseWhyNow(
+          s.coin,
+          s.change24h,
+          read.direction,
+          s.aligned,
+          s.hasDaily,
+          history,
+          play: read.play,
+        ),
         signalTimeframe: signalTimeframe,
+        play: read.play,
       );
     }).toList();
   }
@@ -155,10 +195,61 @@ abstract final class OracleDeskService {
         history: history,
       );
 
-  static OraclePulseDirection _pulseDirection(double change24h, OracleDeskBiasKind bias) {
-    if (bias == OracleDeskBiasKind.bullish && change24h >= 0.15) return OraclePulseDirection.long;
-    if (bias == OracleDeskBiasKind.bearish && change24h <= -0.15) return OraclePulseDirection.short;
-    return change24h >= 0 ? OraclePulseDirection.long : OraclePulseDirection.short;
+  /// BTC/ETH ~5% 24h, alts ~7.5% — treated as extended, not a fresh breakout chase.
+  static const double btcEthExtendedPct = 5.0;
+  static const double altExtendedPct = 7.5;
+
+  static bool isExtendedMove(String coin, double change24h) {
+    final abs = change24h.abs();
+    if (coin == 'BTC' || coin == 'ETH') return abs >= btcEthExtendedPct;
+    return abs >= altExtendedPct;
+  }
+
+  static String structureAnchor(String coin) {
+    final row = DailyAnalysisStore.loadTodayByCoin()[coin];
+    final report = (row?['report'] ?? '').toString();
+    if (report.isEmpty) return 'Daily VWAP / prior-day level';
+    final sl = RegExp(
+      r'(?:SL|Invalidation)\s*(?:at|:)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
+      caseSensitive: false,
+    ).firstMatch(report);
+    final entry = RegExp(
+      r'Entry(?:\s*:|\s+at)?[^\n$]{0,48}?\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
+      caseSensitive: false,
+    ).firstMatch(report);
+    if (sl != null) return 'support / invalidation near \$${sl.group(1)}';
+    if (entry != null) return 'daily entry zone \$${entry.group(1)}';
+    return 'Daily VWAP / prior-day level';
+  }
+
+  static ({OraclePulseDirection direction, OraclePulsePlay play}) _pulseRead(
+    String coin,
+    double change24h,
+    OracleDeskBiasKind bias,
+  ) {
+    final extended = isExtendedMove(coin, change24h);
+    if (extended && change24h > 0) {
+      if (bias == OracleDeskBiasKind.bearish) {
+        return (direction: OraclePulseDirection.short, play: OraclePulsePlay.bounceToResistance);
+      }
+      return (direction: OraclePulseDirection.long, play: OraclePulsePlay.pullbackToSupport);
+    }
+    if (extended && change24h < 0) {
+      if (bias == OracleDeskBiasKind.bullish) {
+        return (direction: OraclePulseDirection.long, play: OraclePulsePlay.pullbackToSupport);
+      }
+      return (direction: OraclePulseDirection.short, play: OraclePulsePlay.bounceToResistance);
+    }
+    if (bias == OracleDeskBiasKind.bullish && change24h >= 0.15) {
+      return (direction: OraclePulseDirection.long, play: OraclePulsePlay.trend);
+    }
+    if (bias == OracleDeskBiasKind.bearish && change24h <= -0.15) {
+      return (direction: OraclePulseDirection.short, play: OraclePulsePlay.trend);
+    }
+    return (
+      direction: change24h >= 0 ? OraclePulseDirection.long : OraclePulseDirection.short,
+      play: OraclePulsePlay.trend,
+    );
   }
 
   static String _pulseWhyNow(
@@ -167,9 +258,23 @@ abstract final class OracleDeskService {
     OraclePulseDirection dir,
     bool aligned,
     bool hasDaily,
-    List<Map<String, dynamic>> history,
-  ) {
+    List<Map<String, dynamic>> history, {
+    OraclePulsePlay play = OraclePulsePlay.trend,
+  }) {
     final move = '${change24h >= 0 ? '+' : ''}${change24h.toStringAsFixed(1)}% 24h';
+    final anchor = structureAnchor(coin);
+    if (play == OraclePulsePlay.pullbackToSupport) {
+      if (change24h > 0) {
+        return '$coin $move — extended. Do not chase. Longs wait for pullback to $anchor.';
+      }
+      return '$coin $move on a bullish Daily — flush, not a new short. Wait for sweep + reclaim of $anchor.';
+    }
+    if (play == OraclePulsePlay.bounceToResistance) {
+      if (change24h > 0) {
+        return '$coin $move into a bearish Daily — bounce, not a squeeze. Wait for rejection at $anchor.';
+      }
+      return '$coin $move — extended dump. Do not panic-short the low. Shorts wait for bounce into $anchor.';
+    }
     final setupToday = history.any((h) =>
         h['source'] == 'trade_setup' && (h['coin'] ?? '').toString().toUpperCase() == coin);
     if (hasDaily && aligned) {
@@ -179,7 +284,7 @@ abstract final class OracleDeskService {
       return 'Fresh setup zone — $move with active OB/FVG levels on $coin.';
     }
     if (aligned) {
-      return 'Structure aligns ${dir.label} — $move with bid/offer absorption building.';
+      return 'Structure aligns ${dir.label} — $move with buyers/sellers actually showing up.';
     }
     return 'Liquidity sweep setup $move — radar flagged tactical ${dir.label} on $coin.';
   }
@@ -370,7 +475,13 @@ abstract final class OracleDeskService {
     });
   }
 
-  static List<double> _buildEquityCurve(List<Map<String, dynamic>> trades, DateTime since) {
+  static List<double> _buildEquityCurve(
+    List<Map<String, dynamic>> trades,
+    DateTime since,
+    double capital, {
+    required double riskFallback,
+    required double levFallback,
+  }) {
     final relevant = trades.where((t) {
       final dt = DateTime.tryParse(t['createdAt']?.toString() ?? '');
       return dt != null && !dt.isBefore(since);
@@ -381,18 +492,24 @@ abstract final class OracleDeskService {
         return at.compareTo(bt);
       });
 
-    final points = <double>[1.0];
-    var equity = 10000.0;
+    final start = capital > 0 ? capital : 1.0;
+    final points = <double>[start];
+    var equity = start;
     for (final t in relevant) {
       final s = (t['status'] ?? '').toString();
       if (s == 'Win' || s == 'Loss') {
-        final r = _realizedR(t) ?? (s == 'Win' ? 1.2 : -1.0);
-        equity += r * _paperDollarsPerR;
+        equity += _dollarPnl(t, capital, riskFallback: riskFallback, levFallback: levFallback);
       } else {
-        final r = _unrealizedR(t) ?? 0;
-        equity += r * _paperDollarsPerR * 0.35;
+        equity += _dollarPnl(
+              t,
+              capital,
+              riskFallback: riskFallback,
+              levFallback: levFallback,
+              realizedOnly: false,
+            ) *
+            0.35;
       }
-      points.add((equity / 10000.0).clamp(0.82, 1.28));
+      points.add(equity);
     }
     if (points.length < 3) {
       return [1.0, 1.02, 1.01, 1.03, 1.02];
@@ -596,30 +713,105 @@ abstract final class OracleDeskService {
     );
   }
 
-  static double _paperPnlForWindow(List<Map<String, dynamic>> trades, DateTime since) {
+  static double _paperPnlForWindow(
+    List<Map<String, dynamic>> trades,
+    DateTime since,
+    double capital, {
+    required double riskFallback,
+    required double levFallback,
+  }) {
     var total = 0.0;
     for (final t in trades) {
       final dt = DateTime.tryParse(t['createdAt']?.toString() ?? '');
       if (dt == null || dt.isBefore(since)) continue;
       final s = (t['status'] ?? '').toString();
       if (s == 'Win' || s == 'Loss') {
-        total += (_realizedR(t) ?? (s == 'Win' ? 1.0 : -1.0)) * _paperDollarsPerR;
+        total += _dollarPnl(t, capital, riskFallback: riskFallback, levFallback: levFallback);
       }
     }
     return total;
   }
 
+  static double _tradeRiskPercent(Map<String, dynamic> trade, double fallback) {
+    return (_toDouble(trade['riskPercent'] ?? trade['risk_percent']) ?? fallback).clamp(0.1, 100.0);
+  }
+
+  static double _tradeLeverage(Map<String, dynamic> trade, double fallback) {
+    return (_toDouble(trade['leverage']) ?? fallback).clamp(1.0, 100.0);
+  }
+
+  /// Citadel sizing: margin = bankroll × risk%, notional = margin × leverage.
+  static double _notionalUsd(
+    Map<String, dynamic> trade,
+    double capital, {
+    required double riskFallback,
+    required double levFallback,
+  }) {
+    final stored = _toDouble(
+      trade['notionalUsd'] ?? trade['positionSizeUsd'] ?? trade['notional'],
+    );
+    if (stored != null && stored > 0) return stored;
+    if (capital <= 0) return 0;
+    return capital * (_tradeRiskPercent(trade, riskFallback) / 100.0) * _tradeLeverage(trade, levFallback);
+  }
+
+  static double _rToPriceFraction(Map<String, dynamic> trade, double r) {
+    final entry = _toDouble(trade['entry']);
+    final sl = _toDouble(trade['sl']);
+    if (entry == null || sl == null || entry.abs() < 1e-12) return r * 0.01;
+    return r * ((entry - sl).abs() / entry.abs());
+  }
+
+  static double _dollarPnl(
+    Map<String, dynamic> trade,
+    double capital, {
+    required double riskFallback,
+    required double levFallback,
+    bool realizedOnly = true,
+  }) {
+    if (capital <= 0) return 0;
+    final status = (trade['status'] ?? '').toString();
+    final closed = status == 'Win' || status == 'Loss' || status == 'Closed';
+    if (!closed && realizedOnly) return 0;
+
+    final exchangePnl = _toDouble(trade['realizedPnl']);
+    if (exchangePnl != null && closed) {
+      final via = (trade['closedVia'] ?? '').toString();
+      final fees = via == 'citadel' ? 0.0 : (_toDouble(trade['feesUsd']) ?? 0);
+      return exchangePnl - fees;
+    }
+
+    double? r;
+    if (closed) {
+      r = _realizedR(trade) ?? (status == 'Win' ? 1.2 : -1.0);
+    } else {
+      r = _unrealizedR(trade) ?? 0;
+    }
+    final gross = _notionalUsd(trade, capital, riskFallback: riskFallback, levFallback: levFallback) *
+        _rToPriceFraction(trade, r);
+    final fees = _toDouble(trade['feesUsd']) ?? 0;
+    return gross - (closed ? fees : 0);
+  }
+
   static double? _realizedR(Map<String, dynamic> trade) {
     final entry = _toDouble(trade['entry']);
     final sl = _toDouble(trade['sl']);
-    final tp1 = _toDouble(trade['tp1']);
-    if (entry == null || sl == null || tp1 == null) return null;
+    if (entry == null || sl == null) return null;
     final risk = (entry - sl).abs();
     if (risk < 1e-12) return null;
     final dir = _resolveDirection(trade);
     final status = (trade['status'] ?? '').toString();
+
+    final exit = _toDouble(trade['exitPrice'] ?? trade['exit']);
+    if (exit != null) {
+      final move = dir == 'Long Only' ? exit - entry : entry - exit;
+      return move / risk;
+    }
+
     if (status == 'Loss') return -1.0;
     if (status == 'Win') {
+      final tp1 = _toDouble(trade['tp1']);
+      if (tp1 == null) return null;
       final reward = dir == 'Long Only' ? (tp1 - entry).abs() : (entry - tp1).abs();
       return reward / risk;
     }
@@ -650,7 +842,7 @@ abstract final class OracleDeskService {
   static double? _toDouble(dynamic value) {
     if (value == null) return null;
     if (value is num) return value.toDouble();
-    return double.tryParse(value.toString());
+    return double.tryParse(value.toString().replaceAll(',', '').trim());
   }
 }
 
@@ -695,6 +887,7 @@ class OracleDeskPerformance {
   final int winCount;
   final OracleDeskStreak streak;
   final OracleDeskEdgeBreakdown edge;
+  final double startingCapitalUsd;
 
   const OracleDeskPerformance({
     required this.equity7d,
@@ -708,6 +901,7 @@ class OracleDeskPerformance {
     required this.winCount,
     required this.streak,
     required this.edge,
+    this.startingCapitalUsd = 10000,
   });
 }
 
@@ -777,6 +971,23 @@ class OracleDeskEdgeBreakdown {
 
 enum OraclePulseDirection { long, short }
 
+enum OraclePulsePlay { trend, pullbackToSupport, bounceToResistance }
+
+extension OraclePulsePlayX on OraclePulsePlay {
+  String get label {
+    switch (this) {
+      case OraclePulsePlay.pullbackToSupport:
+        return 'Pullback to support';
+      case OraclePulsePlay.bounceToResistance:
+        return 'Bounce to resistance';
+      case OraclePulsePlay.trend:
+        return 'Trend';
+    }
+  }
+
+  bool get isMeanRevert => this != OraclePulsePlay.trend;
+}
+
 extension OraclePulseDirectionX on OraclePulseDirection {
   String get label => this == OraclePulseDirection.long ? 'LONG' : 'SHORT';
   bool get isLong => this == OraclePulseDirection.long;
@@ -789,6 +1000,7 @@ class OraclePulseOpportunity {
   final int convictionPct;
   final String whyNow;
   final String signalTimeframe;
+  final OraclePulsePlay play;
 
   const OraclePulseOpportunity({
     required this.coin,
@@ -796,6 +1008,7 @@ class OraclePulseOpportunity {
     required this.convictionPct,
     required this.whyNow,
     this.signalTimeframe = '1h',
+    this.play = OraclePulsePlay.trend,
   });
 
   String get tradeSetupDirection =>

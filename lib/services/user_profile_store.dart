@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -94,5 +95,139 @@ abstract final class UserProfileStore {
     final trimmed = value.trim();
     if (trimmed.isEmpty) return false;
     return RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(trimmed);
+  }
+}
+
+/// Where the trader actually executes — informs AI even if Citadel does not support that venue yet.
+class TradingVenueOption {
+  final String id;
+  final String label;
+  final String? note;
+
+  const TradingVenueOption({required this.id, required this.label, this.note});
+}
+
+abstract final class TradingVenueStore {
+  static const _prefKey = 'trading_venue_id';
+  static const String autoId = 'auto';
+
+  static const List<TradingVenueOption> options = [
+    TradingVenueOption(
+      id: autoId,
+      label: 'Auto (best available)',
+      note: 'AI uses the live feed chain. Citadel still executes on the linked exchange only.',
+    ),
+    TradingVenueOption(id: 'bitunix', label: 'Bitunix', note: 'Citadel live execution'),
+    TradingVenueOption(id: 'blofin_demo', label: 'BloFin (Demo)', note: 'Citadel demo only'),
+    TradingVenueOption(id: 'binance', label: 'Binance'),
+    TradingVenueOption(id: 'bybit', label: 'Bybit'),
+    TradingVenueOption(id: 'okx', label: 'OKX'),
+    TradingVenueOption(id: 'kraken', label: 'Kraken'),
+    TradingVenueOption(id: 'coinbase', label: 'Coinbase'),
+    TradingVenueOption(id: 'hyperliquid', label: 'Hyperliquid'),
+    TradingVenueOption(id: 'kucoin', label: 'KuCoin'),
+    TradingVenueOption(id: 'gate', label: 'Gate.io'),
+    TradingVenueOption(id: 'mexc', label: 'MEXC'),
+    TradingVenueOption(id: 'bitget', label: 'Bitget'),
+    TradingVenueOption(id: 'htx', label: 'HTX'),
+    TradingVenueOption(id: 'phemex', label: 'Phemex'),
+    TradingVenueOption(id: 'deribit', label: 'Deribit'),
+  ];
+
+  static String venueId = autoId;
+
+  static TradingVenueOption get current {
+    return options.firstWhere((o) => o.id == venueId, orElse: () => options.first);
+  }
+
+  static Future<void> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = (prefs.getString(_prefKey) ?? autoId).trim().toLowerCase();
+    venueId = options.any((o) => o.id == saved) ? saved : autoId;
+  }
+
+  static Future<void> save(String id) async {
+    final next = id.trim().toLowerCase();
+    venueId = options.any((o) => o.id == next) ? next : autoId;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_prefKey, venueId);
+  }
+
+  static Map<String, dynamic> analyzePayloadFields() {
+    if (venueId == autoId) return const {};
+    return {
+      'trading_venue': venueId,
+      'preferred_exchange': venueId,
+    };
+  }
+}
+
+/// Starting bankroll for War Room Performance Snapshot / AI Alpha.
+abstract final class StartingCapitalStore {
+  static const _prefKey = 'starting_capital_usd';
+  static const double minUsd = 0;
+  static const double maxUsd = 1000000;
+  static const double defaultUsd = 10000;
+
+  static double capitalUsd = defaultUsd;
+  static final ValueNotifier<double> notifier = ValueNotifier<double>(defaultUsd);
+
+  static Future<void> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getDouble(_prefKey);
+    capitalUsd = (raw ?? defaultUsd).clamp(minUsd, maxUsd);
+    notifier.value = capitalUsd;
+  }
+
+  static Future<void> save(double value) async {
+    capitalUsd = value.clamp(minUsd, maxUsd);
+    notifier.value = capitalUsd;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_prefKey, capitalUsd);
+  }
+}
+
+/// Persisted Home / Desk watchlist (replaces session-only defaults after first run).
+abstract final class WatchlistStore {
+  static const _prefKey = 'watchlist_coins_v1';
+  static const List<String> defaults = ['BTC', 'ETH', 'SOL', 'BNB'];
+
+  static Future<List<String>> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getStringList(_prefKey);
+    if (raw == null || raw.isEmpty) return List<String>.from(defaults);
+    final out = <String>[];
+    for (final coin in raw) {
+      final n = coin.trim().toUpperCase();
+      if (n.isNotEmpty && !out.contains(n)) out.add(n);
+    }
+    return out.isEmpty ? List<String>.from(defaults) : out;
+  }
+
+  static Future<void> save(List<String> coins) async {
+    final out = <String>[];
+    for (final coin in coins) {
+      final n = coin.trim().toUpperCase();
+      if (n.isNotEmpty && !out.contains(n)) out.add(n);
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_prefKey, out);
+  }
+}
+
+/// One-time desk setup: venue, bankroll, four watchlist coins.
+abstract final class FirstRunStore {
+  static const _prefKey = 'first_run_setup_complete_v1';
+  static bool completed = false;
+
+  static Future<void> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    completed = prefs.getBool(_prefKey) ?? false;
+  }
+
+  static Future<void> markComplete() async {
+    completed = true;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_prefKey, true);
   }
 }

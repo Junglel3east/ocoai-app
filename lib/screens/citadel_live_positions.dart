@@ -95,6 +95,8 @@ class _CitadelLivePositionsPanelState extends State<CitadelLivePositionsPanel> {
         _loading = false;
         _error = null;
       });
+      OracleAlertEngine.instance.bindPositions(list);
+      unawaited(OracleAlertEngine.instance.tick());
     } catch (e) {
       debugPrint('[CitadelLivePositions] refresh error: $e');
       if (!mounted || silent) return;

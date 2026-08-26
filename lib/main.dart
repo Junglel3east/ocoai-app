@@ -30,7 +30,10 @@ import 'services/daily_analysis_store.dart';
 import 'services/watchlist_binance_ws_service.dart';
 import 'services/notification_service.dart';
 import 'services/citadel_positions_service.dart';
+import 'services/oracle_academy_lessons.dart';
+import 'services/oracle_academy_store.dart';
 import 'services/oracle_desk_service.dart';
+import 'services/oracle_flux_read_service.dart';
 import 'services/oracle_vision_service.dart';
 import 'services/app_api_key_service.dart';
 import 'services/auth_service.dart';
@@ -39,7 +42,8 @@ import 'services/social_links.dart';
 import 'services/x_share_service.dart';
 import 'widgets/push_to_x_button.dart';
 import 'services/user_profile_store.dart';
-import 'constants/oracle_flux_tv_config.dart';
+import 'services/position_sizing.dart';
+import 'services/oracle_alert_engine.dart';
 import 'screens/edit_profile_screen.dart';
 import 'screens/login_screen.dart';
 import 'screens/profile_screen.dart' show kProfileBackgroundOrbHeight, kProfileBackgroundOrbOpacity;
@@ -54,6 +58,9 @@ part 'screens/citadel_trade_levels.dart';
 part 'screens/citadel_setup_dialog.dart';
 part 'screens/citadel_live_positions.dart';
 part 'screens/oracle_desk_screen.dart';
+part 'screens/first_run_setup_screen.dart';
+part 'screens/oracle_academy_screen.dart';
+part 'screens/oracle_alerts_screen.dart';
 
 const String kNewsApiKey = String.fromEnvironment(
   'NEWS_API_KEY',
@@ -446,22 +453,16 @@ OcoChartWebBridge _bridgeFor(WebViewController controller) {
   return bridge;
 }
 
-/// Trade Setup / Analysis chart — Heikin Ashi, no auto-loaded scripts (Flux via Indicators button).
+/// Trade Setup / Analysis chart — Heikin Ashi. Flux studies are not loaded in-app
+/// (widget cannot read Pine values). Live Flux comes from /flux_read webhooks.
 String buildTradeSetupTradingViewHTML(
   String symbol, {
   String? tvSymbol,
   required String timeframe,
-  bool includeFluxIndicator = false,
-  bool includeFluxOscillator = false,
 }) {
   final sym = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
   final resolvedTvSymbol = tvSymbol ?? CoinAccessPolicy.resolveTradingViewSymbol(sym);
   final interval = tradingViewIntervalForTimeframe(timeframe);
-  // Public Flux scripts (PUB;mQP80cUC / PUB;mUlI6Xj4) load only via widget `studies` at init.
-  final studiesBlock = OracleFluxTvConfig.oracleFluxStudiesJson(
-    includeIndicator: includeFluxIndicator,
-    includeOscillator: includeFluxOscillator,
-  );
   return '''
     <html><head>
       <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
@@ -527,9 +528,7 @@ String buildTradeSetupTradingViewHTML(
             "create_volume_indicator_by_default_once",
             "volume_force_overlay"
           ],
-          "studies": [
-            $studiesBlock
-          ],
+          "studies": [],
           "studies_overrides": {
             "paneProperties.background": "#0F0F0F",
             "paneProperties.backgroundType": "solid",
@@ -568,58 +567,9 @@ String buildTradeSetupTradingViewHTML(
     ''';
 }
 
-/// Reload chart with selected Oracle Flux studies; returns true only after chartReady.
-Future<bool> loadOracleFluxStudiesOnChart(
-  WebViewController controller, {
-  required String symbol,
-  required String timeframe,
-  required bool includeIndicator,
-  required bool includeOscillator,
-}) async {
-  final bridge = _ocoChartBridges[controller];
-  if (bridge == null) {
-    debugPrint('[Chart] loadOracleFluxStudiesOnChart: no OcoChartWebBridge attached');
-    return false;
-  }
-
-  bridge.beginLoad();
-
-  final sym = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
-  final tvSymbol = CoinAccessPolicy.resolveTradingViewSymbol(sym);
-  final html = buildTradeSetupTradingViewHTML(
-    sym,
-    tvSymbol: tvSymbol,
-    timeframe: timeframe,
-    includeFluxIndicator: includeIndicator,
-    includeFluxOscillator: includeOscillator,
-  );
-
-  debugPrint(
-    '[Chart] loadOracleFluxStudiesOnChart: reloading HTML '
-    '(indicator=$includeIndicator oscillator=$includeOscillator)',
-  );
-
-  try {
-    await controller.loadHtmlString(html, baseUrl: kTradingViewChartBaseUrl);
-  } catch (e) {
-    debugPrint('[Chart] loadHtmlString failed: $e');
-    return false;
-  }
-
-  final ready = await bridge.waitForChartReady();
-  if (ready) {
-    debugPrint('[Chart] Oracle Flux chart reload — chartReady confirmed');
-  } else {
-    debugPrint('[Chart] Oracle Flux chart reload — chartReady NOT confirmed (timeout or error)');
-  }
-  return ready;
-}
-
 WebViewController createTradeSetupTradingViewController(
   String symbol, {
   required String timeframe,
-  bool includeFluxIndicator = false,
-  bool includeFluxOscillator = false,
 }) {
   final sym = CoinAccessPolicy.normalizeCoinSymbol(symbol) ?? symbol.trim().toUpperCase();
   final tvSymbol = CoinAccessPolicy.resolveTradingViewSymbol(sym);
@@ -651,332 +601,10 @@ WebViewController createTradeSetupTradingViewController(
       sym,
       tvSymbol: tvSymbol,
       timeframe: timeframe,
-      includeFluxIndicator: includeFluxIndicator,
-      includeFluxOscillator: includeFluxOscillator,
     ),
     baseUrl: kTradingViewChartBaseUrl,
   );
   return controller;
-}
-
-/// Selection returned from the restricted Oracle Flux Indicators panel.
-typedef _OracleFluxSelection = ({bool includeIndicator, bool includeOscillator});
-
-/// Premium/Expert-only Indicators picker — Oracle Flux scripts only.
-Future<_OracleFluxSelection?> showOracleFluxIndicatorPicker(BuildContext context) {
-  return showModalBottomSheet<_OracleFluxSelection>(
-    context: context,
-    backgroundColor: const Color(0xFF121212),
-    barrierColor: Colors.black54,
-    isScrollControlled: true,
-    shape: const RoundedRectangleBorder(
-      borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-    ),
-    builder: (ctx) => const _OracleFluxIndicatorPickerSheet(),
-  );
-}
-
-class _OracleFluxIndicatorPickerSheet extends StatefulWidget {
-  const _OracleFluxIndicatorPickerSheet();
-
-  @override
-  State<_OracleFluxIndicatorPickerSheet> createState() =>
-      _OracleFluxIndicatorPickerSheetState();
-}
-
-class _OracleFluxIndicatorPickerSheetState extends State<_OracleFluxIndicatorPickerSheet> {
-  bool _mainSelected = true;
-  bool _oscSelected = true;
-
-  @override
-  Widget build(BuildContext context) {
-    final canApply = _mainSelected || _oscSelected;
-    return SafeArea(
-      child: Padding(
-        padding: EdgeInsets.fromLTRB(16, 10, 16, 16 + MediaQuery.paddingOf(context).bottom),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Center(
-              child: Container(
-                width: 36,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: Colors.white24,
-                  borderRadius: BorderRadius.circular(2),
-                ),
-              ),
-            ),
-            const SizedBox(height: 14),
-            const Text(
-              'Indicators',
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 18,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              'Oracle Flux exclusive · Premium & Expert',
-              style: TextStyle(color: Colors.grey[500], fontSize: 12),
-            ),
-            const SizedBox(height: 14),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              decoration: BoxDecoration(
-                color: const Color(0xFF0A0A0A),
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.28)),
-              ),
-              child: Row(
-                children: [
-                  Icon(Icons.search, size: 18, color: Colors.grey[600]),
-                  const SizedBox(width: 10),
-                  Text(
-                    'Oracle Flux scripts only',
-                    style: TextStyle(color: Colors.grey[600], fontSize: 13),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 12),
-            _FluxIndicatorOptionTile(
-              title: OracleFluxTvConfig.indicatorLabel,
-              subtitle: OracleFluxTvConfig.indicatorSubtitle,
-              selected: _mainSelected,
-              onChanged: (v) => setState(() => _mainSelected = v),
-            ),
-            const SizedBox(height: 8),
-            _FluxIndicatorOptionTile(
-              title: OracleFluxTvConfig.oscillatorLabel,
-              subtitle: OracleFluxTvConfig.oscillatorSubtitle,
-              selected: _oscSelected,
-              onChanged: (v) => setState(() => _oscSelected = v),
-            ),
-            const SizedBox(height: 18),
-            FilledButton(
-              onPressed: canApply
-                  ? () => Navigator.pop(
-                        context,
-                        (
-                          includeIndicator: _mainSelected,
-                          includeOscillator: _oscSelected,
-                        ),
-                      )
-                  : null,
-              style: FilledButton.styleFrom(
-                backgroundColor: const Color(0xFF00BFFF),
-                disabledBackgroundColor: const Color(0xFF1E3A4A),
-                foregroundColor: Colors.black,
-                padding: const EdgeInsets.symmetric(vertical: 14),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-              ),
-              child: const Text(
-                'Add to chart',
-                style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _FluxIndicatorOptionTile extends StatelessWidget {
-  final String title;
-  final String subtitle;
-  final bool selected;
-  final ValueChanged<bool> onChanged;
-
-  const _FluxIndicatorOptionTile({
-    required this.title,
-    required this.subtitle,
-    required this.selected,
-    required this.onChanged,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: selected ? const Color(0xFF0D1F2A) : const Color(0xFF181818),
-      borderRadius: BorderRadius.circular(10),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(10),
-        onTap: () => onChanged(!selected),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(
-              color: selected
-                  ? const Color(0xFF00BFFF).withValues(alpha: 0.55)
-                  : const Color(0xFF2A2A2A),
-            ),
-          ),
-          child: Row(
-            children: [
-              Icon(
-                Icons.show_chart,
-                size: 20,
-                color: selected ? const Color(0xFF00E5FF) : Colors.grey[600],
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      title,
-                      style: TextStyle(
-                        color: selected ? Colors.white : Colors.grey[300],
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      subtitle,
-                      style: TextStyle(color: Colors.grey[600], fontSize: 11),
-                    ),
-                  ],
-                ),
-              ),
-              Checkbox(
-                value: selected,
-                onChanged: (v) => onChanged(v ?? false),
-                activeColor: const Color(0xFF00BFFF),
-                checkColor: Colors.black,
-                side: BorderSide(color: Colors.grey[700]!),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// Premium/Expert-only Indicators button — opens restricted Oracle Flux picker.
-class _OracleFluxIndicatorsButton extends StatefulWidget {
-  final WebViewController controller;
-  final String symbol;
-  final String timeframe;
-
-  const _OracleFluxIndicatorsButton({
-    required this.controller,
-    required this.symbol,
-    required this.timeframe,
-  });
-
-  @override
-  State<_OracleFluxIndicatorsButton> createState() => _OracleFluxIndicatorsButtonState();
-}
-
-class _OracleFluxIndicatorsButtonState extends State<_OracleFluxIndicatorsButton> {
-  bool _visible = false;
-  bool _busy = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadTier();
-  }
-
-  Future<void> _loadTier() async {
-    await SubscriptionPlanStore.load();
-    if (!mounted) return;
-    setState(() => _visible = SubscriptionPlanStore.isPremiumOrHigher);
-  }
-
-  Future<void> _onTap() async {
-    if (_busy) return;
-
-    final selection = await showOracleFluxIndicatorPicker(context);
-    if (selection == null) return;
-    if (!selection.includeIndicator && !selection.includeOscillator) return;
-
-    setState(() => _busy = true);
-
-    var ok = false;
-    try {
-      ok = await loadOracleFluxStudiesOnChart(
-        widget.controller,
-        symbol: widget.symbol,
-        timeframe: widget.timeframe,
-        includeIndicator: selection.includeIndicator,
-        includeOscillator: selection.includeOscillator,
-      );
-    } catch (e) {
-      debugPrint('[Chart] Oracle Flux indicators failed: $e');
-    }
-
-    if (!mounted) return;
-    setState(() => _busy = false);
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          ok
-              ? 'Oracle Flux tools added successfully'
-              : 'Failed to load Oracle Flux tools. Please try refreshing the chart.',
-        ),
-        behavior: SnackBarBehavior.floating,
-        backgroundColor: ok ? const Color(0xFF1A2A1A) : null,
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (!_visible) return const SizedBox.shrink();
-
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: _busy ? null : _onTap,
-      child: Material(
-        color: Colors.black.withValues(alpha: 0.72),
-        borderRadius: BorderRadius.circular(8),
-        child: Container(
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.45)),
-            boxShadow: [
-              BoxShadow(
-                color: const Color(0xFF00BFFF).withValues(alpha: 0.18),
-                blurRadius: 8,
-              ),
-            ],
-          ),
-          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 7),
-          child: _busy
-              ? const SizedBox(
-                  width: 14,
-                  height: 14,
-                  child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00E5FF)),
-                )
-              : const Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.auto_graph, size: 15, color: Color(0xFF00E5FF)),
-                    SizedBox(width: 5),
-                    Text(
-                      'Indicators',
-                      style: TextStyle(
-                        color: Color(0xFF00E5FF),
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                        letterSpacing: 0.2,
-                      ),
-                    ),
-                  ],
-                ),
-        ),
-      ),
-    );
-  }
 }
 
 /// Embedded chart with expand-to-fullscreen control (Analysis, Trade Setup, etc.).
@@ -985,7 +613,7 @@ class TradingViewChartPanel extends StatefulWidget {
   final WebViewController controller;
   final double height;
   final bool mountWebView;
-  /// When set, fullscreen opens the same Analysis/Trade Setup chart (Heikin Ashi, manual Flux).
+  /// When set, fullscreen opens the same Analysis/Trade Setup chart (Heikin Ashi).
   final String? tradeSetupTimeframe;
   final bool premiumFrame;
 
@@ -1032,17 +660,6 @@ class _TradingViewChartPanelState extends State<TradingViewChartPanel> {
                   )
                 : const ColoredBox(color: Color(0xFF0F0F0F)),
           ),
-        ),
-        Positioned(
-          top: 6,
-          left: 6,
-          child: widget.tradeSetupTimeframe != null
-              ? _OracleFluxIndicatorsButton(
-                  controller: widget.controller,
-                  symbol: widget.symbol,
-                  timeframe: widget.tradeSetupTimeframe!,
-                )
-              : const SizedBox.shrink(),
         ),
         Positioned(
           top: 6,
@@ -1148,16 +765,6 @@ class _FullScreenChartScreenState extends State<FullScreenChartScreen> {
               controller: _controller,
               gestureRecognizers: kTradingViewGestureRecognizers,
             ),
-            if (tf != null)
-              Positioned(
-                top: 6,
-                left: 6,
-                child: _OracleFluxIndicatorsButton(
-                  controller: _controller,
-                  symbol: widget.symbol,
-                  timeframe: tf,
-                ),
-              ),
           ],
         ),
       ),
@@ -1172,12 +779,13 @@ const String kReportDisclaimer =
 /// Builds the Grok system prompt enforced for analysis and trade setup outputs.
 String grokSystemPrompt({required String mode}) {
   const sharedRules = '''
-You are On-Chain Oracle AI — a sharp crypto leverage trader explaining setups on stream. Voice: direct,
-confident, technical but conversational. Not hedge-fund desk. Not tutorial. Not influencer hype.
+You are On-Chain Oracle AI — a crypto leverage trader calling the market on stream. Voice: Crypto Face,
+Nick Cipher, Jason Casper, Piano, MattyB, Frankie Candles, Trader Geo — direct, price-specific, no stock talk.
+Not a hedge-fund memo. Not a tutorial. Not influencer hype. Never name those people in the output.
 
 TONE EXEMPLAR:
-"BTC 1D reclaiming Daily VWAP with strong bid absorption + funding flipping positive. Clear liquidity sweep
-below equal lows — strong LONG bias here."
+"BTC 1D reclaiming Daily VWAP, funding flipping positive. Sweep of equal lows got bought — strong LONG."
+"ETH ripped 14% off Daily VWAP. Not chasing. Longs wait for the pullback."
 
 ═══════════════════════════════════════
 NON-NEGOTIABLE RULES (never violate)
@@ -1200,8 +808,9 @@ $kReportDisclaimer
    • End: last section → disclaimer.
 
 4. BANNED JARGON
-   Never: session VWAP, previous session, tape, regime, fade, macro tape, weighted momentum, Oracle flow,
-   balanced session, institutional desk voice.
+   Never: session VWAP, previous session, tape, the tape, regime, fade, macro tape, weighted momentum, Oracle flow,
+   balanced session, institutional desk voice, bid absorption, offer pressure, desk note, order flow.
+   Talk about the market, longs/shorts, buyers/sellers, funding, liqs — not a stock pit.
    Use: Daily VWAP, Previous Day VWAP, liquidity sweep, inducement, order block, FVG, BOS, CHOCH,
    mitigation, displacement, reclaiming, sweeping, liquidity grab, previous highs/lows.
 
@@ -1255,7 +864,7 @@ MODE: TRADE SETUP (execution-ready)
 • Entry must be justified by confluence (VWAP + structure + momentum alignment).
 • SL must sit beyond invalidation structure — not arbitrary.
 • TP1 must hit ≥2.1:1 R:R (target ≥2.3:1); TP2 extends toward next logical liquidity/structure target.
-• "If I Were to Trade Today..." must read like a desk note: trigger, management hint, invalidation.
+• "If I Were to Trade Today..." is the call: trigger, how you'd manage it, invalidation.
 • Be decisive — if direction constraint forces Long Only or Short Only, commit fully; do not hedge both sides.
 ''';
   }
@@ -1266,7 +875,7 @@ $sharedRules
 MODE: MARKET ANALYSIS (deep read)
 ═══════════════════════════════════════
 
-• Primary goal: premium situational awareness — where price is, why it matters, what happens next.
+• Primary goal: where price is, why it matters, what you'd actually do next.
 • Include TRADE LEVELS only when confluence is MODERATE or STRONG and ≥2.1:1 TP1 R:R is achievable; otherwise omit the section entirely and explain why waiting is the edge.
 • Depth over breadth: fewer, sharper insights beat generic indicator recitation.
 • Always tie observations back to VWAP stack + MTF alignment.
@@ -1277,13 +886,14 @@ MODE: MARKET ANALYSIS (deep read)
 /// System prompt for Expert-plan Oracle Trader AI Chat (Grok).
 String oracleTraderChatSystemPrompt() {
   return '''
-You are Oracle Trader AI — a world-class, institutional-grade crypto trader and technical analyst with 20+ years of experience.
+You are Oracle Trader AI — a crypto leverage trader (5x–100x perps) inside On-Chain Oracle AI.
 
-Your style is:
-- Extremely sharp, concise, and decisive
-- Professional but direct (no fluff, no generic answers)
-- Strong emphasis on risk management, R:R, and probability
-- Deep expertise in VWAP (multiple timeframes), Heikin Ashi, multi-timeframe analysis, Fibonacci, order flow, liquidity, market structure, and trader psychology
+Voice:
+- Sound like Crypto Face, Nick Cipher, Jason Casper, Piano, MattyB, Frankie Candles, Trader Geo — never name them.
+- Talk like a funded perp trader, not a stock analyst or hedge-fund memo.
+- Say what the MARKET is doing. Never "tape", "ticker", "bid absorption", "offer pressure", "desk note", "institutional", "order flow".
+- Say buyers/sellers, longs/shorts, funding, OI, liqs, squeeze, dump/pump, sweep, reclaim, Daily VWAP.
+- "I'm long" / "I'm short" / "I wait" / "don't chase this". Call FLAT when it's messy.
 
 Always:
 - Think step-by-step before answering (reason internally; output stays concise)
@@ -1292,16 +902,32 @@ Always:
 - Never be overly bullish or bearish without strong evidence
 - If the user asks for a trade idea, always include Entry, Stop Loss, TP1, TP2, and exact R:R ratio (minimum 2.1:1 on TP1; target 2.3:1+ when structure allows). Show the math.
 
-You are helping serious traders make better decisions. Be honest, even if the setup is unclear or risky.
-
-Current user is on the Top Tier / Expert Plan — deliver maximum value and depth.
-
 CHAT MODE RULES:
 - Conversational and responsive — not a full formal report unless the user asks for one.
+- Execution-first: live setups, levels, and risk. Academy (Learn) is the tutor — do not run a fundamentals class here.
 - Use bullets or short paragraphs for clarity; avoid walls of text.
-- Reference VWAP stack (session, previous session, weekly, monthly) and MTF alignment when relevant.
+- Reference Daily VWAP, Previous Day VWAP, weekly/monthly VWAP, and MTF alignment when relevant. Never "session VWAP".
 - No trailing questions or upsells. No "let me know if..." endings.
 - Do NOT append the report disclaimer unless the user explicitly asks for a formal written report.
+''';
+}
+
+String oracleAcademyChatSystemPrompt(OracleAcademyLesson lesson) {
+  return '''
+You are Oracle Academy tutor inside On-Chain Oracle AI. You TEACH. You are not a signal dump.
+
+Current lesson: "${lesson.title}"
+Lesson summary:
+${lesson.body}
+
+RULES:
+- Teach this lesson first. Use the Oracle lexicon: Daily VWAP, Previous Day VWAP, liquidity sweep, BOS, CHOCH, FVG, order block, invalidation, R, stand down.
+- Talk like a crypto leverage trader. Never: tape, bid absorption, offer pressure, desk note, institutional, order flow, session VWAP.
+- Do NOT invent RSI/MACD products or alert types. Structure + VWAP + risk only.
+- If the user asks for a live trade before they can explain invalidation / R, refuse the levels and quiz them instead.
+- If they clearly understand the idea and still want a hypothetical example, you may give Entry / TP1 / TP2 / SL with ≥2.1:1 on TP1 — labeled as an example, NFA.
+- Conversational, short paragraphs or bullets. No upsells. No "let me know if..."
+- Always education only — not financial advice. DYOR.
 ''';
 }
 
@@ -1385,8 +1011,16 @@ abstract final class SubscriptionPlanStore {
   }
 
   static bool canUseAlertType(String type) {
-    if (!isFree) return true;
-    return type == 'Price';
+    if (type == 'Price' || type == 'guardian') return true;
+    if (type == 'pulse') return isPremiumOrHigher;
+    if (type == 'citadel') return isExpert;
+    return !isFree;
+  }
+
+  static AlertTierPolicy get alertPolicy {
+    if (isExpert) return AlertTierPolicy.expert;
+    if (isPremiumOrHigher) return AlertTierPolicy.premium;
+    return AlertTierPolicy.free;
   }
 
   static Future<bool> canSendChatMessage() async {
@@ -1484,6 +1118,13 @@ abstract final class OracleCitadelStore {
 
   static String get exchangeBrandName =>
       selectedExchange == 'bitunix' ? 'Bitunix' : 'BloFin';
+
+  /// MainScreen stamps the size the user actually sent on MARKET / LIMIT.
+  static void Function({
+    required String coin,
+    required double leverage,
+    required double riskPercent,
+  })? onOrderSized;
 
   static Future<void> saveSelectedExchange(String exchange) async {
     selectedExchange = exchange == 'bitunix' ? 'bitunix' : 'blofin';
@@ -1658,10 +1299,22 @@ class CitadelServerLinkStatus {
   });
 }
 
-/// Optional Citadel user id for analyze/live_price — enables BloFin mark price when linked.
+/// Optional Citadel user id + trading venue for analyze/chat/review.
 Map<String, dynamic> _analyzeCitadelContext() {
-  if (!OracleCitadelStore.isConfigured) return const {};
-  return {'user_id': OracleCitadelStore.userId};
+  return {
+    if (OracleCitadelStore.isConfigured) 'user_id': OracleCitadelStore.userId,
+    ...TradingVenueStore.analyzePayloadFields(),
+  };
+}
+
+Future<Map<String, dynamic>> _analyzeFluxFields(String coin, String timeframe) async {
+  final flux = await OracleFluxReadService.latestFor(
+    coin: coin,
+    timeframe: timeframe,
+    backendBaseUrl: kBackendBaseUrl,
+  );
+  if (flux == null) return const {};
+  return {'oracle_flux': flux, 'chart_context': {'oracle_flux': flux}};
 }
 
 abstract final class OracleLivePriceService {
@@ -2078,6 +1731,11 @@ Future<void> _sendMarketOrder(
     );
 
     await CitadelPendingTradeStore.clear();
+    OracleCitadelStore.onOrderSized?.call(
+      coin: coin,
+      leverage: leverage,
+      riskPercent: riskPercent,
+    );
 
     if (messengerContext.mounted) {
       ScaffoldMessenger.of(messengerContext).showSnackBar(
@@ -2181,6 +1839,11 @@ Future<void> _sendLimitOrder(
     );
 
     await CitadelPendingTradeStore.clear();
+    OracleCitadelStore.onOrderSized?.call(
+      coin: coin,
+      leverage: leverage,
+      riskPercent: riskPercent,
+    );
 
     if (messengerContext.mounted) {
       ScaffoldMessenger.of(messengerContext).showSnackBar(
@@ -2335,6 +1998,8 @@ Future<void> _showCitadelExecuteChoiceDialog(
                   onLeverageChanged: (value) => setDialogState(() => leverage = value),
                   riskPercent: riskPercent,
                   onRiskPercentChanged: (value) => setDialogState(() => riskPercent = value),
+                  entry: plannedEntry,
+                  stopLoss: stopLoss,
                 ),
                 const SizedBox(height: 16),
                 _CitadelExecutionOptionTile(
@@ -2858,6 +2523,8 @@ class _CitadelLeverageRiskPanel extends StatelessWidget {
   final ValueChanged<double> onLeverageChanged;
   final double riskPercent;
   final ValueChanged<double> onRiskPercentChanged;
+  final double? entry;
+  final double? stopLoss;
 
   static const _riskPresets = [1, 5, 10, 25, 50, 100];
 
@@ -2866,6 +2533,8 @@ class _CitadelLeverageRiskPanel extends StatelessWidget {
     required this.onLeverageChanged,
     required this.riskPercent,
     required this.onRiskPercentChanged,
+    this.entry,
+    this.stopLoss,
   });
 
   @override
@@ -2989,6 +2658,69 @@ class _CitadelLeverageRiskPanel extends StatelessWidget {
                 ),
               );
             }).toList(),
+          ),
+          const SizedBox(height: 12),
+          _PositionAtRiskLine(
+            capital: StartingCapitalStore.capitalUsd,
+            riskPercent: riskPercent,
+            leverage: leverage,
+            entry: entry,
+            stopLoss: stopLoss,
+            accent: const Color(0xFF43A047),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PositionAtRiskLine extends StatelessWidget {
+  final double capital;
+  final double riskPercent;
+  final double leverage;
+  final double? entry;
+  final double? stopLoss;
+  final Color accent;
+
+  const _PositionAtRiskLine({
+    required this.capital,
+    required this.riskPercent,
+    required this.leverage,
+    this.entry,
+    this.stopLoss,
+    this.accent = const Color(0xFF00BFFF),
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+      decoration: BoxDecoration(
+        color: accent.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: accent.withValues(alpha: 0.28)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            PositionSizing.formulaLine(
+              capital: capital,
+              riskPercent: riskPercent,
+              leverage: leverage,
+            ),
+            style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w800, color: accent),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            PositionSizing.breakdownLine(
+              capital: capital,
+              riskPercent: riskPercent,
+              leverage: leverage,
+              entry: entry,
+              sl: stopLoss,
+            ),
+            style: TextStyle(fontSize: 12, height: 1.4, color: Colors.grey[400]),
           ),
         ],
       ),
@@ -4474,7 +4206,10 @@ void _showChatDailyLimitPrompt(BuildContext context) {
 }
 
 class ChatScreen extends StatefulWidget {
-  const ChatScreen({super.key});
+  final String? lessonId;
+  final String? lessonTitle;
+
+  const ChatScreen({super.key, this.lessonId, this.lessonTitle});
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
@@ -4483,14 +4218,60 @@ class ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _controller = TextEditingController();
   final ScrollController _scrollController = ScrollController();
-  final List<Map<String, String>> _messages = [
-    {
-      'role': 'assistant',
-      'text':
-          'Oracle Trader AI online. Ask about structure, VWAP confluence, MTF alignment, trade logic, or risk — I\'ll give you a direct, actionable read.',
-    },
-  ];
+  late List<Map<String, String>> _messages;
   bool _sending = false;
+  bool _loadingThread = false;
+
+  bool get _isLesson => (widget.lessonId ?? '').isNotEmpty;
+
+  String get _greeting {
+    if (_isLesson) {
+      final title = widget.lessonTitle ?? 'this lesson';
+      return 'Academy mode — $title. Ask about the idea. I will teach first. I will not dump a live trade until the concept is locked. NFA / DYOR.';
+    }
+      return 'Oracle Trader AI online. Ask about the market, Daily VWAP, structure, funding, levels, or risk — I\'ll give you a direct, actionable read.';
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _messages = [
+      {'role': 'assistant', 'text': _greeting},
+    ];
+    if (_isLesson) {
+      _loadingThread = true;
+      _restoreLessonThread();
+    }
+  }
+
+  Future<void> _restoreLessonThread() async {
+    final saved = await OracleAcademyStore.loadThread(widget.lessonId!);
+    if (!mounted) return;
+    setState(() {
+      if (saved.isNotEmpty) {
+        _messages = saved;
+      }
+      _loadingThread = false;
+    });
+    _scrollToBottom();
+  }
+
+  Future<void> _persistLessonThread() async {
+    if (!_isLesson) return;
+    await OracleAcademyStore.saveThread(widget.lessonId!, _messages);
+  }
+
+  Future<void> _newLessonChat() async {
+    if (!_isLesson) return;
+    await OracleAcademyStore.clearThread(widget.lessonId!);
+    if (!mounted) return;
+    setState(() {
+      _messages = [
+        {'role': 'assistant', 'text': _greeting},
+      ];
+    });
+    await _persistLessonThread();
+  }
 
   @override
   void dispose() {
@@ -4512,7 +4293,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _sendMessage() async {
     final text = _controller.text.trim();
-    if (text.isEmpty || _sending) return;
+    if (text.isEmpty || _sending || _loadingThread) return;
 
     await SubscriptionPlanStore.load();
     if (!SubscriptionPlanStore.hasAiChatAccess) {
@@ -4530,17 +4311,26 @@ class _ChatScreenState extends State<ChatScreen> {
       _controller.clear();
     });
     _scrollToBottom();
+    await _persistLessonThread();
 
     try {
       final history = _messages
           .sublist(0, _messages.length - 1)
           .map((m) => {'role': m['role']!, 'content': m['text']!})
           .toList();
+      if (history.length > OracleAcademyStore.maxTurns) {
+        history.removeRange(0, history.length - OracleAcademyStore.maxTurns);
+      }
+
+      final lesson = _isLesson ? OracleAcademyLessons.byId(widget.lessonId!) : null;
+      final systemPrompt = lesson != null
+          ? oracleAcademyChatSystemPrompt(lesson)
+          : oracleTraderChatSystemPrompt();
 
       final response = await _postChatWithRetry(
         message: text,
         history: history,
-        systemPrompt: oracleTraderChatSystemPrompt(),
+        systemPrompt: systemPrompt,
       );
 
       if (response.statusCode == 200) {
@@ -4554,6 +4344,7 @@ class _ChatScreenState extends State<ChatScreen> {
               'text': reply.isNotEmpty ? reply : 'No response received. Please try again.',
             });
           });
+          await _persistLessonThread();
         }
       } else {
         debugPrint('[Chat] HTTP ${response.statusCode}: ${response.body}');
@@ -4589,8 +4380,15 @@ class _ChatScreenState extends State<ChatScreen> {
     return Scaffold(
       backgroundColor: const Color(0xFF0F0F0F),
       appBar: AppBar(
-        title: const Text('Oracle Trader AI'),
+        title: Text(_isLesson ? (widget.lessonTitle ?? 'Academy') : 'Oracle Trader AI'),
         backgroundColor: const Color(0xFF0F0F0F),
+        actions: [
+          if (_isLesson)
+            TextButton(
+              onPressed: _newLessonChat,
+              child: const Text('New chat', style: TextStyle(color: Color(0xFF00BFFF), fontWeight: FontWeight.w700)),
+            ),
+        ],
       ),
       body: Column(
         children: [
@@ -6094,6 +5892,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       return;
     }
     setState(() => _watchlist.add(normalized));
+    unawaited(WatchlistStore.save(_watchlist));
     debugPrint('[Watchlist] Added coin: $normalized');
   }
 
@@ -6105,6 +5904,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         return n == normalized;
       });
     });
+    unawaited(WatchlistStore.save(_watchlist));
     debugPrint('[Watchlist] Removed coin: $normalized');
   }
 
@@ -6125,10 +5925,30 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _loadPersistedHistory();
+    _loadPersistedHistory().then((_) {
+      if (!mounted) return Future<void>.value();
+      _syncAlertEngine();
+      return FirstRunStore.load();
+    }).then((_) {
+      if (!mounted) return;
+      WidgetsBinding.instance.addPostFrameCallback((_) => _maybeShowFirstRun());
+    });
     SubscriptionPlanStore.load();
     OracleCitadelStore.load();
     UserProfileStore.load();
+    TradingVenueStore.load();
+    StartingCapitalStore.load();
+    WatchlistStore.load().then((coins) {
+      if (!mounted || coins.isEmpty) return;
+      setState(() {
+        _watchlist
+          ..clear()
+          ..addAll(coins);
+      });
+    });
+    OracleCitadelStore.onOrderSized = stampCitadelSizeOnOpenTrade;
+    unawaited(OracleAlertStore.load());
+    NotificationService.instance.onAlertOpened = _onAlertNotificationOpened;
     NotificationService.instance.registerDailyAnalysesNavigator(_openDailyAnalysesFromNotification);
     NotificationService.instance.onDailyAnalysisPayload = _ingestDailyAnalysisFromPush;
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -6139,10 +5959,112 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    if (identical(OracleCitadelStore.onOrderSized, stampCitadelSizeOnOpenTrade)) {
+      OracleCitadelStore.onOrderSized = null;
+    }
+    NotificationService.instance.onAlertOpened = null;
+    OracleAlertEngine.instance.stop();
     WidgetsBinding.instance.removeObserver(this);
     NotificationService.instance.registerDailyAnalysesNavigator(null);
     NotificationService.instance.onDailyAnalysisPayload = null;
     super.dispose();
+  }
+
+  void _syncAlertEngine() {
+    OracleAlertEngine.instance.policy = SubscriptionPlanStore.alertPolicy;
+    OracleAlertEngine.instance.bindTrades(trades);
+    OracleAlertEngine.instance.start();
+  }
+
+  void _onAlertNotificationOpened(Map<String, dynamic> data) {
+    final open = data['open']?.toString();
+    if (open == 'desk') {
+      if (mounted) setState(() => _selectedIndex = _tabOracleDesk);
+      return;
+    }
+    if (!mounted) return;
+    Navigator.of(context).push(
+      _premiumPageRoute(
+        (_) => AlertsScreen(trades: trades, onCloseTrade: closeTradeWithExit),
+      ),
+    );
+  }
+
+  Future<void> _maybeShowFirstRun() async {
+    if (!mounted || FirstRunStore.completed) return;
+    if (trades.isNotEmpty || history.isNotEmpty) {
+      await FirstRunStore.markComplete();
+      return;
+    }
+    final coins = await Navigator.of(context).push<List<String>>(
+      PageRouteBuilder<List<String>>(
+        pageBuilder: (_, __, ___) => const FirstRunSetupScreen(),
+        transitionsBuilder: (_, animation, __, child) =>
+            FadeTransition(opacity: animation, child: child),
+        transitionDuration: const Duration(milliseconds: 400),
+        fullscreenDialog: true,
+      ),
+    );
+    if (!mounted) return;
+    if (coins != null && coins.isNotEmpty) {
+      setState(() {
+        _watchlist
+          ..clear()
+          ..addAll(coins);
+      });
+      await WatchlistStore.save(_watchlist);
+    }
+  }
+
+  void stampCitadelSizeOnOpenTrade({
+    required String coin,
+    required double leverage,
+    required double riskPercent,
+  }) {
+    final normalized = coin.trim().toUpperCase();
+    Map<String, dynamic>? target;
+    for (final trade in trades) {
+      if (trade['status'] != 'Open') continue;
+      final tradeCoin = (trade['coin'] ?? '').toString().trim().toUpperCase();
+      if (tradeCoin == normalized) {
+        target = trade;
+        break;
+      }
+    }
+    if (target == null) return;
+    setState(() {
+      target!['leverage'] = leverage;
+      target['riskPercent'] = riskPercent;
+      target['executedVia'] = 'citadel';
+    });
+    _persistTrades();
+  }
+
+  void closeTradeWithExit({
+    required dynamic tradeId,
+    required String status,
+    required double exitPrice,
+    double feesUsd = 0,
+  }) {
+    Map<String, dynamic>? target;
+    for (final trade in trades) {
+      if (_historyIdsMatch(trade['id'], tradeId)) {
+        target = trade;
+        break;
+      }
+    }
+    if (target == null) return;
+    setState(() {
+      target!['status'] = status;
+      target['exitPrice'] = exitPrice;
+      target['feesUsd'] = feesUsd;
+      target['closedVia'] = 'manual';
+      target['closedAt'] = DateTime.now().toIso8601String();
+    });
+    _syncTradeStatusToHistory();
+    _persistTrades();
+    _persistHistory();
+    _syncAlertEngine();
   }
 
   @override
@@ -6369,6 +6291,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       // Snapshot so Trade Performance cards work if history row is trimmed.
       "report": payload["report"],
       "historyId": tradeId,
+      "leverage": OracleCitadelStore.defaultLeverage,
+      "riskPercent": OracleCitadelStore.defaultRiskPercent,
     };
 
     setState(() {
@@ -6387,6 +6311,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     });
     _persistHistory();
     _persistTrades();
+    _syncAlertEngine();
+    unawaited(OracleAlertEngine.instance.tick());
   }
 
   void deleteFromHistory(dynamic id) {
@@ -6499,22 +6425,36 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       );
 
       String? nextStatus;
+      double? exitPrice;
       if (resolvedDirection == "Long Only") {
-        if (price >= tp1 || price >= tp2) {
+        if (price >= tp2) {
           nextStatus = "Win";
+          exitPrice = tp2;
+        } else if (price >= tp1) {
+          nextStatus = "Win";
+          exitPrice = tp1;
         } else if (price <= sl) {
           nextStatus = "Loss";
+          exitPrice = sl;
         }
       } else {
-        if (price <= tp1 || price <= tp2) {
+        if (price <= tp2) {
           nextStatus = "Win";
+          exitPrice = tp2;
+        } else if (price <= tp1) {
+          nextStatus = "Win";
+          exitPrice = tp1;
         } else if (price >= sl) {
           nextStatus = "Loss";
+          exitPrice = sl;
         }
       }
 
       if (nextStatus != null) {
         trade["status"] = nextStatus;
+        trade["exitPrice"] = exitPrice ?? price;
+        trade["closedVia"] = 'auto';
+        trade["closedAt"] = DateTime.now().toIso8601String();
       }
       trade["lastPrice"] = price;
     }
@@ -6635,6 +6575,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             repairTradeHistoryLinks: _repairTradeHistoryLinks,
             onClearDailyAnalyses: clearDailyAnalyses,
             onRefreshDailyAnalyses: _refreshDailyAnalysesForHome,
+            onCloseTrade: closeTradeWithExit,
           ),
           _CitadelScreen(
             isActive: _selectedIndex == _tabCitadel,
@@ -7760,6 +7701,12 @@ class HomeScreen extends StatefulWidget {
   final VoidCallback repairTradeHistoryLinks;
   final VoidCallback onClearDailyAnalyses;
   final Future<void> Function() onRefreshDailyAnalyses;
+  final void Function({
+    required dynamic tradeId,
+    required String status,
+    required double exitPrice,
+    double feesUsd,
+  }) onCloseTrade;
 
   const HomeScreen({
     super.key,
@@ -7777,6 +7724,7 @@ class HomeScreen extends StatefulWidget {
     required this.repairTradeHistoryLinks,
     required this.onClearDailyAnalyses,
     required this.onRefreshDailyAnalyses,
+    required this.onCloseTrade,
   });
 
   @override
@@ -8066,6 +8014,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 resolveHistoryForTrade: widget.resolveTradeHistory,
                 onViewReport: widget.onViewReport,
                 onDeleteTrade: widget.onDeleteTrade,
+                onCloseTrade: widget.onCloseTrade,
               ),
             ),
           );
@@ -8118,17 +8067,36 @@ class _HomeScreenState extends State<HomeScreen> {
         titleSpacing: 12,
         actions: [
           IconButton(
-            tooltip: 'YouTube',
-            icon: const Icon(Icons.play_circle_outline, color: Color(0xFFFF5252)),
-            onPressed: () => openYouTubePlaylist(context),
-          ),
-          IconButton(
-            tooltip: 'Alerts',
-            icon: const Icon(Icons.notifications),
+            tooltip: 'Learn',
+            icon: const Icon(Icons.menu_book_outlined, color: Color(0xFF00BFFF)),
             onPressed: () => Navigator.push(
               context,
-              _premiumPageRoute((_) => const AlertsScreen()),
+              _premiumPageRoute((_) => const OracleAcademyScreen()),
             ),
+          ),
+          ValueListenableBuilder<int>(
+            valueListenable: OracleAlertStore.triggeredCount,
+            builder: (context, count, _) {
+              return IconButton(
+                tooltip: 'Alerts',
+                onPressed: () => Navigator.push(
+                  context,
+                  _premiumPageRoute(
+                    (_) => AlertsScreen(
+                      trades: widget.trades,
+                      onCloseTrade: widget.onCloseTrade,
+                    ),
+                  ),
+                ),
+                icon: Badge(
+                  isLabelVisible: count > 0 && !OracleAlertStore.muteAll,
+                  label: Text(count > 9 ? '9+' : '$count'),
+                  backgroundColor: const Color(0xFF00BFFF),
+                  textColor: Colors.black,
+                  child: const Icon(Icons.notifications),
+                ),
+              );
+            },
           ),
           if (_chatFabHidden)
             IconButton(
@@ -8194,6 +8162,10 @@ class _HomeScreenState extends State<HomeScreen> {
                   key: _dailyBiasKey,
                   onCoinTap: widget.onCoinTap,
                 ),
+              ),
+              Padding(
+                padding: _kHomeCardGap,
+                child: const _PersonalBankrollBrief(),
               ),
             const SizedBox(height: 16),
             // Daily Analysis — Quick Analyze only (trade setups → Trade Performance).
@@ -8262,6 +8234,53 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Personalized sizing line under Daily Oracle Bias — uses bankroll + Citadel defaults.
+class _PersonalBankrollBrief extends StatelessWidget {
+  const _PersonalBankrollBrief();
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<double>(
+      valueListenable: StartingCapitalStore.notifier,
+      builder: (context, capital, _) {
+        final risk = OracleCitadelStore.defaultRiskPercent;
+        final lev = OracleCitadelStore.defaultLeverage;
+        final riskLabel = risk == risk.roundToDouble() ? '${risk.round()}' : risk.toStringAsFixed(1);
+        return Container(
+          width: double.infinity,
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+          decoration: BoxDecoration(
+            color: const Color(0xFF141414),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.22)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'YOUR DESK',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 1.3,
+                  color: Colors.grey[500],
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'With your ${PositionSizing.formatUsd(capital)} bankroll and $riskLabel% risk at ${lev.round()}x, '
+                'a typical setup uses ${PositionSizing.formatUsd(PositionSizing.marginUsd(capital, risk))} margin '
+                '(${PositionSizing.formatUsd(PositionSizing.notionalUsd(capital, risk, lev))} notional).',
+                style: TextStyle(fontSize: 13, height: 1.45, color: Colors.grey[300]),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 }
@@ -8363,6 +8382,7 @@ class _DailyOracleBiasBlockState extends State<_DailyOracleBiasBlock> {
       if (snap != null) {
         _snapshot = snap;
         _error = null;
+        unawaited(OracleAlertEngine.instance.noteBias(_oracleBiasLabel(snap.overall)));
       } else if (_snapshot == null) {
         _error = 'Market data is temporarily unavailable. Pull down on Home to refresh.';
       }
@@ -9934,6 +9954,75 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _analysisComplete = true;
   bool _darkMode = true;
   bool _hapticFeedback = true;
+  String _tradingVenueId = TradingVenueStore.autoId;
+  double _startingCapital = StartingCapitalStore.capitalUsd;
+  late final TextEditingController _capitalController;
+  bool _editingCapitalText = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _capitalController = TextEditingController(text: _formatCapitalInput(_startingCapital));
+    TradingVenueStore.load().then((_) {
+      if (!mounted) return;
+      setState(() => _tradingVenueId = TradingVenueStore.venueId);
+    });
+    StartingCapitalStore.load().then((_) {
+      if (!mounted) return;
+      setState(() {
+        _startingCapital = StartingCapitalStore.capitalUsd;
+        if (!_editingCapitalText) {
+          _capitalController.text = _formatCapitalInput(_startingCapital);
+        }
+      });
+    });
+    OracleAlertStore.load().then((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _capitalController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _onVenueChanged(String? id) async {
+    if (id == null) return;
+    await TradingVenueStore.save(id);
+    if (!mounted) return;
+    setState(() => _tradingVenueId = TradingVenueStore.venueId);
+  }
+
+  String _formatCapitalInput(double value) {
+    final n = value.round();
+    final raw = n.toString();
+    final buf = StringBuffer();
+    for (var i = 0; i < raw.length; i++) {
+      final fromEnd = raw.length - i;
+      buf.write(raw[i]);
+      if (fromEnd > 1 && fromEnd % 3 == 1) buf.write(',');
+    }
+    return buf.toString();
+  }
+
+  double? _parseCapitalInput(String raw) {
+    final cleaned = raw.replaceAll(RegExp(r'[^0-9.]'), '');
+    if (cleaned.isEmpty) return null;
+    return double.tryParse(cleaned);
+  }
+
+  Future<void> _commitCapital(double value) async {
+    final next = value.clamp(StartingCapitalStore.minUsd, StartingCapitalStore.maxUsd);
+    await StartingCapitalStore.save(next);
+    if (!mounted) return;
+    setState(() {
+      _startingCapital = StartingCapitalStore.capitalUsd;
+      if (!_editingCapitalText) {
+        _capitalController.text = _formatCapitalInput(_startingCapital);
+      }
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -9952,11 +10041,48 @@ class _SettingsScreenState extends State<SettingsScreen> {
             onChanged: (v) => setState(() => _pushNotifications = v),
           ),
           _SettingsSwitchTile(
-            icon: Icons.email_outlined,
-            title: 'Email Alerts',
-            subtitle: 'Get updates via email',
-            value: _emailAlerts,
-            onChanged: (v) => setState(() => _emailAlerts = v),
+            icon: Icons.shield_outlined,
+            title: 'Setup Guardians',
+            subtitle: 'Entry, stop, and target pings on open setups',
+            value: !OracleAlertStore.muteSetup && !OracleAlertStore.muteAll,
+            onChanged: (v) async {
+              OracleAlertStore.muteSetup = !v;
+              await OracleAlertStore.saveMutes();
+              if (mounted) setState(() {});
+            },
+          ),
+          _SettingsSwitchTile(
+            icon: Icons.auto_awesome_outlined,
+            title: 'Desk Pulse',
+            subtitle: 'Bias flips (Premium+)',
+            value: !OracleAlertStore.mutePulse && !OracleAlertStore.muteAll,
+            onChanged: (v) async {
+              OracleAlertStore.mutePulse = !v;
+              await OracleAlertStore.saveMutes();
+              if (mounted) setState(() {});
+            },
+          ),
+          _SettingsSwitchTile(
+            icon: Icons.account_balance_outlined,
+            title: 'Citadel live',
+            subtitle: 'Fills and near-stop (Expert)',
+            value: !OracleAlertStore.muteCitadel && !OracleAlertStore.muteAll,
+            onChanged: (v) async {
+              OracleAlertStore.muteCitadel = !v;
+              await OracleAlertStore.saveMutes();
+              if (mounted) setState(() {});
+            },
+          ),
+          _SettingsSwitchTile(
+            icon: Icons.attach_money,
+            title: 'Custom price alerts',
+            subtitle: 'Optional levels you arm yourself',
+            value: !OracleAlertStore.mutePrice && !OracleAlertStore.muteAll,
+            onChanged: (v) async {
+              OracleAlertStore.mutePrice = !v;
+              await OracleAlertStore.saveMutes();
+              if (mounted) setState(() {});
+            },
           ),
           _SettingsSwitchTile(
             icon: Icons.analytics_outlined,
@@ -9964,6 +10090,204 @@ class _SettingsScreenState extends State<SettingsScreen> {
             subtitle: 'Notify when AI analysis finishes',
             value: _analysisComplete,
             onChanged: (v) => setState(() => _analysisComplete = v),
+          ),
+          const SizedBox(height: _AppSpacing.item),
+          const _SectionHeader(title: 'Trading venue'),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        width: 42,
+                        height: 42,
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF00BFFF).withValues(alpha: 0.12),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: const Icon(Icons.account_balance_outlined, color: Color(0xFF00BFFF), size: 22),
+                      ),
+                      const SizedBox(width: 12),
+                      const Expanded(
+                        child: Text(
+                          'I trade on',
+                          style: TextStyle(fontWeight: FontWeight.w600, fontSize: 16),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<String>(
+                    value: _tradingVenueId,
+                    isExpanded: true,
+                    dropdownColor: const Color(0xFF1A1A1A),
+                    decoration: InputDecoration(
+                      filled: true,
+                      fillColor: const Color(0xFF0A0A0A),
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide(color: Colors.grey[800]!),
+                      ),
+                      focusedBorder: const OutlineInputBorder(
+                        borderRadius: BorderRadius.all(Radius.circular(12)),
+                        borderSide: BorderSide(color: Color(0xFF00BFFF), width: 1.5),
+                      ),
+                    ),
+                    items: TradingVenueStore.options
+                        .map(
+                          (opt) => DropdownMenuItem(
+                            value: opt.id,
+                            child: Text(opt.label, overflow: TextOverflow.ellipsis),
+                          ),
+                        )
+                        .toList(),
+                    onChanged: _onVenueChanged,
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    TradingVenueStore.current.note ??
+                        'AI analysis, trade setups, and chat will treat this as your execution venue — even if Citadel cannot place orders there yet.',
+                    style: TextStyle(fontSize: 12.5, height: 1.45, color: Colors.grey[500]),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: _AppSpacing.item),
+          const _SectionHeader(title: 'Starting capital'),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        width: 42,
+                        height: 42,
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF00BFFF).withValues(alpha: 0.12),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: const Icon(Icons.account_balance_wallet_outlined, color: Color(0xFF00BFFF), size: 22),
+                      ),
+                      const SizedBox(width: 12),
+                      const Expanded(
+                        child: Text(
+                          'Bankroll',
+                          style: TextStyle(fontWeight: FontWeight.w600, fontSize: 16),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  TextField(
+                    controller: _capitalController,
+                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                    inputFormatters: [
+                      FilteringTextInputFormatter.allow(RegExp(r'[0-9,.]')),
+                    ],
+                    style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 18, letterSpacing: -0.2),
+                    decoration: InputDecoration(
+                      prefixText: '\$ ',
+                      prefixStyle: TextStyle(color: Colors.grey[400], fontWeight: FontWeight.w600, fontSize: 18),
+                      hintText: '10,000',
+                      filled: true,
+                      fillColor: const Color(0xFF0A0A0A),
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide(color: Colors.grey[800]!),
+                      ),
+                      focusedBorder: const OutlineInputBorder(
+                        borderRadius: BorderRadius.all(Radius.circular(12)),
+                        borderSide: BorderSide(color: Color(0xFF00BFFF), width: 1.5),
+                      ),
+                    ),
+                    onTap: () => _editingCapitalText = true,
+                    onChanged: (raw) {
+                      final parsed = _parseCapitalInput(raw);
+                      if (parsed == null) return;
+                      final next = parsed.clamp(StartingCapitalStore.minUsd, StartingCapitalStore.maxUsd);
+                      setState(() => _startingCapital = next);
+                      StartingCapitalStore.save(next);
+                    },
+                    onTapOutside: (_) {
+                      _editingCapitalText = false;
+                      _commitCapital(_startingCapital);
+                      FocusManager.instance.primaryFocus?.unfocus();
+                    },
+                    onEditingComplete: () {
+                      _editingCapitalText = false;
+                      _commitCapital(_startingCapital);
+                      FocusScope.of(context).unfocus();
+                    },
+                    onSubmitted: (_) {
+                      _editingCapitalText = false;
+                      _commitCapital(_startingCapital);
+                    },
+                  ),
+                  const SizedBox(height: 8),
+                  SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      activeTrackColor: const Color(0xFF00BFFF),
+                      inactiveTrackColor: Colors.grey[800],
+                      thumbColor: const Color(0xFF00BFFF),
+                      overlayColor: const Color(0xFF00BFFF).withValues(alpha: 0.16),
+                      trackHeight: 3,
+                    ),
+                    child: Slider(
+                      min: StartingCapitalStore.minUsd,
+                      max: StartingCapitalStore.maxUsd,
+                      value: _startingCapital.clamp(StartingCapitalStore.minUsd, StartingCapitalStore.maxUsd),
+                      onChanged: (v) {
+                        _editingCapitalText = false;
+                        setState(() {
+                          _startingCapital = v;
+                          _capitalController.text = _formatCapitalInput(v);
+                        });
+                      },
+                      onChangeEnd: _commitCapital,
+                    ),
+                  ),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text('\$0', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                      Text('\$1,000,000', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  _StartingCapitalPresets(
+                    selected: _startingCapital,
+                    onSelect: (v) {
+                      _editingCapitalText = false;
+                      _capitalController.text = _formatCapitalInput(v);
+                      _commitCapital(v);
+                    },
+                  ),
+                  const SizedBox(height: 10),
+                  _PositionAtRiskLine(
+                    capital: _startingCapital,
+                    riskPercent: OracleCitadelStore.defaultRiskPercent,
+                    leverage: OracleCitadelStore.defaultLeverage,
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    'War Room AI Alpha uses this bankroll x each trade\'s risk % x leverage x R-multiple. '
+                    'Change it anytime — the snapshot recalculates immediately.',
+                    style: TextStyle(fontSize: 12.5, height: 1.45, color: Colors.grey[500]),
+                  ),
+                ],
+              ),
+            ),
           ),
           const SizedBox(height: _AppSpacing.item),
           const _SectionHeader(title: 'Appearance'),
@@ -9995,6 +10319,58 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _StartingCapitalPresets extends StatelessWidget {
+  final double selected;
+  final ValueChanged<double> onSelect;
+
+  const _StartingCapitalPresets({required this.selected, required this.onSelect});
+
+  static const _presets = <(double, String)>[
+    (1000, '\$1k'),
+    (5000, '\$5k'),
+    (10000, '\$10k'),
+    (25000, '\$25k'),
+    (50000, '\$50k'),
+    (100000, '\$100k'),
+    (250000, '\$250k'),
+    (500000, '\$500k'),
+    (1000000, '\$1M'),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: _presets.map((preset) {
+        final active = (selected - preset.$1).abs() < 0.5;
+        return GestureDetector(
+          onTap: () => onSelect(preset.$1),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 180),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              color: active ? const Color(0xFF00BFFF).withValues(alpha: 0.18) : const Color(0xFF0A0A0A),
+              border: Border.all(
+                color: active ? const Color(0xFF00BFFF) : Colors.grey[800]!,
+              ),
+            ),
+            child: Text(
+              preset.$2,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                color: active ? const Color(0xFF00BFFF) : Colors.grey[400],
+              ),
+            ),
+          ),
+        );
+      }).toList(),
     );
   }
 }
@@ -10391,6 +10767,7 @@ class _AnalysisReportScreenState extends State<AnalysisReportScreen> {
       errorMessage = null;
     });
     try {
+      final fluxFields = await _analyzeFluxFields(resolvedCoin, '1h');
       final response = await _postAnalyzeWithRetry(
         payload: {
           "coin": resolvedCoin,
@@ -10402,6 +10779,7 @@ class _AnalysisReportScreenState extends State<AnalysisReportScreen> {
           "refresh_price": true,
           "request_ts": DateTime.now().millisecondsSinceEpoch,
           ..._analyzeCitadelContext(),
+          ...fluxFields,
         },
       );
       if (response.statusCode == 200) {
@@ -10891,6 +11269,7 @@ Future<http.Response> _postReviewWithRetry({
   final payload = {
     "coin": coin,
     "previous_report": previousReport,
+    ...TradingVenueStore.analyzePayloadFields(),
   };
 
   for (int i = 0; i < attempts; i++) {
@@ -10989,6 +11368,7 @@ class _TradeSetupResultScreenState extends State<TradeSetupResultScreen> {
           ? '\n\nOracle Vision pulse: ${widget.convictionPct}% ${widget.direction} confluence on ${widget.timeframe}. '
               'Honor bias when grading Daily VWAP, structure, and Entry/SL/TP1 (40%)/TP2 (60%).'
           : '';
+      final fluxFields = await _analyzeFluxFields(resolvedCoin, widget.timeframe);
       final response = await _postAnalyzeWithRetry(
         payload: {
           "coin": resolvedCoin,
@@ -11001,6 +11381,7 @@ class _TradeSetupResultScreenState extends State<TradeSetupResultScreen> {
           "request_ts": DateTime.now().millisecondsSinceEpoch,
           if (widget.convictionPct != null) "vision_confluence_pct": widget.convictionPct,
           ..._analyzeCitadelContext(),
+          ...fluxFields,
         },
       );
       if (response.statusCode == 200) {
@@ -11172,6 +11553,7 @@ Future<http.Response> _postChatWithRetry({
     'history': history,
     'system_prompt': systemPrompt,
     'request_ts': DateTime.now().millisecondsSinceEpoch,
+    ...TradingVenueStore.analyzePayloadFields(),
   };
   final body = jsonEncode(payload);
   debugPrint('[HTTP POST] $uri chat message length=${message.length}');
@@ -11695,14 +12077,14 @@ class _AdvancedAlertsPlaceholder extends StatelessWidget {
   }
 }
 
-class AlertsScreen extends StatefulWidget {
-  const AlertsScreen({super.key});
+class _LegacyAlertsScreenUnused extends StatefulWidget {
+  const _LegacyAlertsScreenUnused();
 
   @override
-  State<AlertsScreen> createState() => _AlertsScreenState();
+  State<_LegacyAlertsScreenUnused> createState() => _LegacyAlertsScreenUnusedState();
 }
 
-class _AlertsScreenState extends State<AlertsScreen> with SingleTickerProviderStateMixin {
+class _LegacyAlertsScreenUnusedState extends State<_LegacyAlertsScreenUnused> with SingleTickerProviderStateMixin {
   bool _loading = true;
   String? _bannerMessage;
   late final AnimationController _bannerController;

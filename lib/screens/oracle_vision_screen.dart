@@ -75,6 +75,9 @@ abstract final class _OracleVisionLiveCopy {
   }
 
   static String opportunityWhy(OraclePulseOpportunity opp, String timeframe) {
+    if (opp.play.isMeanRevert && opp.whyNow.length > 24) {
+      return opp.whyNow;
+    }
     final generic = opp.whyNow.contains('Awaiting') ||
         opp.whyNow.contains('Default radar') ||
         opp.whyNow.contains('Watchlist priority');
@@ -82,7 +85,7 @@ abstract final class _OracleVisionLiveCopy {
       return _enrichPulse(opp.whyNow, opp, timeframe);
     }
     final fund = _fundingSnippet(opp.coin);
-    final side = opp.direction.isLong ? 'bid absorption' : 'offer pressure';
+    final side = opp.direction.isLong ? 'buyers stepping in' : 'sellers pressing';
     final vwap = opp.direction.isLong ? 'reclaiming' : 'rejecting';
     return '${opp.coin} $timeframe: $vwap Daily VWAP, $side + $fund — ${opp.direction.label} bias.';
   }
@@ -1229,6 +1232,28 @@ class _VisionOpportunityCardState extends State<_VisionOpportunityCard> with Sin
                                   opp.direction.label,
                                   style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800, color: dirColor),
                                 ),
+                                if (opp.play.isMeanRevert) ...[
+                                  const SizedBox(width: 8),
+                                  Flexible(
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                                      decoration: BoxDecoration(
+                                        color: const Color(0xFFFFB74D).withValues(alpha: 0.16),
+                                        borderRadius: BorderRadius.circular(6),
+                                        border: Border.all(color: const Color(0xFFFFB74D).withValues(alpha: 0.45)),
+                                      ),
+                                      child: Text(
+                                        opp.play.label,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          fontSize: 9,
+                                          fontWeight: FontWeight.w800,
+                                          color: Color(0xFFFFB74D),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               ],
                             ),
                             const SizedBox(height: 4),

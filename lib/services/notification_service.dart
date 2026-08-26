@@ -48,6 +48,18 @@ class NotificationService {
   bool get isFirebaseReady => _firebaseReady;
   bool get isLocalReady => _localReady;
 
+  /// Open Alerts or a trade from a tapped alert notification.
+  void Function(Map<String, dynamic> data)? onAlertOpened;
+
+  Future<String?> fcmToken() async {
+    if (!_firebaseReady) return null;
+    try {
+      return await _fcm.getToken();
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Wire Home navigation (call from MainScreen.initState).
   void registerDailyAnalysesNavigator(VoidCallback? navigator) {
     onOpenDailyAnalyses = navigator;
@@ -232,12 +244,20 @@ class NotificationService {
     );
   }
 
-  Future<void> showAlertHit({String coin = 'BTC', String? condition}) async {
+  Future<void> showAlertHit({
+    String coin = 'BTC',
+    String? condition,
+    Map<String, String>? extra,
+  }) async {
     await _showLocal(
       type: OracleNotificationType.alertHit,
       title: OracleNotificationType.alertHit.title,
       body: condition ?? '$coin alert condition was met. Tap to view details.',
-      payload: {'type': OracleNotificationType.alertHit.name, 'coin': coin},
+      payload: {
+        'type': OracleNotificationType.alertHit.name,
+        'coin': coin,
+        ...?extra,
+      },
     );
   }
 
@@ -297,6 +317,7 @@ class NotificationService {
   void _onMessageOpenedApp(RemoteMessage message) {
     debugPrint('[FCM] Notification opened: ${message.data}');
     _maybeOpenDailyAnalysesFromPayload(message.data);
+    _maybeOpenAlertFromPayload(message.data);
   }
 
   void _onNotificationTapped(NotificationResponse response) {
@@ -316,6 +337,7 @@ class NotificationService {
       }
     }
     _maybeOpenDailyAnalysesFromPayload(data);
+    _maybeOpenAlertFromPayload(data);
   }
 
   void _maybeOpenDailyAnalysesFromPayload(Map<String, dynamic>? data) {
@@ -331,6 +353,20 @@ class NotificationService {
     } else {
       _pendingOpenDailyAnalyses = true;
     }
+  }
+
+  void _maybeOpenAlertFromPayload(Map<String, dynamic>? data) {
+    if (data == null) return;
+    final typeName = (data['type'] ?? data['notification_type'])?.toString();
+    final open = data['open']?.toString();
+    final isAlert = typeName == 'alertHit' ||
+        typeName == 'alert_hit' ||
+        typeName == OracleNotificationType.alertHit.name ||
+        typeName == OracleNotificationType.tradeSetupTriggered.name ||
+        open == 'alerts' ||
+        open == 'desk';
+    if (!isAlert) return;
+    onAlertOpened?.call(Map<String, dynamic>.from(data));
   }
 
   void _handleTypedPayload(

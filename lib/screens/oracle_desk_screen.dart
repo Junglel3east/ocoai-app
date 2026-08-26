@@ -99,17 +99,29 @@ class _OracleDeskScreenState extends State<OracleDeskScreen> with SingleTickerPr
   String _formatUsd(double v) {
     final sign = v >= 0 ? '+' : '-';
     final abs = v.abs();
+    if (abs >= 1000000) return '$sign\$${(abs / 1000000).toStringAsFixed(2)}M';
     if (abs >= 1000) return '$sign\$${(abs / 1000).toStringAsFixed(1)}k';
     return '$sign\$${abs.toStringAsFixed(0)}';
   }
 
   @override
   Widget build(BuildContext context) {
-    final perf = OracleDeskService.computePerformance(
-      trades: widget.trades,
-      watchlist: widget.watchlist,
+    return ValueListenableBuilder<double>(
+      valueListenable: StartingCapitalStore.notifier,
+      builder: (context, capital, _) {
+        final perf = OracleDeskService.computePerformance(
+          trades: widget.trades,
+          watchlist: widget.watchlist,
+          startingCapitalUsd: capital,
+          defaultRiskPercent: OracleCitadelStore.defaultRiskPercent,
+          defaultLeverage: OracleCitadelStore.defaultLeverage,
+        );
+        return _buildDesk(context, perf);
+      },
     );
+  }
 
+  Widget _buildDesk(BuildContext context, OracleDeskPerformance perf) {
     final bottomInset = MediaQuery.paddingOf(context).bottom;
 
     return Scaffold(
@@ -162,6 +174,19 @@ class _PerformanceSnapshotPanel extends StatefulWidget {
 class _PerformanceSnapshotPanelState extends State<_PerformanceSnapshotPanel> {
   int _equityTab = 0;
 
+  String _formatSnapshotBankroll(double v) {
+    final n = v.round().clamp(0, 1000000);
+    if (n >= 1000000) return '\$1,000,000';
+    final raw = n.toString();
+    final buf = StringBuffer('\$');
+    for (var i = 0; i < raw.length; i++) {
+      final fromEnd = raw.length - i;
+      buf.write(raw[i]);
+      if (fromEnd > 1 && fromEnd % 3 == 1) buf.write(',');
+    }
+    return buf.toString();
+  }
+
   @override
   Widget build(BuildContext context) {
     const cyan = Color(0xFF00D4FF);
@@ -201,9 +226,33 @@ class _PerformanceSnapshotPanelState extends State<_PerformanceSnapshotPanel> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text(
-                    'Performance Snapshot',
-                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, letterSpacing: -0.2),
+                  Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'Performance Snapshot',
+                          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, letterSpacing: -0.2),
+                        ),
+                      ),
+                      PushToXButton(
+                        iconOnly: true,
+                        tooltip: 'Share War Room',
+                        sheetTitle: 'Share War Room',
+                        initialText: XShareService.formatWarRoomPost(
+                          bankrollUsd: perf.startingCapitalUsd,
+                          winRatePct: perf.winRatePct,
+                          avgRiskReward: perf.avgRiskReward,
+                          aiAlphaUsd: perf.totalAiAlphaUsd,
+                          closedCount: perf.closedCount,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    'Bankroll ${_formatSnapshotBankroll(perf.startingCapitalUsd)}'
+                    ' · each trade sized with stored risk % × leverage',
+                    style: TextStyle(fontSize: 12, height: 1.35, color: Colors.grey[500]),
                   ),
                   const SizedBox(height: 18),
                   _EquityTabBar(

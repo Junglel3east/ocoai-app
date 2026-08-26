@@ -203,6 +203,13 @@ class TradePerformanceScreen extends StatelessWidget {
 
   final void Function(dynamic tradeId) onDeleteTrade;
 
+  final void Function({
+    required dynamic tradeId,
+    required String status,
+    required double exitPrice,
+    double feesUsd,
+  }) onCloseTrade;
+
 
 
   const TradePerformanceScreen({
@@ -216,6 +223,8 @@ class TradePerformanceScreen extends StatelessWidget {
     required this.onViewReport,
 
     required this.onDeleteTrade,
+
+    required this.onCloseTrade,
 
   });
 
@@ -315,7 +324,7 @@ class TradePerformanceScreen extends StatelessWidget {
 
 
 
-  Widget _tradeCard(BuildContext context, Map<String, dynamic> trade) {
+  Widget _tradeCard(BuildContext context, Map<String, dynamic> trade, {VoidCallback? onChanged}) {
 
     final coin = (trade['coin'] ?? '—').toString();
 
@@ -324,6 +333,12 @@ class TradePerformanceScreen extends StatelessWidget {
     final preview = resolveHistoryForTrade(trade);
 
     final timeLabel = preview?['time']?.toString() ?? _formatCreated(trade);
+
+    final exit = trade['exitPrice'];
+
+    final statusLine = exit != null
+        ? '$timeLabel • $status @ $exit'
+        : '$timeLabel • $status';
 
 
 
@@ -365,7 +380,7 @@ class TradePerformanceScreen extends StatelessWidget {
 
                     Text(
 
-                      '$timeLabel • $status',
+                      statusLine,
 
                       style: TextStyle(fontSize: 13, color: Colors.grey[500]),
 
@@ -445,6 +460,19 @@ class TradePerformanceScreen extends StatelessWidget {
 
               ),
 
+              if (status == 'Open') ...[
+                const SizedBox(width: 6),
+                _HistoryChipButton(
+                  label: 'Close',
+                  backgroundColor: const Color(0xFF00BFFF),
+                  foregroundColor: Colors.black,
+                  onPressed: () async {
+                    await _openCloseTradeDialog(context, trade);
+                    onChanged?.call();
+                  },
+                ),
+              ],
+
               IconButton(
 
                 padding: EdgeInsets.zero,
@@ -471,124 +499,188 @@ class TradePerformanceScreen extends StatelessWidget {
 
 
 
+  Future<void> _openCloseTradeDialog(BuildContext context, Map<String, dynamic> trade) async {
+    final result = await _showCloseTradeDialog(context, trade);
+    if (result == null) return;
+    onCloseTrade(
+      tradeId: trade['id'],
+      status: result.status,
+      exitPrice: result.exitPrice,
+      feesUsd: result.feesUsd,
+    );
+    if (context.mounted) {
+      _snack(context, '${trade['coin']} closed as ${result.status}');
+    }
+  }
+
   @override
 
   Widget build(BuildContext context) {
-
-    final winCount = trades.where((t) => t['status'] == 'Win').length;
-
-    final lossCount = trades.where((t) => t['status'] == 'Loss').length;
-
-    final closed = winCount + lossCount;
-
-    final openCount = trades.where((t) => t['status'] == 'Open').length;
-
-    final rate = closed == 0 ? 0 : ((winCount / closed) * 100).round();
-
-
-
     return Scaffold(
-
       backgroundColor: const Color(0xFF0F0F0F),
-
       appBar: AppBar(
-
         title: const Text('Trade Performance'),
-
         backgroundColor: const Color(0xFF0F0F0F),
-
       ),
-
       body: trades.isEmpty
-
           ? _AppEmptyState(
-
               icon: Icons.emoji_events_outlined,
-
               title: 'No trades yet',
-
               subtitle: 'Generate a Trade Setup to start tracking performance here.',
-
             )
-
-          : ListView(
-
-              physics: const BouncingScrollPhysics(),
-
-              padding: const EdgeInsets.all(_AppSpacing.screen),
-
-              children: [
-
-                Card(
-
-                  child: Padding(
-
-                    padding: const EdgeInsets.all(_AppSpacing.card),
-
-                    child: Column(
-
-                      crossAxisAlignment: CrossAxisAlignment.start,
-
-                      children: [
-
-                        const Text(
-
-                          'Past Performance',
-
-                          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
-
+          : StatefulBuilder(
+              builder: (context, setLocal) {
+                final winCount = trades.where((t) => t['status'] == 'Win').length;
+                final lossCount = trades.where((t) => t['status'] == 'Loss').length;
+                final closed = winCount + lossCount;
+                final openCount = trades.where((t) => t['status'] == 'Open').length;
+                final rate = closed == 0 ? 0 : ((winCount / closed) * 100).round();
+                return ListView(
+                  physics: const BouncingScrollPhysics(),
+                  padding: const EdgeInsets.all(_AppSpacing.screen),
+                  children: [
+                    Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(_AppSpacing.card),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Past Performance',
+                              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                            ),
+                            const SizedBox(height: 10),
+                            Text(
+                              'Win Rate: $rate% ($winCount Wins / $closed Closed)',
+                              style: const TextStyle(
+                                fontSize: 15,
+                                fontWeight: FontWeight.w600,
+                                color: Color(0xFF00BFFF),
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              '$openCount open · ${trades.length} total setups',
+                              style: TextStyle(fontSize: 13, color: Colors.grey[500]),
+                            ),
+                          ],
                         ),
-
-                        const SizedBox(height: 10),
-
-                        Text(
-
-                          'Win Rate: $rate% ($winCount Wins / $closed Closed)',
-
-                          style: const TextStyle(
-
-                            fontSize: 15,
-
-                            fontWeight: FontWeight.w600,
-
-                            color: Color(0xFF00BFFF),
-
-                          ),
-
-                        ),
-
-                        const SizedBox(height: 6),
-
-                        Text(
-
-                          '$openCount open · ${trades.length} total setups',
-
-                          style: TextStyle(fontSize: 13, color: Colors.grey[500]),
-
-                        ),
-
-                      ],
-
+                      ),
                     ),
-
-                  ),
-
-                ),
-
-                const SizedBox(height: _AppSpacing.section),
-
-                const _SectionHeader(title: 'All Trades'),
-
-                ...trades.map((trade) => _tradeCard(context, trade)),
-
-              ],
-
+                    const SizedBox(height: _AppSpacing.section),
+                    const _SectionHeader(title: 'All Trades'),
+                    ...trades.map((trade) => _tradeCard(context, trade, onChanged: () => setLocal(() {}))),
+                  ],
+                );
+              },
             ),
-
     );
+  }
+}
 
+class _CloseTradeResult {
+  final String status;
+  final double exitPrice;
+  final double feesUsd;
+
+  const _CloseTradeResult({
+    required this.status,
+    required this.exitPrice,
+    required this.feesUsd,
+  });
+}
+
+Future<_CloseTradeResult?> _showCloseTradeDialog(BuildContext context, Map<String, dynamic> trade) {
+  return showDialog<_CloseTradeResult>(
+    context: context,
+    builder: (ctx) => _CloseTradeDialog(trade: trade),
+  );
+}
+
+class _CloseTradeDialog extends StatefulWidget {
+  final Map<String, dynamic> trade;
+
+  const _CloseTradeDialog({required this.trade});
+
+  @override
+  State<_CloseTradeDialog> createState() => _CloseTradeDialogState();
+}
+
+class _CloseTradeDialogState extends State<_CloseTradeDialog> {
+  late final TextEditingController _exitController;
+  late final TextEditingController _feesController;
+
+  @override
+  void initState() {
+    super.initState();
+    final trade = widget.trade;
+    final last = trade['lastPrice'] ?? trade['tp1'] ?? trade['entry'];
+    _exitController = TextEditingController(text: last?.toString() ?? '');
+    _feesController = TextEditingController(text: '0');
   }
 
+  @override
+  void dispose() {
+    _exitController.dispose();
+    _feesController.dispose();
+    super.dispose();
+  }
+
+  void _submit(String status) {
+    final exit = double.tryParse(_exitController.text.replaceAll(',', '').trim());
+    if (exit == null || exit <= 0) return;
+    final fees = double.tryParse(_feesController.text.replaceAll(',', '').trim()) ?? 0;
+    Navigator.pop(context, _CloseTradeResult(status: status, exitPrice: exit, feesUsd: fees));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final trade = widget.trade;
+    final coin = (trade['coin'] ?? 'Trade').toString();
+    return AlertDialog(
+      backgroundColor: const Color(0xFF1A1A1A),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      title: Text('Close $coin', style: const TextStyle(fontWeight: FontWeight.w700)),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Entry ${trade['entry']} · SL ${trade['sl']} · TP1 ${trade['tp1']}',
+            style: TextStyle(fontSize: 12.5, height: 1.4, color: Colors.grey[500]),
+          ),
+          const SizedBox(height: 14),
+          TextField(
+            controller: _exitController,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))],
+            decoration: const InputDecoration(labelText: 'Exit price'),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: _feesController,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))],
+            decoration: const InputDecoration(labelText: 'Fees (USD, optional)'),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: Text('Cancel', style: TextStyle(color: Colors.grey[500])),
+        ),
+        TextButton(
+          onPressed: () => _submit('Loss'),
+          child: const Text('Loss', style: TextStyle(color: Color(0xFFFF5252), fontWeight: FontWeight.w700)),
+        ),
+        TextButton(
+          onPressed: () => _submit('Win'),
+          child: const Text('Win', style: TextStyle(color: Color(0xFF00E676), fontWeight: FontWeight.w700)),
+        ),
+      ],
+    );
+  }
 }
 
 

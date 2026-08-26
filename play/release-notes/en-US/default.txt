@@ -1,1 +1,6 @@
-Internal Testing 1.0.3 — Oracle Citadel reliability: Market orders now place a two-step Stop Loss (entry, then SL via BloFin order-tpsl) on Live and Demo, plus dual TP (40%/60%). Clearer trade success/error feedback. Live BloFin passphrase handling, X daily posting (BTC/ETH/SOL/XRP), and general stability fixes.
+What's new in 1.0.5:
+• Starting capital — set your bankroll in Settings; War Room AI Alpha sizes from it
+• Setup Guardians — Alerts watch entry, stop, and targets on open trades
+• Close trades at your real exit price (optional fees) for accurate Alpha
+• First-run desk setup: venue, bankroll, and watchlist
+• Share your War Room snapshot to X

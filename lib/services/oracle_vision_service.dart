@@ -50,7 +50,7 @@ abstract final class OracleVisionService {
   static const int _kCounterTrendConvictionCap = 45;
   static const double _kReversalEvidencePct = 3.5;
 
-  /// Higher-timeframe (Daily) trend read from the live bias bundle + majors' 24h tape.
+  /// Higher-timeframe (Daily) trend read from the live bias bundle + majors' 24h move.
   static ({bool strongBearish, bool bearish, bool strongBullish}) macroTrend(
     OracleDeskBias bias,
     Map<String, double> change24h,
@@ -83,7 +83,7 @@ abstract final class OracleVisionService {
     }
   }
 
-  /// Builds liquidation heat zones from live 24h tape (Binance-backed bias bundle).
+  /// Builds liquidation heat zones from live 24h percent (Binance-backed bias bundle).
   static List<LiquidationHeatZone> buildLiquidationHeatmap({
     required Map<String, double> change24h,
     required List<String> watchlist,
@@ -128,10 +128,20 @@ abstract final class OracleVisionService {
         kind = LiquidationZoneKind.shortSqueeze;
       }
 
-      final direction = kind == LiquidationZoneKind.shortSqueeze
+      final extended = OracleDeskService.isExtendedMove(coin, ch);
+      var direction = kind == LiquidationZoneKind.shortSqueeze
           ? OraclePulseDirection.long
           : OraclePulseDirection.short;
-      var conviction = (62 + abs * 5.5 + (bias.confidencePct * 0.08)).round().clamp(65, 96);
+      if (extended && ch > 0 && macro.strongBearish) {
+        direction = OraclePulseDirection.short;
+      }
+      if (extended && ch < 0 && macro.strongBullish) {
+        direction = OraclePulseDirection.long;
+      }
+      var conviction = (62 + abs * 5.5 + (bias.confidencePct * 0.08)).round().clamp(58, 96);
+      if (extended) {
+        conviction = conviction.clamp(50, 70);
+      }
       final counterTrend = (macro.strongBearish && direction.isLong) ||
           (macro.strongBullish && !direction.isLong);
       if (counterTrend) {
@@ -145,7 +155,7 @@ abstract final class OracleVisionService {
           heat: (abs / 8).clamp(0.35, 1.0),
           change24hPct: ch,
           convictionPct: conviction,
-          whyZone: _whyZoneText(coin, ch, kind),
+          whyZone: _whyZoneText(coin, ch, kind, extended: extended, direction: direction),
           direction: direction,
         ),
       );
@@ -177,8 +187,27 @@ abstract final class OracleVisionService {
     return zones.take(6).toList();
   }
 
-  static String _whyZoneText(String coin, double change24h, LiquidationZoneKind kind) {
+  static String _whyZoneText(
+    String coin,
+    double change24h,
+    LiquidationZoneKind kind, {
+    bool extended = false,
+    OraclePulseDirection? direction,
+  }) {
     final move = '${change24h >= 0 ? '+' : ''}${change24h.toStringAsFixed(1)}% 24h';
+    final anchor = OracleDeskService.structureAnchor(coin);
+    if (extended && change24h > 0) {
+      if (direction != null && !direction.isLong) {
+        return '$coin $move — squeeze already printed into a bearish Daily. Wait for rejection at $anchor. Do not chase longs.';
+      }
+      return '$coin $move — extended. Do not chase. Wait for pullback to $anchor before longs.';
+    }
+    if (extended && change24h < 0) {
+      if (direction != null && direction.isLong) {
+        return '$coin $move — flush on a bullish Daily, not a new short. Wait for sweep + reclaim of $anchor.';
+      }
+      return '$coin $move — extended dump. Do not panic-short the low. Wait for bounce into $anchor.';
+    }
     switch (kind) {
       case LiquidationZoneKind.longLiqRisk:
         return '$coin long liquidation cluster below — $move cascade risk into stops.';
@@ -228,6 +257,7 @@ abstract final class OracleVisionService {
     // HTF trend discipline: counter-trend cards get capped conviction + caution
     // copy instead of high-conviction spam during a one-sided Daily.
     list = list.map((o) {
+      if (o.play.isMeanRevert) return o;
       final ch = change24h[o.coin] ?? 0;
       if (macro.strongBearish && o.direction.isLong && ch < _kReversalEvidencePct) {
         return OraclePulseOpportunity(
@@ -237,6 +267,7 @@ abstract final class OracleVisionService {
           whyNow:
               'Caution — Daily bias bearish, counter-trend long. Needs a sweep + reclaim of previous lows before sizing.',
           signalTimeframe: o.signalTimeframe,
+          play: o.play,
         );
       }
       if (macro.strongBullish && !o.direction.isLong && ch > -_kReversalEvidencePct) {
@@ -247,6 +278,7 @@ abstract final class OracleVisionService {
           whyNow:
               'Caution — Daily bias bullish, counter-trend short. Needs a rejection from previous highs before sizing.',
           signalTimeframe: o.signalTimeframe,
+          play: o.play,
         );
       }
       return o;

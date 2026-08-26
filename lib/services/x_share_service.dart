@@ -33,6 +33,42 @@ class XShareService {
     return truncateForTweet(lines.join('\n'));
   }
 
+  static String formatWarRoomPost({
+    required double bankrollUsd,
+    required double winRatePct,
+    required double avgRiskReward,
+    required double aiAlphaUsd,
+    required int closedCount,
+  }) {
+    String money(double v) {
+      final sign = v >= 0 ? '+' : '-';
+      final abs = v.abs();
+      if (abs >= 1000000) return '$sign\$${(abs / 1000000).toStringAsFixed(2)}M';
+      if (abs >= 1000) return '$sign\$${(abs / 1000).toStringAsFixed(1)}k';
+      return '$sign\$${abs.toStringAsFixed(0)}';
+    }
+
+    String bank(double v) {
+      final abs = v.abs();
+      if (abs >= 1000000) return '\$1M';
+      if (abs >= 1000) return '\$${(abs / 1000).toStringAsFixed(abs >= 10000 ? 0 : 1)}k';
+      return '\$${abs.toStringAsFixed(0)}';
+    }
+
+    final wr = closedCount == 0 ? '—' : '${winRatePct.toStringAsFixed(0)}%';
+    final rr = closedCount == 0 ? '—' : avgRiskReward.toStringAsFixed(2);
+    final lines = <String>[
+      '⚔️ On-Chain Oracle AI — War Room',
+      'Bankroll ${bank(bankrollUsd)} · $closedCount closed',
+      'Win rate $wr · Avg R $rr',
+      'AI Alpha ${money(aiAlphaUsd)}',
+      '',
+      '#OnChainOracle #Crypto #AIAlpha',
+      kXHandle,
+    ];
+    return truncateForTweet(lines.join('\n'));
+  }
+
   static String formatNewsPost({
     required String headline,
     String? url,

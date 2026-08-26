@@ -144,6 +144,10 @@ DAILY_ANALYSIS_HOUR = int(os.getenv("DAILY_ANALYSIS_HOUR", "7"))
 DAILY_ANALYSIS_MINUTE = int(os.getenv("DAILY_ANALYSIS_MINUTE", "30"))
 DAILY_ANALYSIS_COINS: tuple[str, ...] = ("BTC", "ETH", "SOL", "XRP")
 _DAILY_ANALYSIS_FILE = _CITADEL_DATA_DIR / "daily_analyses.json"
+_FLUX_READ_FILE = _CITADEL_DATA_DIR / "flux_reads.json"
+_FLUX_READ_TOKEN = (os.getenv("FLUX_READ_TOKEN") or "").strip()
+_FLUX_READ_LOCK = threading.Lock()
+_FLUX_READ_STORE: dict[str, Any] = {"rows": {}}
 _daily_scheduler_task: Optional[asyncio.Task] = None
 _alert_watch_task: Optional[asyncio.Task] = None
 _x_daily_post_scheduler_task: Optional[asyncio.Task] = None
@@ -4548,7 +4552,7 @@ LAYER 1 — ORACLE FLUX OVERLAY (levels, structure, state — the WHERE):
   (0.618–0.65) hold + inflow = continuation long; 0.786 rejection at VWAP/OB = classic Flux short. A Fib
   level is only actionable when the oscillator confirms the reaction (Wave turn, diamond, or divergence).
 • EMA stack / trend ribbon: EMA 5/20 alignment and slope = trend engine state. Price riding the stack with
-  clean HA bodies = continuation permission; EMA compression/flip at a Fib or VWAP = regime change watch.
+  clean HA bodies = continuation permission; EMA compression/flip at a Fib or VWAP = trend-change watch.
 • Heikin Ashi (Flux-integrated): clean bodies in trend direction = continuation; doji clusters at Fib/VWAP
   = indecision / reversal watch — demand an oscillator event before acting on it.
 • STRONG BUY / STRONG SELL (overlay flags): high-priority triggers when aligned with HTF + Daily VWAP +
@@ -4563,7 +4567,7 @@ LAYER 1 — ORACLE FLUX OVERLAY (levels, structure, state — the WHERE):
   Reclaim + inflow + Oracle Score ramp = long bias. Reject + outflow + 0.786 Fib = short bias.
 
 LAYER 2 — FLUX OSCILLATOR (timing, momentum, exhaustion — the WHEN):
-• Flux Wave (WT1/WT2 composite: WaveTrend + VWAP momentum + Money Flow): your momentum truth line.
+• Flux Wave (momentum line vs Daily VWAP + Money Flow): your momentum truth line.
   Cross up through zero = bullish impulse; rollover down through zero = bearish impulse. Crosses INSIDE
   OB/OS zones outrank zero crosses — a bullish cross below -60 is a springboard, above +60 it is late.
 • OB/OS zones (±60 / ±80): +80 = extended, exhaustion watch; -80 = capitulation watch. Wave parked in an
@@ -5139,6 +5143,14 @@ _FLUX_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "chop_strength": ("chop_strength", "chopStrength", "chop", "chop_index", "chopIndex"),
     "direction_bias": ("direction_bias", "directionBias", "bias", "flux_bias", "fluxBias"),
     "engines": ("engines", "flux_engines", "fluxEngines", "engine_states", "engineStates"),
+    "regime": ("regime", "flux_regime", "fluxRegime"),
+    "setup_state": ("setup_state", "setupState", "state"),
+    "vwap_bias": ("vwap_bias", "vwapBias"),
+    "structure": ("structure",),
+    "trend": ("trend",),
+    "fluid_tf": ("fluid_tf", "fluidTf"),
+    "regime_gate": ("regime_gate", "regimeGate"),
+    "layer": ("layer",),
     # Flux Oscillator (pane, PUB;mUlI6Xj4) — optional timing-layer fields.
     "flux_wave": ("flux_wave", "fluxWave", "wave", "wave_value", "waveValue", "wt1", "wt"),
     "wave_state": (
@@ -5191,6 +5203,14 @@ class OracleFluxSnapshot:
     diamond: Optional[str] = None
     divergence: Optional[str] = None
     oscillator_zone: Optional[str] = None
+    regime: Optional[str] = None
+    setup_state: Optional[str] = None
+    vwap_bias: Optional[str] = None
+    structure: Optional[str] = None
+    trend: Optional[str] = None
+    fluid_tf: Optional[bool] = None
+    regime_gate: Optional[bool] = None
+    layer: Optional[str] = None
 
     def has_signal(self) -> bool:
         return any(
@@ -5210,6 +5230,9 @@ class OracleFluxSnapshot:
                 bool(self.diamond),
                 bool(self.divergence),
                 bool(self.oscillator_zone),
+                bool(self.regime),
+                bool(self.setup_state),
+                bool(self.vwap_bias),
             ]
         )
 
@@ -5402,6 +5425,15 @@ def parse_oracle_flux(raw: Any) -> Optional[OracleFluxSnapshot]:
     snap.oscillator_zone = _flux_clean_text(
         _flux_first_value(raw, *_FLUX_FIELD_ALIASES["oscillator_zone"])
     )
+    snap.regime = _flux_clean_text(_flux_first_value(raw, *_FLUX_FIELD_ALIASES["regime"]))
+    snap.setup_state = _flux_clean_text(_flux_first_value(raw, *_FLUX_FIELD_ALIASES["setup_state"]))
+    snap.vwap_bias = _flux_clean_text(_flux_first_value(raw, *_FLUX_FIELD_ALIASES["vwap_bias"]))
+    snap.structure = _flux_clean_text(_flux_first_value(raw, *_FLUX_FIELD_ALIASES["structure"]))
+    snap.trend = _flux_clean_text(_flux_first_value(raw, *_FLUX_FIELD_ALIASES["trend"]))
+    snap.fluid_tf = _flux_coerce_bool(_flux_first_value(raw, *_FLUX_FIELD_ALIASES["fluid_tf"]))
+    snap.regime_gate = _flux_coerce_bool(_flux_first_value(raw, *_FLUX_FIELD_ALIASES["regime_gate"]))
+    layer = _flux_first_value(raw, *_FLUX_FIELD_ALIASES["layer"])
+    snap.layer = str(layer).strip().lower() if layer is not None else None
 
     if snap.has_signal():
         return snap
@@ -5435,6 +5467,11 @@ def _flux_dict_has_markers(data: dict[str, Any]) -> bool:
         "divergence",
         "oscillator_zone",
         "oscillatorzone",
+        "regime",
+        "setup_state",
+        "setupstate",
+        "vwap_bias",
+        "vwapbias",
     }
     return bool(lowered & markers)
 
@@ -5494,6 +5531,163 @@ def extract_oracle_flux_from_request(request: AnalyzeRequest) -> Optional[Oracle
     return None
 
 
+def _flux_normalize_symbol(raw: Any) -> str:
+    text = str(raw or "").strip().upper()
+    if text.endswith(".P") and len(text) > 2:
+        text = text[:-2]
+    for suffix in ("USDT", "USD", "PERP"):
+        if text.endswith(suffix) and len(text) > len(suffix):
+            text = text[: -len(suffix)]
+            break
+    return text
+
+
+def _flux_normalize_tf(raw: Any) -> str:
+    text = str(raw or "").strip().lower()
+    mapping = {
+        "1": "1m",
+        "1m": "1m",
+        "3": "3m",
+        "5": "5m",
+        "5m": "5m",
+        "15": "15m",
+        "15m": "15m",
+        "30": "30m",
+        "30m": "30m",
+        "45": "45m",
+        "60": "1h",
+        "1h": "1h",
+        "120": "2h",
+        "2h": "2h",
+        "240": "4h",
+        "4h": "4h",
+        "d": "1d",
+        "1d": "1d",
+        "1D": "1d",
+        "w": "1w",
+        "1w": "1w",
+    }
+    return mapping.get(text, text or "1h")
+
+
+def _flux_read_key(coin: str, timeframe: str) -> str:
+    return f"{_flux_normalize_symbol(coin)}|{_flux_normalize_tf(timeframe)}"
+
+
+def _load_flux_read_store() -> dict[str, Any]:
+    with _FLUX_READ_LOCK:
+        if _FLUX_READ_STORE.get("rows"):
+            return _FLUX_READ_STORE
+        try:
+            if _FLUX_READ_FILE.exists():
+                data = json.loads(_FLUX_READ_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and isinstance(data.get("rows"), dict):
+                    _FLUX_READ_STORE["rows"] = data["rows"]
+        except Exception as exc:
+            logger.warning("flux_read_store_load_failed err=%s", exc)
+        return _FLUX_READ_STORE
+
+
+def _save_flux_read_store() -> None:
+    _CITADEL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with _FLUX_READ_LOCK:
+        _FLUX_READ_FILE.write_text(
+            json.dumps(_FLUX_READ_STORE, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+
+def _unwrap_flux_read_payload(raw: Any) -> Optional[dict[str, Any]]:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(raw, dict):
+        return None
+    for key in ("oracle_flux", "oracleFlux", "flux", "payload"):
+        nested = raw.get(key)
+        if isinstance(nested, dict) and _flux_dict_has_markers(nested):
+            return nested
+        if isinstance(nested, str):
+            parsed = _unwrap_flux_read_payload(nested)
+            if parsed:
+                return parsed
+    for key in ("text", "message", "content"):
+        nested = raw.get(key)
+        if isinstance(nested, (dict, str)):
+            parsed = _unwrap_flux_read_payload(nested)
+            if parsed:
+                return parsed
+    if _flux_dict_has_markers(raw) or raw.get("v") == 1:
+        return raw
+    return None
+
+
+def _merge_flux_read_layers(overlay: Optional[dict], oscillator: Optional[dict]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    if isinstance(overlay, dict):
+        merged.update(overlay)
+    if isinstance(oscillator, dict):
+        for key, value in oscillator.items():
+            if value in (None, "", "none"):
+                continue
+            if key in merged and merged[key] not in (None, "", "none") and key in {
+                "oracle_score",
+                "conviction_label",
+                "nearest_fib",
+                "vwap_bias",
+                "structure",
+                "trend",
+            }:
+                continue
+            merged[key] = value
+    merged["layer"] = "merged" if overlay and oscillator else (oscillator or overlay or {}).get("layer")
+    return merged
+
+
+def upsert_flux_read(payload: dict[str, Any]) -> dict[str, Any]:
+    store = _load_flux_read_store()
+    coin = _flux_normalize_symbol(payload.get("sym") or payload.get("coin") or payload.get("symbol"))
+    tf = _flux_normalize_tf(payload.get("tf") or payload.get("timeframe") or payload.get("interval"))
+    if not coin:
+        raise ValueError("FluxRead needs a symbol (sym / coin).")
+    key = _flux_read_key(coin, tf)
+    layer = str(payload.get("layer") or "").strip().lower()
+    with _FLUX_READ_LOCK:
+        row = store["rows"].get(key) if isinstance(store["rows"].get(key), dict) else {}
+        if layer == "oscillator":
+            row["oscillator"] = payload
+        else:
+            row["overlay"] = payload
+        row["merged"] = _merge_flux_read_layers(row.get("overlay"), row.get("oscillator"))
+        row["coin"] = coin
+        row["timeframe"] = tf
+        row["updated_at"] = datetime.now(timezone.utc).isoformat()
+        store["rows"][key] = row
+    try:
+        _save_flux_read_store()
+    except Exception as exc:
+        logger.warning("flux_read_store_save_failed err=%s", exc)
+    return row
+
+
+def load_flux_read(coin: str, timeframe: str) -> Optional[dict[str, Any]]:
+    store = _load_flux_read_store()
+    key = _flux_read_key(coin, timeframe)
+    with _FLUX_READ_LOCK:
+        row = store["rows"].get(key)
+    if not isinstance(row, dict):
+        return None
+    merged = row.get("merged")
+    return merged if isinstance(merged, dict) else None
+
+
 def format_oracle_flux_prompt_block(flux: Optional[OracleFluxSnapshot]) -> str:
     """Inject live Flux snapshot when present; always prepend doctrine for Grok depth."""
     doctrine = oracle_flux_doctrine_block()
@@ -5537,6 +5731,20 @@ def format_oracle_flux_prompt_block(flux: Optional[OracleFluxSnapshot]) -> str:
         overlay_lines.append(f"Chop Strength: {flux.chop_strength:.0f} (higher = messier range)")
     if flux.direction_bias:
         overlay_lines.append(f"Flux directional bias: {flux.direction_bias}")
+    if flux.regime:
+        overlay_lines.append(f"Flux regime: {flux.regime} (RANGE / TREND / CHOP — gates STRONG when regime_gate is on)")
+    if flux.setup_state:
+        overlay_lines.append(f"Setup state: {flux.setup_state}")
+    if flux.vwap_bias:
+        overlay_lines.append(f"VWAP bias: {flux.vwap_bias}")
+    if flux.structure:
+        overlay_lines.append(f"Structure: {flux.structure}")
+    if flux.trend:
+        overlay_lines.append(f"Trend: {flux.trend}")
+    if flux.fluid_tf is True:
+        overlay_lines.append("Fluid TF profile: ON")
+    if flux.regime_gate is True:
+        overlay_lines.append("Regime gate STRONG: ON")
 
     oscillator_lines: list[str] = []
     if flux.flux_wave is not None:
@@ -6637,6 +6845,7 @@ async def health() -> dict[str, Any]:
                 ],
                 "review": ["POST /review"],
                 "chat": ["POST /chat"],
+                "flux_read": ["POST /flux_read", "GET /flux_read"],
                 "exchange_keys": [
                     "POST /exchange_keys",
                     "POST /exchange_keys/",
@@ -6682,6 +6891,66 @@ async def sync_alert_watch(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="levels must be a list.")
     alert_watch.upsert_watch(token, [row for row in levels if isinstance(row, dict)], mute_all)
     return {"success": True, "count": 0 if mute_all else len(levels)}
+
+
+def _flux_read_authorized(http_request: Request) -> bool:
+    if not _FLUX_READ_TOKEN:
+        return True
+    header = (http_request.headers.get("x-flux-read-token") or http_request.headers.get("authorization") or "").strip()
+    if header.lower().startswith("bearer "):
+        header = header[7:].strip()
+    return hmac.compare_digest(header, _FLUX_READ_TOKEN)
+
+
+@app.post("/flux_read")
+@app.post("/flux_read/")
+async def post_flux_read(http_request: Request) -> dict[str, Any]:
+    """Ingest FluxRead v1 JSON from TradingView alerts (webhook) or the app."""
+    if not _flux_read_authorized(http_request):
+        raise HTTPException(status_code=401, detail="Invalid Flux Read token.")
+    try:
+        body: Any = await http_request.json()
+    except Exception:
+        raw = (await http_request.body()).decode("utf-8", errors="replace").strip()
+        body = raw
+    payload = _unwrap_flux_read_payload(body)
+    if not payload:
+        raise HTTPException(status_code=400, detail="FluxRead JSON required (v=1).")
+    try:
+        row = upsert_flux_read(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    logger.info(
+        "flux_read_upsert coin=%s tf=%s layer=%s",
+        row.get("coin"),
+        row.get("timeframe"),
+        payload.get("layer"),
+    )
+    return {
+        "success": True,
+        "coin": row.get("coin"),
+        "timeframe": row.get("timeframe"),
+        "updated_at": row.get("updated_at"),
+        "oracle_flux": row.get("merged"),
+    }
+
+
+@app.get("/flux_read")
+@app.get("/flux_read/")
+async def get_flux_read(coin: str, timeframe: str = "1h") -> dict[str, Any]:
+    """Latest merged overlay + oscillator FluxRead for Analyze / Trade Setup."""
+    upper = _flux_normalize_symbol(coin)
+    if not upper:
+        raise HTTPException(status_code=400, detail="coin is required.")
+    merged = load_flux_read(upper, timeframe)
+    if not merged:
+        return {"success": True, "coin": upper, "timeframe": _flux_normalize_tf(timeframe), "oracle_flux": None}
+    return {
+        "success": True,
+        "coin": upper,
+        "timeframe": _flux_normalize_tf(timeframe),
+        "oracle_flux": merged,
+    }
 
 
 @app.get("/live_price")
@@ -6829,6 +7098,9 @@ async def _handle_analyze(
 
         derivatives = fetch_derivatives_snapshot(coin, spot_price=float(market["price"]))
         oracle_flux = extract_oracle_flux_from_request(request)
+        if oracle_flux is None:
+            stored_flux = load_flux_read(coin, request.timeframe)
+            oracle_flux = parse_oracle_flux(stored_flux)
 
         # User's chosen leverage: request value → client prompt → Citadel record → 5x default.
         effective_leverage, leverage_is_user_set = resolve_prompt_leverage(

@@ -1,7 +1,7 @@
 name: on_chain_oracle_ai
 description: "On-Chain Oracle AI"
 publish_to: 'none'
-version: 1.0.3+7
+version: 1.0.5+9
 
 environment:
   sdk: '>=3.5.0 <4.0.0'
