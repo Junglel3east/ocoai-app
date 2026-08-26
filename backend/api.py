@@ -4529,90 +4529,72 @@ def is_scalp_context(
 def oracle_flux_doctrine_block() -> str:
     """
     Oracle Flux + Flux Oscillator doctrine — master-level dual-layer framework for Grok.
-    TradingView: Oracle Flux PUB;mQP80cUC (overlay) | Oracle Flux Oscillator PUB;mUlI6Xj4 (pane)
+    TradingView: Oracle Flux (overlay = WHERE) | Oracle Flux Oscillator (pane = WHEN)
     """
     return """═══════════════════════════════════════
 ORACLE FLUX SYSTEM — DUAL-LAYER MASTERY (OVERLAY = WHERE, OSCILLATOR = WHEN)
 ═══════════════════════════════════════
-You run BOTH Oracle Flux (overlay, PUB;mQP80cUC) and the Flux Oscillator (pane, PUB;mUlI6Xj4) on every
-chart. They are ONE system read as two layers: the OVERLAY gives you WHERE (auto-Fib levels, EMA/structure
-state, signal flags, Score, Engines, Chop), the OSCILLATOR gives you WHEN (Flux Wave timing, Money Flow
-momentum, diamonds, pinch/rollover, divergence, OB/OS exhaustion). A master NEVER quotes one layer without
-cross-checking the other — location without timing is early, timing without location is noise. When live
-Flux values arrive in the user prompt, cite them. When they do not, infer BOTH layers from price action:
-Daily VWAP confluence, Fib reactions, Heikin Ashi quality, momentum divergence, and range/chop behavior
-exactly as Flux would score them.
+You run BOTH Oracle Flux (overlay) and the Flux Oscillator (pane) on every chart. They are ONE system:
+OVERLAY = WHERE / permission (anchored VWAPs, Fibs, HA, Oracle Score, Engines, Chop, STRONG BUY/SELL stamp).
+OSCILLATOR = WHEN (Flux Wave, Money Flow cloud, Fair Value mid-line, DIVERGENCE DIAMONDS).
+A master NEVER quotes one layer without cross-checking the other — location without timing is early,
+timing without location is noise. Cite live Flux Read values when present; otherwise infer BOTH layers
+from Daily VWAP, Fib reactions, HA quality, Wave-style momentum divergence, and CHOP/RANGE/TREND behavior.
 
-LAYER 1 — ORACLE FLUX OVERLAY (levels, structure, state — the WHERE):
-• Oracle Score (0–100): composite edge grade. 70+ aligned with HTF = high conviction; sub-50 or fighting
-  Daily/4H = downgrade hard or stand down. Score ramping across refreshes = building edge; decaying = fading.
-• Conviction % / Conviction label: Flux's graded confidence — fuse with your Overall Bias %; do not ignore
-  a 75%+ Flux Conviction when structure + derivatives agree.
-• Auto-Fibs (overlay-drawn): 0.236 / 0.382 / 0.5 / 0.618 / 0.786 off the live swing. Golden pocket
-  (0.618–0.65) hold + inflow = continuation long; 0.786 rejection at VWAP/OB = classic Flux short. A Fib
-  level is only actionable when the oscillator confirms the reaction (Wave turn, diamond, or divergence).
-• EMA stack / trend ribbon: EMA 5/20 alignment and slope = trend engine state. Price riding the stack with
-  clean HA bodies = continuation permission; EMA compression/flip at a Fib or VWAP = trend-change watch.
-• Heikin Ashi (Flux-integrated): clean bodies in trend direction = continuation; doji clusters at Fib/VWAP
-  = indecision / reversal watch — demand an oscillator event before acting on it.
-• STRONG BUY / STRONG SELL (overlay flags): high-priority triggers when aligned with HTF + Daily VWAP +
-  derivatives. Veto or ignore when they fight Daily/4H structure — never chase a STRONG BUY into HTF supply.
-• Engines (Trend, Momentum, Volume, Structure — when listed): all green = trend continuation permission;
-  mixed or red vs your directional call = conflict — name it and cut size or flat.
-• Chop Strength: range/chop index — high = messy two-way market; cap conviction, prefer stand-down or
-  tight scalp only with clear sweep trigger. Low chop + aligned Engines = trend permission.
-• Money Flow state: inflow = buyers lifting / longs adding; outflow = distribution / sellers hitting bids. Outflow +
-  rejection at Fib/VWAP = short fuel. Inflow + reclaim = long fuel.
-• VWAP confluence: Daily VWAP, Previous Day VWAP, weekly/monthly anchors — Flux weights these heavily.
-  Reclaim + inflow + Oracle Score ramp = long bias. Reject + outflow + 0.786 Fib = short bias.
+setup_state vocabulary (when present): TRIGGER = divergence diamond fired | TAKE = STRONG permission |
+WATCH = building / recent div | SYNCED = layers aligned | SKIP = CHOP stand-down | IDLE = no edge.
 
-LAYER 2 — FLUX OSCILLATOR (timing, momentum, exhaustion — the WHEN):
-• Flux Wave (momentum line vs Daily VWAP + Money Flow): your momentum truth line.
-  Cross up through zero = bullish impulse; rollover down through zero = bearish impulse. Crosses INSIDE
-  OB/OS zones outrank zero crosses — a bullish cross below -60 is a springboard, above +60 it is late.
-• OB/OS zones (±60 / ±80): +80 = extended, exhaustion watch; -80 = capitulation watch. Wave parked in an
-  extreme WITH the HTF trend = strength, not an auto-fade — only fade extremes at HTF levels with a
-  reversal print (diamond, divergence, or pinch).
-• Diamonds (reversal diamonds): highest-quality oscillator print. Diamond at ±80 + HTF level + divergence
-  = A+ reversal trigger; diamond mid-range without location = noise, ignore it.
-• Money Flow fill: expanding fill in trade direction = fuel; fill contracting while price pushes = move
-  running on fumes — tighten stops, stop adding.
-• Pinch dots / rollover dots: exhaustion markers — pinch at overbought + HTF resistance = fade fuel;
-  rollover at oversold + HTF support = bounce fuel. Cite when inferring exhaustion.
-• Oscillator STRONG BUY/SELL dots: LTF trigger confirmation — pair with overlay STRONG flags for A+ entries.
-• Divergence (regular/hidden): price vs Flux Wave / Money Flow. Regular bear at resistance + outflow =
-  distribution; hidden bull at support + inflow = squeeze setup. Hidden divergence is trend-continuation
-  fuel — grade it ABOVE regular divergence when it agrees with Daily/4H.
+LAYER 1 — ORACLE FLUX OVERLAY (WHERE / permission):
+• Oracle Score (0–100): 70+ aligned with HTF = high conviction; sub-50 or fighting Daily/4H = downgrade or stand down.
+• Conviction label: fuse with Overall Bias %; do not ignore a strong Flux conviction when structure + derivatives agree.
+• Auto-Fibs: 0.5 / 0.618 / 0.65 / 0.786. Golden pocket hold + inflow = continuation long; 0.786 rejection at
+  VWAP/OB = classic Flux short — only actionable when the oscillator confirms (Wave turn or divergence diamond).
+• Heikin Ashi: clean bodies = continuation permission; dojis at Fib/VWAP = wait for a WHEN print.
+• STRONG BUY / STRONG SELL: permission stamp on the price chart — HIGH priority when HTF + Daily VWAP aligned.
+  Veto when they fight Daily/4H. STRONG without a Wave turn / divergence diamond = "permission without timing".
+• Engines: all green = continuation permission; mixed vs your call = name the conflict, cut size.
+• Chop Strength + regime: CHOP = stand down / half size; RANGE = reverse setups only; TREND = continuation OK.
+  Regime gate ON means CHOP blocks STRONG; RANGE allows reverse STRONG only.
+• Money Flow: Inflow = long fuel on reclaim; Outflow = short fuel on rejection.
+• VWAP confluence: Daily / Prev Day / WTD anchors — reclaim + inflow + Score ramp = long; reject + outflow + 0.786 = short.
 
-DUAL-LAYER CONFLUENCE MATRIX (decision logic — apply on every read):
-• A+ LONG: golden-pocket/0.618 hold or VWAP reclaim + overlay STRONG BUY + inflow + Engines green + Wave
-  crossing up from ≤-60 (or buy diamond / hidden bull divergence) + low Chop, aligned Daily/4H → 75–90%.
-• A+ SHORT: 0.786 rejection at VWAP/OB + overlay STRONG SELL + outflow + Wave rolling over in OB (or sell
-  diamond / regular bear divergence) + low Chop, aligned Daily/4H → mirror grade.
-• Overlay signal WITHOUT oscillator confirmation = location without timing — wait for the Wave turn,
-  diamond, or divergence; call it "trigger pending", not a live trade.
-• Oscillator extreme AGAINST overlay trend = exhaustion warning — take profit / tighten stops on the trend
-  trade; it is NOT an auto-reversal without a diamond or divergence at an HTF level.
-• Layers CONFLICT (e.g. STRONG BUY flag but Wave rolling over in OB, or inflow but bear divergence) =
-  name the conflict explicitly, downgrade to MODERATE/WEAK, cut size or stand down.
-• Both layers agree but FIGHT Daily/4H = counter-trend — cap conviction at 45%, demand printed reversal
-  evidence (sweep + reclaim, displacement, funding flip) before any trade card.
-• High Chop degrades oscillator signals FIRST — in chop, only sweep-trigger scalps; ignore mid-range
-  diamonds and zero crosses.
+LAYER 2 — FLUX OSCILLATOR (WHEN — timing engine):
+• Flux Wave (primary vs signal): momentum truth. Cross up from OS (≤-60) = springboard long timing;
+  roll over in OB (≥+60) = short timing. Crosses INSIDE OB/OS outrank mid-range zero crosses.
+• Fair Value (white mid-line): timing VWAP of the pane — rising/trough with bull diamond = agree long;
+  falling/peak with bear diamond = agree short. fv_agree_buy / fv_agree_sell in live data = +conviction.
+• Money Flow cloud: expanding fill with the trade = fuel; contracting while price pushes = fumes — tighten, stop adding.
+• DIVERGENCE DIAMONDS (primary WHEN trigger — not old Cipher-style dots):
+  diamond field: div_bull / div_bull_elite / div_bear / div_bear_elite / *_watch / none.
+  Bull ◆ = regular bullish divergence at a confirmed low (WHEN long). Elite bull = higher conviction (blue).
+  Bear ◆ = regular bearish divergence at a confirmed high (WHEN short). Elite bear = higher conviction.
+  Hidden ◆ are OFF by default — prefer regular reversal diamonds. Mid-range diamond with no HTF/VWAP/Fib
+  location = noise — ignore it.
+• Divergence text (Bull-Recent / Bear-Swing / etc.): context for recent div state; diamond print outranks text alone.
+• Oscillator STRONG sync: when strong_buy/strong_sell appears on osc payload it mirrors overlay permission —
+  still require a WHEN event (diamond or Wave OS/OB cross) for A+ entries.
+
+DUAL-LAYER CONFLUENCE MATRIX (every read):
+• A+ LONG: VWAP reclaim or golden-pocket hold + overlay STRONG BUY (TAKE) + inflow + Engines green +
+  bull/elite bull divergence diamond (or Wave cross up from ≤-60) + Fair Value agree + low Chop / TREND → 75–90%.
+• A+ SHORT: 0.786 rejection at VWAP/OB + STRONG SELL + outflow + bear/elite bear diamond (or Wave roll in OB) +
+  Fair Value agree + low Chop → mirror grade.
+• Overlay STRONG WITHOUT diamond/Wave confirm = WHERE without WHEN — call "trigger pending", not a live trade.
+• Diamond WITHOUT location (no Fib/VWAP/structure) = WHEN without WHERE — noise; wait for permission.
+• Oscillator extreme AGAINST overlay trend = exhaustion / take-profit warning — NOT auto-reversal without
+  a divergence diamond at an HTF level.
+• Layers CONFLICT → name it, downgrade MODERATE/WEAK, cut size or STAND DOWN.
+• Both layers agree but fight Daily/4H = counter-trend — cap ~45%, demand sweep+reclaim / displacement / funding flip.
+• High Chop → degrade WHEN signals first; only sweep-trigger scalps; ignore mid-range diamonds and zero crosses.
 
 FLUX INTEGRATION RULES:
-• Lead **Key Drivers** with an "Oracle Flux Analysis" bullet that reads BOTH layers (overlay state + the
-  oscillator timing that confirms or denies it) when Flux data is present OR when you can infer a clear
-  Flux read from structure/VWAP/Fib/HA/momentum on the requested TF.
-• **Confluence Summary** must grade STRONG/MODERATE/WEAK using the dual-layer matrix (Score, Money Flow,
-  Engines, Chop, Wave, diamonds/divergence) fused with derivatives + liquidity — one decisive sentence.
-• **If I Were to Trade Today...**: Trigger must reference Flux events when relevant (STRONG flag,
-  0.786 Fib rejection, Flux Wave zero/OB-OS cross, diamond, pinch/rollover, divergence, VWAP reclaim + inflow).
-• High Chop Strength + conflicted Engines = "STAND DOWN" or half size — no debate.
-• Flux confirms HTF → add conviction. Flux fights HTF → HTF wins; name the veto explicitly.
-• Sharp trader tone: "Flux Score 78, inflow, Engines green, Wave curling up from -71 with a buy diamond —
-  STRONG BUY aligned with the Daily VWAP reclaim. Long above 94.2k; chop 62 so no runner fantasy."
-  Not a tutorial on what Flux is."""
+• Lead **Key Drivers** with "Oracle Flux Analysis" reading WHERE + WHEN (Score, MF, Engines, Chop/regime,
+  STRONG, Fib/VWAP, Wave, Fair Value, divergence diamond, setup_state).
+• **Confluence Summary**: one sentence STRONG/MODERATE/WEAK using dual-layer matrix + derivatives.
+• Trade trigger language: STRONG permission, 0.786 reject, VWAP reclaim, Wave OS/OB cross, divergence diamond,
+  Fair Value agree, setup_state TRIGGER/TAKE — never pinch/rollover dots (removed from Flux).
+• Sharp tone: "Score 78, inflow, Engines 3/3, Wave curling from -71 with div_bull_elite at Daily VWAP reclaim —
+  STRONG BUY permission + WHEN trigger. Long above 94.2k; chop 12, TREND — runner OK." Not a Flux tutorial."""
 
 
 def default_system_prompt(
@@ -4770,15 +4752,13 @@ RULE 2 — GOD-MODE CONFLUENCE STACK (deep integration, zero blind spots)
 • LIQUIDATION CLUSTERS & BOOK PRESSURE: where are stops stacked, where does the cascade accelerate,
   which side of the book is thin. Liq clusters are targets AND invalidation guides — price hunts them.
 • BTC/ETH LEAD (when relevant): risk-on/off for alts, correlation breaks, HTF veto from majors.
-• ORACLE FLUX + FLUX OSCILLATOR (PUB;mQP80cUC / PUB;mUlI6Xj4): CORE high-conviction framework — not optional
-  garnish. TWO layers, one system: overlay = WHERE (Score, Conviction, auto-Fibs — especially 0.786, EMA
-  stack, HA quality, Engines, STRONG BUY/SELL, Chop, Money Flow, VWAP confluence); oscillator = WHEN (Flux
-  Wave zero/OB-OS crosses, reversal diamonds, Money Flow fill, pinch/rollover dots, regular/hidden
-  divergence). NEVER read one layer without cross-checking the other — overlay signal without oscillator
-  timing = trigger pending; oscillator extreme against overlay trend = exhaustion warning, not auto-reversal.
-  Live Flux block in user prompt = cite values; no block = infer BOTH layers from structure/VWAP/Fib/HA/
-  momentum. STRONG flags are high-priority when HTF-aligned; veto when they fight Daily/4H. High Chop =
-  range/chop — cut conviction or stand down.
+• ORACLE FLUX + FLUX OSCILLATOR: CORE dual-layer framework — not optional garnish. Overlay = WHERE /
+  permission (Score, Conviction, auto-Fibs — especially 0.786, HA, Engines, STRONG BUY/SELL, Chop/regime,
+  Money Flow, VWAP confluence); oscillator = WHEN (Flux Wave OB/OS crosses, Fair Value mid-line,
+  DIVERGENCE DIAMONDS div_bull/div_bear/_elite, Money Flow cloud, regular divergence; hidden ◆ off by default).
+  NEVER read one layer without the other — STRONG without diamond/Wave = trigger pending; Wave extreme
+  against trend = exhaustion warning, not auto-reversal. Live Flux Read = cite; else infer BOTH layers.
+  STRONG flags high-priority when HTF-aligned; veto when they fight Daily/4H. High Chop = stand down.
 • PREMIUM BREVITY: Tight trader prose. No filler. Each **Key Drivers** bullet: 2–4 crisp sentences max.
   Do not repeat the same Mobula or derivatives numbers across bullets.
 
@@ -4797,7 +4777,7 @@ Weave derivatives into **Volume-Weighted Analysis**, **Market Structure**, and *
 
 **Confluence Summary** — EXACTLY one sentence. Grade STRONG / MODERATE / WEAK. Fuse structure + VWAP +
   momentum + derivatives + liquidity + Oracle Flux dual-layer (Score, Money Flow, Engines, Chop, STRONG
-  flags, Flux Wave, diamonds/divergence) — always.
+  permission, Flux Wave, Fair Value, divergence diamonds) — always.
 
 Derivatives OVERRIDE or CONFIRM technical bias: extreme positive funding + crowded longs = counter-long fuel;
 negative funding + rising OI + short liqs = squeeze blueprint; OI collapse after spike = move spent.
@@ -4850,9 +4830,9 @@ REPORT STRUCTURE — EXACT HEADINGS (Flutter — DO NOT rename or reorder)
 **Overall Bias**: [Mildly Bullish / Mildly Bearish / Neutral] (Confidence: XX%)
 
 **Key Drivers**:
-- Oracle Flux Analysis: Oracle Score, Conviction, Money Flow, Flux Wave, Engines, STRONG BUY/SELL, Chop
-  Strength, Fib rejections (0.786 key), VWAP confluence, pinch/rollover (oscillator), divergence — live
-  Flux values when block present; otherwise infer from structure/HA/VWAP on requested TF.
+- Oracle Flux Analysis: WHERE (Score, Conviction, Money Flow, Engines, STRONG permission, Chop/regime,
+  Fib/VWAP) + WHEN (Flux Wave, Fair Value, divergence diamond, setup_state) — live Flux Read when present;
+  otherwise infer from structure/HA/VWAP on requested TF.
 - Volume-Weighted Analysis: ...
 - Heikin Ashi Analysis: ...
 - Market Structure: ...
@@ -5080,17 +5060,15 @@ REQUIRED BEHAVIOR:
 • TECHNICAL DEPTH: Daily VWAP, Previous Day VWAP, weekly/monthly VWAP, order blocks, FVGs, BOS/CHOCH,
   premium/discount, previous highs/lows, fakeouts, displacement, HTF/LTF alignment, DEX vs CEX volume delta,
   liquidation clusters. BTC/ETH lead for alts — not "macro risk-on" stock talk.
-• ORACLE FLUX + FLUX OSCILLATOR (PUB;mQP80cUC / PUB;mUlI6Xj4): core high-conviction framework on every
-  chart read — two layers, one system. Overlay = WHERE: Oracle Score, Conviction, Money Flow (inflow/
-  outflow), auto-Fibs (0.786 key, golden pocket), EMA stack, HA quality, Engines, STRONG BUY/SELL, Chop
-  Strength, VWAP confluence. Oscillator = WHEN: Flux Wave zero/OB-OS (±60/±80) crosses, reversal diamonds,
-  Money Flow fill, pinch/rollover dots, regular/hidden divergence. Cross-check both before any call:
-  overlay level without oscillator timing = trigger pending; Wave extreme against the trend = exhaustion
-  warning, not auto-reversal — demand a diamond or divergence at an HTF level to fade. When [ORACLE FLUX]
-  live values are in context, cite them. When not, infer BOTH layers from VWAP/Fib/HA/momentum. STRONG
-  flags = high-priority when HTF-aligned; veto when fighting Daily/4H. High Chop = stand down or scalp only
-  (mid-range diamonds and zero crosses don't count in chop). Weave Flux into bias and levels — never a
-  standalone reason to trade without structure + derivatives backing it.
+• ORACLE FLUX + FLUX OSCILLATOR: core dual-layer on every chart read. Overlay = WHERE / permission:
+  Oracle Score, Conviction, Money Flow, auto-Fibs (0.786 key, golden pocket), HA, Engines, STRONG BUY/SELL,
+  Chop/regime, VWAP confluence. Oscillator = WHEN: Flux Wave OB/OS (±60/±80) crosses, Fair Value mid-line,
+  DIVERGENCE DIAMONDS (div_bull / div_bull_elite / div_bear / div_bear_elite), Money Flow cloud, regular
+  divergence (hidden ◆ off by default). Cross-check both: STRONG without diamond/Wave = trigger pending;
+  Wave extreme against trend = exhaustion, not auto-reversal — demand a divergence diamond at an HTF level
+  to fade. Cite live Flux Read when present; else infer BOTH layers. High Chop = stand down or scalp only
+  (mid-range diamonds and zero crosses don't count). Weave Flux into bias and levels — never trade Flux alone
+  without structure + derivatives.
 • LEVELS (when user wants a trade): Entry at $X, TP1 (40%) at $X, TP2 (60%) at $X, SL at $X (R:R X.X:1).
   TP1 = 40% of position (min {MIN_RR_TP1:.1f}:1 R:R, target {TARGET_RR_TP1:.1f}:1+). TP2 = 60% runner.
   SL = structural invalidation beyond sweep/OB/Daily VWAP.
@@ -5164,6 +5142,8 @@ _FLUX_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "diamond": (
         "diamond",
         "diamonds",
+        "divergence_diamond",
+        "divergenceDiamond",
         "reversal_diamond",
         "reversalDiamond",
         "diamond_signal",
@@ -5180,6 +5160,9 @@ _FLUX_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
         "oscillator_state",
         "oscillatorState",
     ),
+    "fair_value": ("fair_value", "fairValue", "fv", "flux_fair_value", "fluxFairValue"),
+    "fv_agree_buy": ("fv_agree_buy", "fvAgreeBuy", "fair_value_agree_buy"),
+    "fv_agree_sell": ("fv_agree_sell", "fvAgreeSell", "fair_value_agree_sell"),
 }
 
 
@@ -5203,6 +5186,9 @@ class OracleFluxSnapshot:
     diamond: Optional[str] = None
     divergence: Optional[str] = None
     oscillator_zone: Optional[str] = None
+    fair_value: Optional[float] = None
+    fv_agree_buy: Optional[bool] = None
+    fv_agree_sell: Optional[bool] = None
     regime: Optional[str] = None
     setup_state: Optional[str] = None
     vwap_bias: Optional[str] = None
@@ -5230,6 +5216,9 @@ class OracleFluxSnapshot:
                 bool(self.diamond),
                 bool(self.divergence),
                 bool(self.oscillator_zone),
+                self.fair_value is not None,
+                self.fv_agree_buy is True,
+                self.fv_agree_sell is True,
                 bool(self.regime),
                 bool(self.setup_state),
                 bool(self.vwap_bias),
@@ -5425,6 +5414,9 @@ def parse_oracle_flux(raw: Any) -> Optional[OracleFluxSnapshot]:
     snap.oscillator_zone = _flux_clean_text(
         _flux_first_value(raw, *_FLUX_FIELD_ALIASES["oscillator_zone"])
     )
+    snap.fair_value = _flux_coerce_float(_flux_first_value(raw, *_FLUX_FIELD_ALIASES["fair_value"]))
+    snap.fv_agree_buy = _flux_coerce_bool(_flux_first_value(raw, *_FLUX_FIELD_ALIASES["fv_agree_buy"]))
+    snap.fv_agree_sell = _flux_coerce_bool(_flux_first_value(raw, *_FLUX_FIELD_ALIASES["fv_agree_sell"]))
     snap.regime = _flux_clean_text(_flux_first_value(raw, *_FLUX_FIELD_ALIASES["regime"]))
     snap.setup_state = _flux_clean_text(_flux_first_value(raw, *_FLUX_FIELD_ALIASES["setup_state"]))
     snap.vwap_bias = _flux_clean_text(_flux_first_value(raw, *_FLUX_FIELD_ALIASES["vwap_bias"]))
@@ -5467,6 +5459,12 @@ def _flux_dict_has_markers(data: dict[str, Any]) -> bool:
         "divergence",
         "oscillator_zone",
         "oscillatorzone",
+        "fair_value",
+        "fairvalue",
+        "fv_agree_buy",
+        "fvagreebuy",
+        "fv_agree_sell",
+        "fvagreesell",
         "regime",
         "setup_state",
         "setupstate",
@@ -5694,19 +5692,19 @@ def format_oracle_flux_prompt_block(flux: Optional[OracleFluxSnapshot]) -> str:
     if flux is None or not flux.has_signal():
         return (
             "═══ ORACLE FLUX — LIVE SNAPSHOT NOT PROVIDED (infer Flux read from structure) ═══\n"
-            "Charts run Oracle Flux PUB;mQP80cUC + Flux Oscillator PUB;mUlI6Xj4. No live Flux payload "
-            "in this request — infer Oracle Score, Money Flow, Flux Wave, Engines, Chop, STRONG flags, "
-            "Fib rejections, and VWAP confluence from price action on the requested TF. Apply full Flux "
-            "doctrine below.\n\n"
+            "Charts run Oracle Flux (overlay WHERE) + Flux Oscillator (pane WHEN). No live Flux payload "
+            "in this request — infer Oracle Score, Money Flow, Flux Wave, Fair Value, Engines, Chop/regime, "
+            "STRONG permission, divergence diamonds, Fib rejections, and VWAP confluence from price action "
+            "on the requested TF. Apply full Flux doctrine below.\n\n"
             f"{doctrine}\n\n"
         )
 
     lines = [
-        "═══ ORACLE FLUX — LIVE CHART READ (PUB;mQP80cUC + PUB;mUlI6Xj4) — CORE CONVICTION INPUT ═══",
+        "═══ ORACLE FLUX — LIVE CHART READ (OVERLAY WHERE + OSCILLATOR WHEN) — CORE CONVICTION INPUT ═══",
         "Treat these as authoritative Flux values. Fuse with HTF structure + derivatives; HTF veto wins on conflict.",
         "Weave into Oracle Flux Analysis, Confluence Summary, and trade trigger (e.g. \"Score 74 + 0.786 Fib "
-        "rejection + Money Flow outflow + STRONG SELL + Wave rolling over in OB → high-conviction short\").",
-        "High Chop Strength = range/chop — downgrade conviction or stand down unless clean sweep trigger.",
+        "rejection + outflow + STRONG SELL + div_bear_elite → high-conviction short\").",
+        "High Chop / CHOP regime = stand down unless clean sweep trigger. setup_state TRIGGER/TAKE = act; SKIP = flat.",
     ]
 
     overlay_lines: list[str] = []
@@ -5721,9 +5719,9 @@ def format_oracle_flux_prompt_block(flux: Optional[OracleFluxSnapshot]) -> str:
     if flux.nearest_fib:
         overlay_lines.append(f"Nearest Fib level: {flux.nearest_fib} (rejection/hold context)")
     if flux.strong_buy is True:
-        overlay_lines.append("STRONG BUY: active on chart")
+        overlay_lines.append("STRONG BUY: active — WHERE permission stamp")
     if flux.strong_sell is True:
-        overlay_lines.append("STRONG SELL: active on chart")
+        overlay_lines.append("STRONG SELL: active — WHERE permission stamp")
     if flux.engines:
         engine_text = " | ".join(f"{name}: {state}" for name, state in flux.engines.items())
         overlay_lines.append(f"Engines: {engine_text}")
@@ -5732,9 +5730,11 @@ def format_oracle_flux_prompt_block(flux: Optional[OracleFluxSnapshot]) -> str:
     if flux.direction_bias:
         overlay_lines.append(f"Flux directional bias: {flux.direction_bias}")
     if flux.regime:
-        overlay_lines.append(f"Flux regime: {flux.regime} (RANGE / TREND / CHOP — gates STRONG when regime_gate is on)")
+        overlay_lines.append(f"Flux regime: {flux.regime} (CHOP / RANGE / TREND — gates STRONG when regime_gate is on)")
     if flux.setup_state:
-        overlay_lines.append(f"Setup state: {flux.setup_state}")
+        overlay_lines.append(
+            f"Setup state: {flux.setup_state} (TRIGGER=diamond WHEN | TAKE=STRONG permission | SKIP=CHOP | IDLE=no edge)"
+        )
     if flux.vwap_bias:
         overlay_lines.append(f"VWAP bias: {flux.vwap_bias}")
     if flux.structure:
@@ -5753,31 +5753,42 @@ def format_oracle_flux_prompt_block(flux: Optional[OracleFluxSnapshot]) -> str:
         )
     if flux.wave_state:
         oscillator_lines.append(f"Wave state: {flux.wave_state}")
+    if flux.fair_value is not None:
+        oscillator_lines.append(f"Fair Value mid-line: {flux.fair_value:+.1f} (pane timing VWAP)")
+    if flux.fv_agree_buy is True:
+        oscillator_lines.append("Fair Value agree BUY: yes (+conviction with bull diamond / OS cross)")
+    if flux.fv_agree_sell is True:
+        oscillator_lines.append("Fair Value agree SELL: yes (+conviction with bear diamond / OB roll)")
     if flux.diamond:
-        oscillator_lines.append(f"Reversal diamond: {flux.diamond} (A+ only at HTF level + divergence)")
+        oscillator_lines.append(
+            f"Divergence diamond (WHEN): {flux.diamond} "
+            "(div_bull / div_bull_elite / div_bear / div_bear_elite — A+ only with HTF/VWAP/Fib location)"
+        )
     if flux.divergence:
-        oscillator_lines.append(f"Divergence: {flux.divergence} (hidden = continuation fuel; regular = reversal watch)")
+        oscillator_lines.append(
+            f"Divergence state: {flux.divergence} (regular preferred; hidden ◆ off by default)"
+        )
     if flux.oscillator_zone:
         oscillator_lines.append(f"Oscillator zone: {flux.oscillator_zone}")
 
     if overlay_lines:
-        lines.append("— OVERLAY (WHERE — levels/structure/state):")
+        lines.append("— OVERLAY (WHERE — levels / structure / STRONG permission):")
         lines.extend(overlay_lines)
     if oscillator_lines:
-        lines.append("— OSCILLATOR (WHEN — timing/momentum/exhaustion):")
+        lines.append("— OSCILLATOR (WHEN — Wave / Fair Value / divergence diamonds):")
         lines.extend(oscillator_lines)
         lines.append(
-            "Cross-check layers NOW: overlay signal without oscillator confirmation = trigger pending; "
-            "oscillator extreme against overlay trend = exhaustion warning, not auto-reversal."
+            "Cross-check NOW: STRONG without diamond/Wave = trigger pending; "
+            "diamond without Fib/VWAP location = noise; Wave extreme against trend = exhaustion, not auto-reversal."
         )
     elif overlay_lines:
         lines.append(
-            "No live oscillator fields in this payload — infer Flux Wave posture, diamonds, and divergence "
+            "No live oscillator fields — infer Flux Wave, Fair Value posture, and divergence diamonds "
             "from momentum/HA/volume on the requested TF before grading conviction."
         )
 
     lines.append(
-        "Mandatory: Oracle Flux Analysis bullet in **Key Drivers** reading BOTH layers + "
+        "Mandatory: Oracle Flux Analysis bullet in **Key Drivers** reading BOTH WHERE + WHEN + "
         "dual-layer-weighted **Confluence Summary**."
     )
     lines.append("")
@@ -5833,9 +5844,9 @@ Deliver using this **exact structure** (headings unchanged — maximum depth ins
 State HTF bias, HTF veto, and whether derivatives confirm or fight the read.
 
 **Key Drivers**:
-- Oracle Flux Analysis: Oracle Score, Conviction, Money Flow, Flux Wave, Engines, STRONG BUY/SELL, Chop
-  Strength, Fib rejections (0.786 key), VWAP confluence, pinch/rollover, divergence — cite live Flux when
-  in prompt; otherwise infer from structure/HA/VWAP on requested TF.
+- Oracle Flux Analysis: WHERE (Score, Conviction, Money Flow, Engines, STRONG permission, Chop/regime,
+  Fib/VWAP) + WHEN (Flux Wave, Fair Value, divergence diamond, setup_state) — cite live Flux when in
+  prompt; otherwise infer from structure/HA/VWAP on requested TF.
 - Volume-Weighted Analysis: Daily VWAP, Previous Day VWAP, weekly / monthly VWAP — premium vs discount,
   acceptance vs rejection, cluster zones (~0.3–0.8%), mean-reversion vs trend continuation. Weave
   on-chain/CEX flow and derivatives positioning here when relevant.
@@ -6115,8 +6126,8 @@ Direction: {direction_instruction(direction)}
 ═══ LIVE MARKET DATA — ORDER OF AUTHORITY (synthesize; never list metrics alone) ═══
 {mobula_block}{coingecko_block}{market_fallback_note}{derivatives_block}
 Cross-check: Mobula liquidity + volume delta ↔ CoinGecko CEX vol ↔ funding/OI/L-S/liqs ↔ Daily VWAP/structure
-on {timeframe} ↔ Oracle Flux dual-layer (overlay: Score, Money Flow, Engines, Chop, STRONG flags, Fib/VWAP
-confluence ↔ oscillator: Flux Wave, diamonds, divergence, OB/OS, pinch/rollover — layers must agree or name the conflict).
+on {timeframe} ↔ Oracle Flux dual-layer (overlay WHERE: Score, Money Flow, Engines, Chop, STRONG permission,
+Fib/VWAP ↔ oscillator WHEN: Flux Wave, Fair Value, divergence diamonds, OB/OS — layers must agree or name the conflict).
 Flux block above (live or inferred) must shape Oracle Flux Analysis, conviction %, and trade trigger.
 Weave Mobula liquidity and derivatives into **Volume-Weighted Analysis** and **Market Structure** — never
 as a separate Liquidity & Sentiment heading.
@@ -6124,10 +6135,10 @@ Oracle Vision / Desk conviction must be data-backed — no generic % without cit
 
 ═══ ANALYTICAL DEPTH CHECKLIST (Key Drivers — tight stream-trader prose) ═══
 • Oracle Flux first — read BOTH layers: overlay WHERE (Score, Conviction, Money Flow, Engines,
-  STRONG BUY/SELL, Chop Strength, 0.786/0.618 Fib rejections, EMA stack, VWAP confluence) then oscillator
-  WHEN (Flux Wave zero/OB-OS cross, diamonds, pinch/rollover, regular/hidden divergence) — live values or
-  inferred read. State whether the layers CONFIRM each other or CONFLICT; a level without timing is
-  trigger-pending, an oscillator extreme against trend is exhaustion, not auto-reversal.
+  STRONG BUY/SELL permission, Chop/regime, 0.786/0.618 Fib, VWAP) then oscillator WHEN (Flux Wave OB/OS
+  cross, Fair Value, divergence diamond div_bull/div_bear/_elite, setup_state TRIGGER/TAKE) — live or
+  inferred. State CONFIRM vs CONFLICT; STRONG without WHEN = trigger-pending; Wave extreme against trend
+  = exhaustion, not auto-reversal.
 • MTF: Weekly/Daily/4h → {timeframe} → LTF trigger. ALIGNED or CONFLICTED — name HTF veto if present.
 • TREND LAW: never fight the Daily/4H blindly — counter-trend demands printed reversal evidence
   (sweep + reclaim, displacement, funding flip) or the call is trade-with-trend / stand down.
