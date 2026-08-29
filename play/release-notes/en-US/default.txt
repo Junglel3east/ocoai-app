@@ -1,6 +1,6 @@
-What's new in 1.0.5:
-• Starting capital — set your bankroll in Settings; War Room AI Alpha sizes from it
-• Setup Guardians — Alerts watch entry, stop, and targets on open trades
-• Close trades at your real exit price (optional fees) for accurate Alpha
-• First-run desk setup: venue, bankroll, and watchlist
-• Share your War Room snapshot to X
+What's new in 1.0.5 (build 11):
+• Starting capital rejects $0 — bankroll must be at least $100
+• Trade Setup / Analyze reports render clean headings (no raw **)
+• Custom price alerts explain invalid / empty prices
+• About shows the live app version and build number
+• War Room AI Alpha, Setup Guardians, close-at-real-exit, first-run desk setup

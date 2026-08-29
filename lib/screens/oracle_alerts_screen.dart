@@ -452,11 +452,41 @@ class _PriceAlertEditorSheetState extends State<_PriceAlertEditorSheet> {
   String _coin = 'BTC';
   bool _above = true;
   final _price = TextEditingController();
+  String? _priceError;
 
   @override
   void dispose() {
     _price.dispose();
     super.dispose();
+  }
+
+  void _arm() {
+    final raw = _price.text.trim();
+    if (raw.isEmpty) {
+      setState(() => _priceError = 'Enter a price above \$0.');
+      return;
+    }
+    final value = double.tryParse(raw);
+    if (value == null || value <= 0) {
+      setState(() => _priceError = 'Enter a price above \$0.');
+      return;
+    }
+    setState(() => _priceError = null);
+    Navigator.pop(
+      context,
+      OracleAlert(
+        id: DateTime.now().microsecondsSinceEpoch.toString(),
+        kind: OracleAlertKind.price,
+        coin: _coin,
+        level: 'custom',
+        title: '$_coin price',
+        body: '',
+        status: OracleAlertStatus.armed,
+        targetPrice: value,
+        above: _above,
+        createdAt: DateTime.now(),
+      ),
+    );
   }
 
   @override
@@ -502,29 +532,18 @@ class _PriceAlertEditorSheetState extends State<_PriceAlertEditorSheet> {
             controller: _price,
             keyboardType: const TextInputType.numberWithOptions(decimal: true),
             inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))],
-            decoration: const InputDecoration(labelText: 'Price (USD)', prefixText: '\$ '),
+            onChanged: (_) {
+              if (_priceError != null) setState(() => _priceError = null);
+            },
+            decoration: InputDecoration(
+              labelText: 'Price (USD)',
+              prefixText: '\$ ',
+              errorText: _priceError,
+            ),
           ),
           const SizedBox(height: 16),
           FilledButton(
-            onPressed: () {
-              final value = double.tryParse(_price.text.trim());
-              if (value == null || value <= 0) return;
-              Navigator.pop(
-                context,
-                OracleAlert(
-                  id: DateTime.now().microsecondsSinceEpoch.toString(),
-                  kind: OracleAlertKind.price,
-                  coin: _coin,
-                  level: 'custom',
-                  title: '$_coin price',
-                  body: '',
-                  status: OracleAlertStatus.armed,
-                  targetPrice: value,
-                  above: _above,
-                  createdAt: DateTime.now(),
-                ),
-              );
-            },
+            onPressed: _arm,
             style: FilledButton.styleFrom(
               backgroundColor: const Color(0xFF00BFFF),
               foregroundColor: Colors.black,

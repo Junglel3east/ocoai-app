@@ -62,6 +62,10 @@ android {
             }
             isMinifyEnabled = false
             isShrinkResources = false
+            // Avoid Flutter Windows post-check failure when stripping native debug symbols.
+            ndk {
+                debugSymbolLevel = "NONE"
+            }
         }
     }
 }

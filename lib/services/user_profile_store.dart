@@ -165,7 +165,8 @@ abstract final class TradingVenueStore {
 /// Starting bankroll for War Room Performance Snapshot / AI Alpha.
 abstract final class StartingCapitalStore {
   static const _prefKey = 'starting_capital_usd';
-  static const double minUsd = 0;
+  /// Reject $0 — War Room sizing is meaningless without a positive bankroll.
+  static const double minUsd = 100;
   static const double maxUsd = 1000000;
   static const double defaultUsd = 10000;
 
@@ -177,6 +178,10 @@ abstract final class StartingCapitalStore {
     final raw = prefs.getDouble(_prefKey);
     capitalUsd = (raw ?? defaultUsd).clamp(minUsd, maxUsd);
     notifier.value = capitalUsd;
+    // Migrate legacy $0 / sub-min saves so Alpha never runs on an empty bankroll.
+    if (raw != null && raw < minUsd) {
+      await prefs.setDouble(_prefKey, capitalUsd);
+    }
   }
 
   static Future<void> save(double value) async {

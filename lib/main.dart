@@ -776,6 +776,14 @@ class _FullScreenChartScreenState extends State<FullScreenChartScreen> {
 const String kReportDisclaimer =
     '**Disclaimer**: This is for informational and educational purposes only. Not financial advice. Always DYOR.';
 
+/// Keep in sync with `pubspec.yaml` version (`name+build`).
+abstract final class AppVersionInfo {
+  static const versionName = '1.0.5';
+  static const buildNumber = '11';
+  static const label = 'v$versionName';
+  static const aboutLine = 'Version $versionName (Build $buildNumber)';
+}
+
 /// Builds the Grok system prompt enforced for analysis and trade setup outputs.
 String grokSystemPrompt({required String mode}) {
   const sharedRules = '''
@@ -9215,7 +9223,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   _ProfileMenuTile(
                     icon: Icons.info_outline,
                     title: 'About',
-                    subtitle: 'On-Chain Oracle AI v1.0.2',
+                    subtitle: 'On-Chain Oracle AI ${AppVersionInfo.label}',
                     onTap: () => _open(context, const AboutScreen()),
                   ),
                 ],
@@ -9967,6 +9975,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   double _startingCapital = StartingCapitalStore.capitalUsd;
   late final TextEditingController _capitalController;
   bool _editingCapitalText = false;
+  String? _capitalError;
 
   @override
   void initState() {
@@ -10022,10 +10031,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _commitCapital(double value) async {
+    if (value < StartingCapitalStore.minUsd) {
+      final minLabel = StartingCapitalStore.minUsd.round();
+      if (!mounted) return;
+      setState(() {
+        _capitalError = 'Enter at least \$$minLabel — War Room needs a real bankroll.';
+        _startingCapital = StartingCapitalStore.minUsd;
+        _capitalController.text = _formatCapitalInput(_startingCapital);
+      });
+      await StartingCapitalStore.save(StartingCapitalStore.minUsd);
+      return;
+    }
     final next = value.clamp(StartingCapitalStore.minUsd, StartingCapitalStore.maxUsd);
     await StartingCapitalStore.save(next);
     if (!mounted) return;
     setState(() {
+      _capitalError = null;
       _startingCapital = StartingCapitalStore.capitalUsd;
       if (!_editingCapitalText) {
         _capitalController.text = _formatCapitalInput(_startingCapital);
@@ -10224,25 +10245,42 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     onChanged: (raw) {
                       final parsed = _parseCapitalInput(raw);
                       if (parsed == null) return;
+                      if (parsed < StartingCapitalStore.minUsd) {
+                        setState(() {
+                          _capitalError =
+                              'Enter at least \$${StartingCapitalStore.minUsd.round()} — War Room needs a real bankroll.';
+                        });
+                        return;
+                      }
                       final next = parsed.clamp(StartingCapitalStore.minUsd, StartingCapitalStore.maxUsd);
-                      setState(() => _startingCapital = next);
+                      setState(() {
+                        _capitalError = null;
+                        _startingCapital = next;
+                      });
                       StartingCapitalStore.save(next);
                     },
                     onTapOutside: (_) {
                       _editingCapitalText = false;
-                      _commitCapital(_startingCapital);
+                      _commitCapital(_parseCapitalInput(_capitalController.text) ?? _startingCapital);
                       FocusManager.instance.primaryFocus?.unfocus();
                     },
                     onEditingComplete: () {
                       _editingCapitalText = false;
-                      _commitCapital(_startingCapital);
+                      _commitCapital(_parseCapitalInput(_capitalController.text) ?? _startingCapital);
                       FocusScope.of(context).unfocus();
                     },
                     onSubmitted: (_) {
                       _editingCapitalText = false;
-                      _commitCapital(_startingCapital);
+                      _commitCapital(_parseCapitalInput(_capitalController.text) ?? _startingCapital);
                     },
                   ),
+                  if (_capitalError != null) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      _capitalError!,
+                      style: const TextStyle(color: Color(0xFFFF5252), fontSize: 12.5, height: 1.35),
+                    ),
+                  ],
                   const SizedBox(height: 8),
                   SliderTheme(
                     data: SliderTheme.of(context).copyWith(
@@ -10259,6 +10297,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       onChanged: (v) {
                         _editingCapitalText = false;
                         setState(() {
+                          _capitalError = null;
                           _startingCapital = v;
                           _capitalController.text = _formatCapitalInput(v);
                         });
@@ -10269,7 +10308,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Text('\$0', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                      Text(
+                        '\$${StartingCapitalStore.minUsd.round()}',
+                        style: TextStyle(fontSize: 11, color: Colors.grey[600]),
+                      ),
                       Text('\$1,000,000', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
                     ],
                   ),
@@ -10614,9 +10656,6 @@ class HelpSupportScreen extends StatelessWidget {
 class AboutScreen extends StatelessWidget {
   const AboutScreen({super.key});
 
-  static const _appVersion = '1.0.2';
-  static const _buildNumber = '4';
-
   @override
   Widget build(BuildContext context) {
     return _ProfileDetailScaffold(
@@ -10667,7 +10706,7 @@ class AboutScreen extends StatelessWidget {
                   ),
                   const SizedBox(height: 6),
                   Text(
-                    'Version $_appVersion (Build $_buildNumber)',
+                    AppVersionInfo.aboutLine,
                     style: TextStyle(fontSize: 14, color: Colors.grey[500]),
                   ),
                 ],
@@ -10883,7 +10922,7 @@ class _AnalysisReportScreenState extends State<AnalysisReportScreen> {
                       tradeSetupTimeframe: '1h',
                     ),
                   const SizedBox(height: _AppSpacing.section),
-                  Text(report, style: const TextStyle(fontSize: 16, height: 1.65)),
+                  OracleReportText(report),
                   const SizedBox(height: _AppSpacing.section),
                   PushToXButton(
                     initialText: XShareService.formatAnalysisPost(
@@ -10902,6 +10941,71 @@ class _AnalysisReportScreenState extends State<AnalysisReportScreen> {
               ),
             ),
     );
+  }
+}
+
+/// Renders Oracle Analyze / Trade Setup reports — bold headings without raw `**` markers.
+class OracleReportText extends StatelessWidget {
+  final String report;
+
+  const OracleReportText(this.report, {super.key});
+
+  static final _headingLine = RegExp(r'^\*\*(.+?)\*\*\s*$');
+  static final _boldInline = RegExp(r'\*\*(.+?)\*\*');
+
+  @override
+  Widget build(BuildContext context) {
+    final base = TextStyle(fontSize: 16, height: 1.65, color: Colors.grey[100]);
+    return SelectableText.rich(
+      TextSpan(style: base, children: _buildSpans(report, base)),
+    );
+  }
+
+  static List<InlineSpan> _buildSpans(String raw, TextStyle base) {
+    final out = <InlineSpan>[];
+    final lines = raw.replaceAll('\r\n', '\n').split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      if (i > 0) out.add(const TextSpan(text: '\n'));
+      final line = lines[i];
+      final heading = _headingLine.firstMatch(line);
+      if (heading != null) {
+        out.add(
+          TextSpan(
+            text: heading.group(1),
+            style: base.copyWith(
+              fontWeight: FontWeight.w800,
+              fontSize: 17,
+              color: const Color(0xFF00BFFF),
+            ),
+          ),
+        );
+        continue;
+      }
+      out.addAll(_inlineSpans(line, base));
+    }
+    return out;
+  }
+
+  static List<InlineSpan> _inlineSpans(String line, TextStyle base) {
+    final out = <InlineSpan>[];
+    var start = 0;
+    for (final match in _boldInline.allMatches(line)) {
+      if (match.start > start) {
+        out.add(TextSpan(text: line.substring(start, match.start)));
+      }
+      out.add(
+        TextSpan(
+          text: match.group(1),
+          style: base.copyWith(fontWeight: FontWeight.w700),
+        ),
+      );
+      start = match.end;
+    }
+    if (start < line.length) {
+      out.add(TextSpan(text: line.substring(start)));
+    }
+    if (out.isEmpty) out.add(const TextSpan(text: ''));
+    return out;
   }
 }
 
@@ -11489,7 +11593,7 @@ class _TradeSetupResultScreenState extends State<TradeSetupResultScreen> {
                       premiumFrame: true,
                     ),
                   const SizedBox(height: _AppSpacing.section),
-                  Text(report, style: const TextStyle(fontSize: 16, height: 1.65)),
+                  OracleReportText(report),
                   const SizedBox(height: _AppSpacing.section),
                   SendToCitadelButton(
                     coin: resolvedCoin,
