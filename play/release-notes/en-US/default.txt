@@ -1,6 +1,4 @@
-What's new in 1.0.5 (build 11):
-• Starting capital rejects $0 — bankroll must be at least $100
-• Trade Setup / Analyze reports render clean headings (no raw **)
-• Custom price alerts explain invalid / empty prices
-• About shows the live app version and build number
-• War Room AI Alpha, Setup Guardians, close-at-real-exit, first-run desk setup
+What's new in 1.0.5 (build 13):
+• Fix: sign back in after Sign Out (account lockout on some Android devices)
+• Confirm before Sign Out
+• Starting capital min $100, clean report Markdown, alert price errors, live About version

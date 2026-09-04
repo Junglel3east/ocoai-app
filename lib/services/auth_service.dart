@@ -11,8 +11,11 @@ import 'user_profile_store.dart';
 
 /// Local email/password auth with secure storage and optional biometrics.
 ///
-/// Credentials are mirrored to SharedPreferences so sign-in still works when
-/// encrypted secure storage hangs or fails (common on sideload / Samsung builds).
+/// Credential email + password hash are **SharedPreferences-first** (always written
+/// and preferred on read). FlutterSecureStorage is a secondary mirror — preferring
+/// secure storage first caused lockouts on some Android OEMs (Sharp/Samsung) when
+/// the encrypted store returned a stale/empty hash while prefs still had the real
+/// account. Session / remember / biometric flags still use dual write.
 abstract final class AuthService {
   static const _sessionKey = 'auth_session_active';
   static const _registeredEmailKey = 'auth_registered_email';
@@ -63,8 +66,53 @@ abstract final class AuthService {
     }
   }
 
+  /// Email + password hash — prefs first, then heal secure storage from prefs.
+  static Future<({String? email, String? hash})> _readCredentials() async {
+    final prefs = await SharedPreferences.getInstance();
+    var email = prefs.getString('$_mirrorPrefix$_registeredEmailKey')?.trim();
+    var hash = prefs.getString('$_mirrorPrefix$_passwordHashKey')?.trim();
+
+    String? secureEmail;
+    String? secureHash;
+    try {
+      secureEmail = (await _storage.read(key: _registeredEmailKey).timeout(_secureTimeout))?.trim();
+      secureHash = (await _storage.read(key: _passwordHashKey).timeout(_secureTimeout))?.trim();
+    } catch (e) {
+      debugPrint('[AuthService] credential secure read failed: $e');
+    }
+
+    if (email == null || email.isEmpty) {
+      email = (secureEmail != null && secureEmail.isNotEmpty) ? secureEmail : null;
+    }
+    if (hash == null || hash.isEmpty) {
+      hash = (secureHash != null && secureHash.isNotEmpty) ? secureHash : null;
+    }
+
+    // Heal either layer so the next launch is consistent.
+    if (email != null && email.isNotEmpty && hash != null && hash.isNotEmpty) {
+      final prefsEmail = prefs.getString('$_mirrorPrefix$_registeredEmailKey');
+      final prefsHash = prefs.getString('$_mirrorPrefix$_passwordHashKey');
+      if (prefsEmail != email || prefsHash != hash) {
+        await prefs.setString('$_mirrorPrefix$_registeredEmailKey', email);
+        await prefs.setString('$_mirrorPrefix$_passwordHashKey', hash);
+      }
+      if (secureEmail != email || secureHash != hash) {
+        try {
+          await _storage.write(key: _registeredEmailKey, value: email).timeout(_secureTimeout);
+          await _storage.write(key: _passwordHashKey, value: hash).timeout(_secureTimeout);
+        } catch (e) {
+          debugPrint('[AuthService] credential heal to secure failed: $e');
+        }
+      }
+    }
+
+    return (email: email, hash: hash);
+  }
+
   static Future<void> init() async {
     await UserProfileStore.load();
+    // Reconcile any OEM desync before splash decides login vs home.
+    await _readCredentials();
   }
 
   static String _hashPassword(String password) {
@@ -87,13 +135,16 @@ abstract final class AuthService {
 
   static Future<String?> getRememberedEmail() async {
     if (!await isRememberMeEnabled()) return null;
-    return await _secureRead(_registeredEmailKey);
+    final creds = await _readCredentials();
+    return creds.email;
   }
 
   static Future<bool> hasRegisteredAccount() async {
-    final email = await _secureRead(_registeredEmailKey);
-    final hash = await _secureRead(_passwordHashKey);
-    return email != null && email.isNotEmpty && hash != null && hash.isNotEmpty;
+    final creds = await _readCredentials();
+    return creds.email != null &&
+        creds.email!.isNotEmpty &&
+        creds.hash != null &&
+        creds.hash!.isNotEmpty;
   }
 
   static Future<bool> canUseBiometrics() async {
@@ -154,7 +205,8 @@ abstract final class AuthService {
 
     await _secureWrite(_sessionKey, 'true');
     await _syncProfileFromStorage();
-    final email = await _secureRead(_registeredEmailKey);
+    final creds = await _readCredentials();
+    final email = creds.email;
     if (email != null && email.isNotEmpty) {
       try {
         await AppApiKeyService.ensureKey(email: email).timeout(_secureTimeout);
@@ -172,21 +224,22 @@ abstract final class AuthService {
     bool enableBiometric = false,
   }) async {
     final normalizedEmail = email.trim().toLowerCase();
+    final normalizedPassword = password.trim();
     if (!UserProfileStore.isValidEmail(normalizedEmail)) {
       return AuthResult.failure('Enter a valid email address.');
     }
-    if (password.length < 8) {
+    if (normalizedPassword.length < 8) {
       return AuthResult.failure('Password must be at least 8 characters.');
     }
 
-    final existing = await _secureRead(_registeredEmailKey);
-    if (existing != null && existing.isNotEmpty) {
+    final existing = await _readCredentials();
+    if (existing.email != null && existing.email!.isNotEmpty) {
       return AuthResult.failure('An account already exists. Sign in instead.');
     }
 
     await _persistCredentials(
       email: normalizedEmail,
-      password: password,
+      password: normalizedPassword,
       rememberMe: rememberMe,
       enableBiometric: enableBiometric,
     );
@@ -202,29 +255,33 @@ abstract final class AuthService {
     bool enableBiometric = false,
   }) async {
     final normalizedEmail = email.trim().toLowerCase();
+    final normalizedPassword = password.trim();
     if (!UserProfileStore.isValidEmail(normalizedEmail)) {
       return AuthResult.failure('Enter a valid email address.');
     }
-    if (password.isEmpty) {
+    if (normalizedPassword.isEmpty) {
       return AuthResult.failure('Enter your password.');
     }
 
-    final storedEmail = await _secureRead(_registeredEmailKey);
-    final storedHash = await _secureRead(_passwordHashKey);
+    final creds = await _readCredentials();
+    final storedEmail = creds.email;
+    final storedHash = creds.hash;
 
-    if (storedEmail == null || storedHash == null) {
+    if (storedEmail == null || storedHash == null || storedEmail.isEmpty || storedHash.isEmpty) {
       return AuthResult.failure('No account found. Tap "Create one" below.');
     }
     if (storedEmail.toLowerCase() != normalizedEmail) {
+      debugPrint('[AuthService] sign-in email mismatch');
       return AuthResult.failure('Email or password is incorrect.');
     }
-    if (_hashPassword(password) != storedHash) {
+    if (_hashPassword(normalizedPassword) != storedHash) {
+      debugPrint('[AuthService] sign-in password hash mismatch');
       return AuthResult.failure('Email or password is incorrect.');
     }
 
     await _persistCredentials(
       email: normalizedEmail,
-      password: password,
+      password: normalizedPassword,
       rememberMe: rememberMe,
       enableBiometric: enableBiometric,
     );
@@ -250,6 +307,7 @@ abstract final class AuthService {
     return AuthResult.success();
   }
 
+  /// Ends the session only — never deletes email / password hash.
   static Future<void> signOut() async {
     await _secureDelete(_sessionKey);
   }
@@ -268,8 +326,17 @@ abstract final class AuthService {
     required bool rememberMe,
     required bool enableBiometric,
   }) async {
-    await _secureWrite(_registeredEmailKey, email);
-    await _secureWrite(_passwordHashKey, _hashPassword(password));
+    final hash = _hashPassword(password);
+    final prefs = await SharedPreferences.getInstance();
+    // Prefs first — source of truth for sign-in after sign-out.
+    await prefs.setString('$_mirrorPrefix$_registeredEmailKey', email);
+    await prefs.setString('$_mirrorPrefix$_passwordHashKey', hash);
+    try {
+      await _storage.write(key: _registeredEmailKey, value: email).timeout(_secureTimeout);
+      await _storage.write(key: _passwordHashKey, value: hash).timeout(_secureTimeout);
+    } catch (e) {
+      debugPrint('[AuthService] secure credential write failed (prefs ok): $e');
+    }
 
     if (rememberMe) {
       await _secureWrite(_rememberMeKey, 'true');
@@ -313,7 +380,8 @@ abstract final class AuthService {
   }
 
   static Future<void> _syncProfileFromStorage() async {
-    final email = await _secureRead(_registeredEmailKey);
+    final creds = await _readCredentials();
+    final email = creds.email;
     if (email == null || email.isEmpty) return;
     await UserProfileStore.load();
     await UserProfileStore.save(

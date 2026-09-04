@@ -779,7 +779,7 @@ const String kReportDisclaimer =
 /// Keep in sync with `pubspec.yaml` version (`name+build`).
 abstract final class AppVersionInfo {
   static const versionName = '1.0.5';
-  static const buildNumber = '11';
+  static const buildNumber = '13';
   static const label = 'v$versionName';
   static const aboutLine = 'Version $versionName (Build $buildNumber)';
 }
@@ -9349,6 +9349,27 @@ class _AccountScreenState extends State<AccountScreen> {
             height: 50,
             child: OutlinedButton(
               onPressed: () async {
+                final confirmed = await showDialog<bool>(
+                  context: context,
+                  builder: (ctx) => AlertDialog(
+                    backgroundColor: const Color(0xFF1A1A1A),
+                    title: const Text('Sign out?'),
+                    content: const Text(
+                      'You will need your email and password to sign back in. Your account stays on this device.',
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(ctx, false),
+                        child: const Text('Cancel'),
+                      ),
+                      TextButton(
+                        onPressed: () => Navigator.pop(ctx, true),
+                        child: const Text('Sign Out', style: TextStyle(color: Color(0xFFFF5252))),
+                      ),
+                    ],
+                  ),
+                );
+                if (confirmed != true || !context.mounted) return;
                 await AuthService.signOut();
                 if (!context.mounted) return;
                 Navigator.of(context).pushAndRemoveUntil(

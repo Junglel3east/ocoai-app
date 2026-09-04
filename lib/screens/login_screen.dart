@@ -79,7 +79,7 @@ class _LoginScreenState extends State<LoginScreen> {
     setState(() => _loading = true);
     try {
       final email = _emailController.text.trim();
-      final password = _passwordController.text;
+      final password = _passwordController.text.trim();
 
       final AuthResult result;
       if (_isCreateMode) {
