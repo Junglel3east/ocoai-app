@@ -805,7 +805,7 @@ def format_mobula_market_prompt_block(market: dict[str, Any]) -> str:
         if on_f > off_f * 1.25:
             vol_mix += "spot/DEX-led flow; treat perp squeezes as secondary until CEX confirms."
         elif off_f > on_f * 1.25:
-            vol_mix += "CEX/perp-led flow; weight funding, OI, and liqs in **Volume-Weighted Analysis** and **Confluence Summary**."
+            vol_mix += "CEX/perp-led flow; weight funding, OI, and liqs in **Oracle Flux Analysis**, **Market Structure**, and **Confluence Summary**."
         else:
             vol_mix += "balanced flow; require derivatives + structure alignment before sizing up."
 
@@ -839,9 +839,11 @@ def format_mobula_market_prompt_block(market: dict[str, Any]) -> str:
     lines.extend(
         [
             "MANDATORY MOBULA USAGE (non-negotiable):",
-            "• **Volume-Weighted Analysis** — cite Daily VWAP vs live price, on-chain vs CEX flow, and derivatives positioning.",
+            "• **Oracle Flux Analysis** — cite Daily VWAP vs live price, HA quality, on-chain vs CEX flow, and derivatives when they confirm/fight permission.",
+            "• **Market Structure** (supporting) — map pool depth / trap risk to invalidation and stops.",
             "• **Overall Bias** / **Confluence Summary** / **If I Were to Trade Today...** — price Mobula into the verdict.",
             "• Do NOT dump raw numbers; translate into edge (trap risk, chase risk, squeeze fuel, stand-aside).",
+            "• Never output Volume-Weighted Analysis or Heikin Ashi Analysis as separate Key Drivers headings.",
         ]
     )
     return "\n".join(lines) + "\n\n"
@@ -855,7 +857,7 @@ def format_market_data_fallback_note(market: dict[str, Any]) -> str:
         "═══ ON-CHAIN / MOBULA ═══\n"
         "Mobula live feed unavailable for this tick — do NOT invent DEX liquidity or on-chain volume. "
         "Infer liquidity from structure + Binance derivatives only; state 'on-chain depth unverified' once in "
-        "**Volume-Weighted Analysis** or **Confluence Summary** if relevant.\n\n"
+        "**Oracle Flux Analysis**, **Market Structure**, or **Confluence Summary** if relevant.\n\n"
     )
 
 
@@ -958,8 +960,8 @@ def format_coingecko_pro_prompt_block(market: dict[str, Any]) -> str:
 
     lines.extend(
         [
-            "MANDATORY: Weight CEX volume + Binance derivatives (funding/OI/L-S/liqs) in **Volume-Weighted Analysis** "
-            "and **Confluence Summary**.",
+            "MANDATORY: Weight CEX volume + Binance derivatives (funding/OI/L-S/liqs) in **Oracle Flux Analysis**, "
+            "supporting **Market Structure**, and **Confluence Summary** — never as Volume-Weighted / Heikin Ashi headings.",
             "Do NOT invent DEX pool depth — state CEX-led flow explicitly when on-chain data is missing.",
         ]
     )
@@ -1527,8 +1529,9 @@ Open Interest: {oi_val} → {derivatives['oi_label']}
 Long/Short accounts (5m): {ls_val} → {derivatives['ls_label']}
 Recent liquidations: {liq_val} → {derivatives['liq_label']}
 
-TRADER INSTRUCTION — weave derivatives into **Volume-Weighted Analysis**, **Market Structure**, and
-**Confluence Summary** (never as a separate Liquidity & Sentiment heading):
+TRADER INSTRUCTION — weave derivatives into **Oracle Flux Analysis** (permission confirm/fight),
+supporting **Market Structure**, and **Confluence Summary** (never Liquidity & Sentiment,
+Volume-Weighted Analysis, or Heikin Ashi Analysis as separate Key Drivers headings):
 • Who is paying whom (funding)? Is OI rising with trend (conviction) or against it (shorts/longs adding)?
 • Are accounts lopsided (L/S) into a level where stops cluster? Did liqs mark exhaustion or fuel continuation?
 • Map to positioning: squeeze setup, cascade risk, counter crowded extension, liquidity grab, or stand aside until reset.
@@ -4588,8 +4591,11 @@ DUAL-LAYER CONFLUENCE MATRIX (every read):
 • High Chop → degrade WHEN signals first; only sweep-trigger scalps; ignore mid-range diamonds and zero crosses.
 
 FLUX INTEGRATION RULES:
-• Lead **Key Drivers** with "Oracle Flux Analysis" reading WHERE + WHEN (Score, MF, Engines, Chop/regime,
-  STRONG, Fib/VWAP, Wave, Fair Value, divergence diamond, setup_state).
+• Lead **Key Drivers** with one hero bullet: "Oracle Flux Analysis" reading WHERE + WHEN (Score, MF,
+  Engines, Chop/regime, STRONG, HA trend quality, Fib/VWAP location, Wave, Fair Value, divergence diamond,
+  setup_state). Do NOT split HA or VWAP into separate Key Drivers headings — they live inside Flux WHERE.
+• Second bullet only: **Market Structure** (supporting) — BOS/CHOCH, OB/FVG, sweeps, invalidation; weave
+  derivatives and flow here. Never co-equal "Volume-Weighted Analysis" or "Heikin Ashi Analysis" bullets.
 • **Confluence Summary**: one sentence STRONG/MODERATE/WEAK using dual-layer matrix + derivatives.
 • Trade trigger language: STRONG permission, 0.786 reject, VWAP reclaim, Wave OS/OB cross, divergence diamond,
   Fair Value agree, setup_state TRIGGER/TAKE — never pinch/rollover dots (removed from Flux).
@@ -4748,7 +4754,8 @@ RULE 2 — GOD-MODE CONFLUENCE STACK (deep integration, zero blind spots)
 • MOMENTUM: EMA 5/20 stack, RSI (>50 bullish structure / <50 bearish structure) + divergence only WITH
   structure, MACD histogram expansion/contraction, volume on breaks vs fakeouts.
 • ON-CHAIN / MOBULA (when MOBULA block present — mandatory): DEX liquidity depth, on-chain vs CEX volume
-  delta, slippage/trap risk, spot-led vs perp-led flow. Weave into **Volume-Weighted Analysis** and **Market Structure**.
+  delta, slippage/trap risk, spot-led vs perp-led flow. Weave into **Oracle Flux Analysis** (location /
+  flow context) and supporting **Market Structure** — never a separate Volume-Weighted heading.
 • LIQUIDATION CLUSTERS & BOOK PRESSURE: where are stops stacked, where does the cascade accelerate,
   which side of the book is thin. Liq clusters are targets AND invalidation guides — price hunts them.
 • BTC/ETH LEAD (when relevant): risk-on/off for alts, correlation breaks, HTF veto from majors.
@@ -4759,8 +4766,8 @@ RULE 2 — GOD-MODE CONFLUENCE STACK (deep integration, zero blind spots)
   NEVER read one layer without the other — STRONG without diamond/Wave = trigger pending; Wave extreme
   against trend = exhaustion warning, not auto-reversal. Live Flux Read = cite; else infer BOTH layers.
   STRONG flags high-priority when HTF-aligned; veto when they fight Daily/4H. High Chop = stand down.
-• PREMIUM BREVITY: Tight trader prose. No filler. Each **Key Drivers** bullet: 2–4 crisp sentences max.
-  Do not repeat the same Mobula or derivatives numbers across bullets.
+• PREMIUM BREVITY: Tight trader prose. No filler. Exactly two **Key Drivers** bullets (Flux + Structure),
+  each 2–4 crisp sentences. Do not repeat the same Mobula or derivatives numbers across bullets.
 
 ═══════════════════════════════════════
 RULE 3 — LEVERAGE & DERIVATIVES MASTERY (prose integration — NOT a data dump)
@@ -4768,16 +4775,17 @@ RULE 3 — LEVERAGE & DERIVATIVES MASTERY (prose integration — NOT a data dump
 User prompt supplies live Binance Futures: funding rate, open interest, 5m long/short accounts,
 recent liquidations. Mobula may add liquidity/volume context.
 
-Weave derivatives into **Volume-Weighted Analysis**, **Market Structure**, and **Confluence Summary**
-(prose integration — NOT a data dump, and NEVER as a separate Liquidity & Sentiment heading):
+Weave derivatives into **Oracle Flux Analysis** (when positioning confirms/fights permission), supporting
+**Market Structure**, and **Confluence Summary** (prose — NOT a data dump; NEVER Liquidity & Sentiment,
+Volume-Weighted Analysis, or Heikin Ashi Analysis as separate Key Drivers headings):
   Tell the positioning story: Who is crowded? Who just got liquidated? Is OI rising with price
   (new money) or rising against price (shorts adding)? Is funding paying shorts to hold the book?
   Are liqs fueling continuation or marking exhaustion? Tie to stop runs, cascade risk,
   squeeze setup, liquidity grab. Read like a leverage trader sizing a perp — never "Funding is X. OI is Y."
 
-**Confluence Summary** — EXACTLY one sentence. Grade STRONG / MODERATE / WEAK. Fuse structure + VWAP +
-  momentum + derivatives + liquidity + Oracle Flux dual-layer (Score, Money Flow, Engines, Chop, STRONG
-  permission, Flux Wave, Fair Value, divergence diamonds) — always.
+**Confluence Summary** — EXACTLY one sentence. Grade STRONG / MODERATE / WEAK. Fuse Oracle Flux dual-layer
+  (Score, Money Flow, Engines, Chop, STRONG permission, Flux Wave, Fair Value, divergence diamonds) +
+  structure + VWAP location + derivatives + liquidity — always.
 
 Derivatives OVERRIDE or CONFIRM technical bias: extreme positive funding + crowded longs = counter-long fuel;
 negative funding + rising OI + short liqs = squeeze blueprint; OI collapse after spike = move spent.
@@ -4829,16 +4837,17 @@ REPORT STRUCTURE — EXACT HEADINGS (Flutter — DO NOT rename or reorder)
 
 **Overall Bias**: [Mildly Bullish / Mildly Bearish / Neutral] (Confidence: XX%)
 
-**Key Drivers**:
+**Key Drivers** (exactly two bullets — Flux is the hero; Structure supports levels/invalidation):
 - Oracle Flux Analysis: WHERE (Score, Conviction, Money Flow, Engines, STRONG permission, Chop/regime,
-  Fib/VWAP) + WHEN (Flux Wave, Fair Value, divergence diamond, setup_state) — live Flux Read when present;
-  otherwise infer from structure/HA/VWAP on requested TF.
-- Volume-Weighted Analysis: ...
-- Heikin Ashi Analysis: ...
-- Market Structure: ...
+  HA trend quality, Fib/VWAP location — Daily / Previous Day / weekly / monthly) + WHEN (Flux Wave,
+  Fair Value, divergence diamond, setup_state) — live Flux Read when present; else infer both layers.
+  VWAP premium/discount and HA continuation vs doji live HERE — not as separate headings.
+- Market Structure: Supporting only — BOS/CHOCH, order blocks, FVGs, sweeps/grabs, previous highs/lows,
+  invalidation. Weave fib confluence, momentum (EMA/RSI/MACD with structure), and derivatives/flow
+  inline when they change the level or stop — keep shorter than Flux.
 
-FORBIDDEN Key Drivers bullets (do NOT output these headings): Liquidity & Sentiment, Fibonacci Retracements,
-Technicals. Weave fib levels, MACD/RSI/EMA, and derivatives/positioning into the bullets above instead.
+FORBIDDEN Key Drivers bullets (do NOT output): Volume-Weighted Analysis, Heikin Ashi Analysis,
+Liquidity & Sentiment, Fibonacci Retracements, Technicals.
 
 **Confluence Summary**: One decisive, high-conviction sentence.
 
@@ -5788,7 +5797,8 @@ def format_oracle_flux_prompt_block(flux: Optional[OracleFluxSnapshot]) -> str:
         )
 
     lines.append(
-        "Mandatory: Oracle Flux Analysis bullet in **Key Drivers** reading BOTH WHERE + WHEN + "
+        "Mandatory: one hero **Oracle Flux Analysis** Key Drivers bullet reading BOTH WHERE + WHEN "
+        "(HA + VWAP inside Flux — never separate headings) + shorter supporting **Market Structure** + "
         "dual-layer-weighted **Confluence Summary**."
     )
     lines.append("")
@@ -5843,19 +5853,17 @@ Deliver using this **exact structure** (headings unchanged — maximum depth ins
 **Overall Bias**: [Mildly Bullish / Mildly Bearish / Neutral] (Confidence: XX%)
 State HTF bias, HTF veto, and whether derivatives confirm or fight the read.
 
-**Key Drivers**:
+**Key Drivers** (exactly two bullets — Flux hero, Structure support):
 - Oracle Flux Analysis: WHERE (Score, Conviction, Money Flow, Engines, STRONG permission, Chop/regime,
-  Fib/VWAP) + WHEN (Flux Wave, Fair Value, divergence diamond, setup_state) — cite live Flux when in
-  prompt; otherwise infer from structure/HA/VWAP on requested TF.
-- Volume-Weighted Analysis: Daily VWAP, Previous Day VWAP, weekly / monthly VWAP — premium vs discount,
-  acceptance vs rejection, cluster zones (~0.3–0.8%), mean-reversion vs trend continuation. Weave
-  on-chain/CEX flow and derivatives positioning here when relevant.
-- Heikin Ashi Analysis: Trend quality, indecision wicks, reversal vs continuation read on requested TF.
-- Market Structure: BOS/CHOCH, order blocks, FVGs, inducement, mitigation, displacement, previous highs/lows,
-  liquidity sweeps/grabs, range boundaries, liquidity targets. Include fib confluence and momentum context
-  inline when relevant — do NOT use separate Fibonacci or Technicals headings.
+  HA trend quality, Fib/VWAP location — Daily / Previous Day / weekly / monthly, premium vs discount,
+  ~0.3–0.8% clusters) + WHEN (Flux Wave, Fair Value, divergence diamond, setup_state) — cite live Flux
+  when in prompt; else infer both layers. Do not split HA or VWAP into their own Key Drivers bullets.
+- Market Structure: Supporting — BOS/CHOCH, order blocks, FVGs, inducement, mitigation, displacement,
+  previous highs/lows, sweeps/grabs, range boundaries. Weave fib, momentum, on-chain/CEX flow, and
+  derivatives positioning here when they change invalidation or the stop — keep shorter than Flux.
 
-FORBIDDEN Key Drivers bullets — never output: Liquidity & Sentiment, Fibonacci Retracements, Technicals.
+FORBIDDEN Key Drivers bullets — never output: Volume-Weighted Analysis, Heikin Ashi Analysis,
+Liquidity & Sentiment, Fibonacci Retracements, Technicals.
 
 **Confluence Summary**: Exactly ONE sentence. Grade STRONG / MODERATE / WEAK. State the edge in plain
 trader language — fuse Oracle Flux (Score, Money Flow, Engines, Chop, STRONG flags) + structure +
@@ -6029,7 +6037,8 @@ Weak edge → "NO SCALP — STAY FLAT" and OMIT **TRADE LEVELS**.
     mode_label = "TRADE SETUP (execution-ready)" if mode == "tradesetup" else "MARKET ANALYSIS"
     mobula_priority = (
         "MOBULA DATA IS LIVE — liquidity, on-chain vs CEX volume delta, and pool depth MUST shape bias, "
-        "Volume-Weighted Analysis, conviction %, and your trade card. Lead with on-chain/liquidity read. "
+        "Oracle Flux Analysis (location/flow), Market Structure, conviction %, and your trade card. "
+        "Lead with on-chain/liquidity read inside Flux + Structure — never Volume-Weighted / Heikin Ashi headings. "
         "Cite the source once in the report: \"LIVE from Mobula\"."
         if has_mobula
         else (
@@ -6129,22 +6138,21 @@ Cross-check: Mobula liquidity + volume delta ↔ CoinGecko CEX vol ↔ funding/O
 on {timeframe} ↔ Oracle Flux dual-layer (overlay WHERE: Score, Money Flow, Engines, Chop, STRONG permission,
 Fib/VWAP ↔ oscillator WHEN: Flux Wave, Fair Value, divergence diamonds, OB/OS — layers must agree or name the conflict).
 Flux block above (live or inferred) must shape Oracle Flux Analysis, conviction %, and trade trigger.
-Weave Mobula liquidity and derivatives into **Volume-Weighted Analysis** and **Market Structure** — never
-as a separate Liquidity & Sentiment heading.
+Weave Mobula liquidity and derivatives into **Oracle Flux Analysis** and supporting **Market Structure** —
+never as Volume-Weighted Analysis, Heikin Ashi Analysis, or Liquidity & Sentiment headings.
 Oracle Vision / Desk conviction must be data-backed — no generic % without citing liquidity or positioning.
 
-═══ ANALYTICAL DEPTH CHECKLIST (Key Drivers — tight stream-trader prose) ═══
-• Oracle Flux first — read BOTH layers: overlay WHERE (Score, Conviction, Money Flow, Engines,
-  STRONG BUY/SELL permission, Chop/regime, 0.786/0.618 Fib, VWAP) then oscillator WHEN (Flux Wave OB/OS
+═══ ANALYTICAL DEPTH CHECKLIST (Key Drivers — exactly two bullets, tight stream-trader prose) ═══
+• Oracle Flux first (hero): BOTH layers — WHERE (Score, Conviction, Money Flow, Engines, STRONG BUY/SELL,
+  Chop/regime, HA trend quality, 0.786/0.618 Fib, Daily/Prev Day VWAP location) then WHEN (Flux Wave OB/OS
   cross, Fair Value, divergence diamond div_bull/div_bear/_elite, setup_state TRIGGER/TAKE) — live or
   inferred. State CONFIRM vs CONFLICT; STRONG without WHEN = trigger-pending; Wave extreme against trend
-  = exhaustion, not auto-reversal.
+  = exhaustion, not auto-reversal. VWAP + HA live inside this bullet — do not invent separate headings.
+• Market Structure second (support): order blocks, FVGs, BOS/CHOCH, sweeps/grabs, previous highs/lows —
+  shorter than Flux; weave derivatives/flow only when they change the stop or invalidation.
 • MTF: Weekly/Daily/4h → {timeframe} → LTF trigger. ALIGNED or CONFLICTED — name HTF veto if present.
 • TREND LAW: never fight the Daily/4H blindly — counter-trend demands printed reversal evidence
   (sweep + reclaim, displacement, funding flip) or the call is trade-with-trend / stand down.
-• Daily VWAP + Previous Day VWAP: reclaiming, rejecting, sweeping, premium/discount vs live price.
-• Structure: order blocks, FVGs, BOS/CHOCH, inducement, mitigation, displacement, previous highs/lows,
-  fakeouts, liquidity sweeps, liquidity grabs.
 • Derivatives woven into story — funding flip, OI build, crowded side, liq cascade fuel (never metric dump).
 • Liquidation clusters + book pressure: where stops are stacked, where the cascade accelerates, which side
   of the book is thin — clusters are targets AND invalidation guides.

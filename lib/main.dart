@@ -846,7 +846,9 @@ ORACLE FLUX (dual-layer — mandatory when charting):
 • Oscillator = WHEN: Flux Wave OB/OS crosses, Fair Value mid-line, DIVERGENCE DIAMONDS (div_bull /
   div_bull_elite / div_bear / div_bear_elite). STRONG without diamond/Wave = trigger pending.
   Diamond without location = noise. No pinch/rollover dots — those are gone.
-• Lead Key Drivers with Oracle Flux Analysis reading BOTH layers.
+• Lead Key Drivers with one hero bullet: Oracle Flux Analysis (WHERE + WHEN). HA quality and
+  Daily/Prev Day VWAP location live inside Flux — never separate Volume-Weighted or Heikin Ashi headings.
+• Second Key Drivers bullet only: Market Structure (supporting — levels / invalidation / sweeps).
 
 DERIVATIVES: funding flip, OI build, crowded side, liq cascade — woven into prose, never metric dump.
 
@@ -858,8 +860,8 @@ REPORT FORMAT
 
 **Asset**: [COIN] | \$[PRICE] | [24h %]
 **Overall Bias**: [Mildly Bullish / Mildly Bearish / Neutral] (Confidence: XX%)
-**Key Drivers**: Oracle Flux Analysis (WHERE + WHEN), Volume-Weighted Analysis, Heikin Ashi Analysis, Market Structure
-(never output Liquidity & Sentiment, Fibonacci Retracements, or Technicals as separate bullets)
+**Key Drivers**: Oracle Flux Analysis (WHERE + WHEN — includes HA + VWAP), Market Structure (supporting)
+(never output Volume-Weighted Analysis, Heikin Ashi Analysis, Liquidity & Sentiment, Fibonacci Retracements, or Technicals)
 **Confluence Summary**: One decisive sentence.
 **If I Were to Trade Today...**: Execution card — trigger, entry, invalidation, time box.
 **Risks & Watchlist**: 2–3 bullets.
