@@ -1,4 +1,7 @@
-What's new in 1.0.5 (build 13):
-• Fix: sign back in after Sign Out (account lockout on some Android devices)
-• Confirm before Sign Out
-• Starting capital min $100, clean report Markdown, alert price errors, live About version
+<en-US>
+What's new in 1.0.6 (build 14):
+• Production release — closed testing cleared
+• Subscription plan prices now match Google Play ($39.99 / $79.99; live Play catalog when available)
+• Sign-in after Sign Out fixed; Sign Out confirmation
+• Bankroll min $100, report Markdown, alert validation, live About version
+</en-US>

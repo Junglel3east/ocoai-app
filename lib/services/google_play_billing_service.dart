@@ -40,6 +40,30 @@ abstract final class GooglePlayBillingService {
 
   static ProductDetails? productDetails(String productId) => _products[productId];
 
+  /// Fallback labels when Play Catalog is offline — must match Console list prices.
+  static const fallbackPremiumPrice = r'$39.99';
+  static const fallbackExpertPrice = r'$79.99';
+
+  /// Prefer live Google Play localized price; else Console-matching fallback.
+  static String displayPriceForProductId(String productId) {
+    final live = _products[productId]?.price.trim();
+    if (live != null && live.isNotEmpty) return live;
+    switch (productId) {
+      case premiumProductId:
+        return fallbackPremiumPrice;
+      case expertProductId:
+        return fallbackExpertPrice;
+      default:
+        return '';
+    }
+  }
+
+  static String displayPriceForPlan(String plan) {
+    final id = productIdForPlan(plan);
+    if (id == null) return '';
+    return displayPriceForProductId(id);
+  }
+
   static String? planForProductId(String? productId) {
     switch (productId) {
       case premiumProductId:

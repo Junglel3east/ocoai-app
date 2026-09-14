@@ -778,8 +778,8 @@ const String kReportDisclaimer =
 
 /// Keep in sync with `pubspec.yaml` version (`name+build`).
 abstract final class AppVersionInfo {
-  static const versionName = '1.0.5';
-  static const buildNumber = '13';
+  static const versionName = '1.0.6';
+  static const buildNumber = '14';
   static const label = 'v$versionName';
   static const aboutLine = 'Version $versionName (Build $buildNumber)';
 }
@@ -3683,7 +3683,7 @@ void _showPremiumCoinUpgradePrompt(BuildContext context, String coin) {
       title: const Text('Premium Plan Required', style: TextStyle(fontWeight: FontWeight.w600)),
       content: Text(
         'Your Free plan includes BTC, ETH, and SOL only.\n\n'
-        '$normalized is outside the Free tier. Upgrade to Premium (\$39/mo) for Top 150 coin coverage.',
+        '$normalized is outside the Free tier. Upgrade to Premium (${GooglePlayBillingService.fallbackPremiumPrice}/mo) for Top 150 coin coverage.',
         style: TextStyle(height: 1.45, color: Colors.grey[400]),
       ),
       actions: [
@@ -3716,7 +3716,7 @@ void _showExpertCoinUpgradePrompt(BuildContext context, String coin) {
       title: const Text('Expert Plan Required', style: TextStyle(fontWeight: FontWeight.w600)),
       content: Text(
         '$normalized is not in the Top 150 coin list included with Premium.\n\n'
-        'Upgrade to Expert (\$79/mo) to analyze any symbol — including new and emerging coins like HYPE.',
+        'Upgrade to Expert (${GooglePlayBillingService.fallbackExpertPrice}/mo) to analyze any symbol — including new and emerging coins like HYPE.',
         style: TextStyle(height: 1.45, color: Colors.grey[400]),
       ),
       actions: [
@@ -9440,6 +9440,12 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
     super.initState();
     GooglePlayBillingService.onPurchaseEvent = _onBillingEvent;
     _loadPlan();
+    _refreshStorePrices();
+  }
+
+  Future<void> _refreshStorePrices() async {
+    await GooglePlayBillingService.queryProducts();
+    if (mounted) setState(() {});
   }
 
   @override
@@ -9682,7 +9688,9 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
           _PricingTierCard(
             name: 'Premium',
             tagline: 'Full market coverage for active traders',
-            price: '\$39',
+            price: GooglePlayBillingService.displayPriceForProductId(
+              GooglePlayBillingService.premiumProductId,
+            ),
             period: '/month',
             icon: Icons.diamond_outlined,
             accentColor: const Color(0xFF00BFFF),
@@ -9703,7 +9711,9 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
           _PricingTierCard(
             name: 'Expert',
             tagline: 'Top Tier — maximum Oracle power',
-            price: '\$79',
+            price: GooglePlayBillingService.displayPriceForProductId(
+              GooglePlayBillingService.expertProductId,
+            ),
             period: '/month',
             icon: Icons.auto_awesome,
             accentColor: const Color(0xFFFFB74D),
@@ -10535,7 +10545,9 @@ class PrivacySecurityScreen extends StatelessWidget {
           ),
           _PrivacySection(
             title: 'Subscriptions',
-            body: 'Premium and Expert plans are billed through Google Play (\$39/mo and \$79/mo). '
+            body: 'Premium and Expert plans are billed through Google Play '
+                '(${GooglePlayBillingService.fallbackPremiumPrice}/mo and '
+                '${GooglePlayBillingService.fallbackExpertPrice}/mo; local Play price may vary). '
                 'Manage or cancel subscriptions in your Google Play account settings.',
           ),
           _PrivacySection(
