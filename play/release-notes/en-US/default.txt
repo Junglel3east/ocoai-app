@@ -1,5 +1,5 @@
 <en-US>
-What's new in 1.0.6 (build 14):
+What's new in 1.0.6 (build 15):
 • Production release — closed testing cleared
 • Subscription plan prices now match Google Play ($39.99 / $79.99; live Play catalog when available)
 • Sign-in after Sign Out fixed; Sign Out confirmation
