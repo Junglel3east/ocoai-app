@@ -1,5 +1,5 @@
 <en-US>
-What's new in 1.0.7 (build 17):
+What's new in 1.0.7 (build 18):
 • One plan: Oracle Pro ($49.99/mo) unlocks every tool — any symbol, all timeframes, unlimited setups and AI chat, Oracle Vision, Citadel, Oracle Desk
 • Redesigned Subscription page
 • Citadel: fixed Bitunix "System error" — order size and price now follow each contract's live precision and minimum
