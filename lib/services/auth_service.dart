@@ -7,6 +7,7 @@ import 'package:local_auth/local_auth.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app_api_key_service.dart';
+import 'reviewer_access_service.dart';
 import 'user_profile_store.dart';
 
 /// Local email/password auth with secure storage and optional biometrics.
@@ -377,6 +378,8 @@ abstract final class AuthService {
     } catch (e) {
       debugPrint('[AuthService] ensureKey after sign-in skipped: $e');
     }
+    // Store-review allow-list (no-op for normal users).
+    await ReviewerAccessService.syncForEmail(email);
   }
 
   static Future<void> _syncProfileFromStorage() async {
@@ -390,6 +393,7 @@ abstract final class AuthService {
       timezone: UserProfileStore.timezone,
     );
     await UserProfileStore.saveTier(await _currentTier());
+    await ReviewerAccessService.syncForEmail(email);
   }
 }
 

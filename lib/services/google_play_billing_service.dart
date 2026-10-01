@@ -9,12 +9,19 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'user_profile_store.dart';
 
-/// Google Play Billing — monthly Premium / Expert subscriptions (Android only).
+/// Google Play Billing — one Oracle Pro monthly subscription (Android only).
+///
+/// Oracle Pro maps to the internal `Expert` tier (full access). The legacy
+/// `premium_monthly` / `expert_monthly` SKUs stay recognised so early
+/// subscribers restore correctly, but they are no longer offered for purchase.
 abstract final class GooglePlayBillingService {
+  static const proProductId = 'oracle_pro_monthly';
+
+  /// Legacy SKUs — restore only.
   static const premiumProductId = 'premium_monthly';
   static const expertProductId = 'expert_monthly';
 
-  static const Set<String> productIds = {premiumProductId, expertProductId};
+  static const Set<String> productIds = {proProductId, premiumProductId, expertProductId};
 
   static const _planKey = 'subscription_plan';
   static const _activeProductStorageKey = 'google_play_active_product_id';
@@ -40,47 +47,37 @@ abstract final class GooglePlayBillingService {
 
   static ProductDetails? productDetails(String productId) => _products[productId];
 
-  /// Fallback labels when Play Catalog is offline — must match Console list prices.
-  static const fallbackPremiumPrice = r'$39.99';
-  static const fallbackExpertPrice = r'$79.99';
+  /// Fallback label when Play Catalog is offline — must match the Console list price.
+  static const fallbackProPrice = r'$49.99';
 
-  /// Prefer live Google Play localized price; else Console-matching fallback.
-  static String displayPriceForProductId(String productId) {
-    final live = _products[productId]?.price.trim();
+  /// Live Google Play localized price for Oracle Pro, else Console-matching fallback.
+  static String get proDisplayPrice {
+    final live = _products[proProductId]?.price.trim();
     if (live != null && live.isNotEmpty) return live;
-    switch (productId) {
-      case premiumProductId:
-        return fallbackPremiumPrice;
-      case expertProductId:
-        return fallbackExpertPrice;
-      default:
-        return '';
-    }
-  }
-
-  static String displayPriceForPlan(String plan) {
-    final id = productIdForPlan(plan);
-    if (id == null) return '';
-    return displayPriceForProductId(id);
+    return fallbackProPrice;
   }
 
   static String? planForProductId(String? productId) {
     switch (productId) {
-      case premiumProductId:
-        return 'Premium';
+      case proProductId:
       case expertProductId:
         return 'Expert';
+      case premiumProductId:
+        return 'Premium';
       default:
         return null;
     }
   }
 
+  /// Any paid plan name resolves to the single Oracle Pro SKU.
   static String? productIdForPlan(String plan) {
     switch (plan.trim().toLowerCase()) {
-      case 'premium':
-        return premiumProductId;
+      case 'pro':
+      case 'oracle pro':
       case 'expert':
-        return expertProductId;
+      case 'top tier':
+      case 'premium':
+        return proProductId;
       default:
         return null;
     }

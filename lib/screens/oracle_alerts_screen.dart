@@ -236,8 +236,8 @@ class _AlertsIntroCard extends StatelessWidget {
           Text(
             muted
                 ? 'You will not get pings until you unmute. Setup levels still show here.'
-                : 'Guardians arm with every open setup. Pulse ${policy.pulse ? 'on' : 'is Premium+'}. '
-                    'Citadel live ${policy.citadel ? 'on' : 'is Expert'}. '
+                : 'Guardians arm with every open setup. Pulse ${policy.pulse ? 'on' : 'is Oracle Pro'}. '
+                    'Citadel live ${policy.citadel ? 'on' : 'is Oracle Pro'}. '
                     '${policy.maxCustomPrice} custom price alert${policy.maxCustomPrice == 1 ? '' : 's'} on this plan.',
             style: TextStyle(fontSize: 13, height: 1.45, color: Colors.grey[300]),
           ),

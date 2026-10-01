@@ -1,5 +1,5 @@
 /*
-- Subscription tiers: Free (BTC/ETH/SOL), Premium (Top 150), Expert (any symbol)
+- Subscription: Free (BTC/ETH/SOL) + Oracle Pro ($49.99/mo, full access; stored internally as `Expert`)
 - FCM push notifications + daily 7:30 AM CST local alerts (NotificationService)
 - TradingView charts: VWAP + EMA 5/20 + RSI + MACD + Auto Fib; full pinch/pan/zoom
 - Watchlist coin search screen (TradingView-style symbol picker)
@@ -778,8 +778,8 @@ const String kReportDisclaimer =
 
 /// Keep in sync with `pubspec.yaml` version (`name+build`).
 abstract final class AppVersionInfo {
-  static const versionName = '1.0.6';
-  static const buildNumber = '15';
+  static const versionName = '1.0.7';
+  static const buildNumber = '16';
   static const label = 'v$versionName';
   static const aboutLine = 'Version $versionName (Build $buildNumber)';
 }
@@ -956,7 +956,27 @@ abstract final class SubscriptionPlanStore {
   static const _planKey = 'subscription_plan';
   static const _homeChatHiddenKey = 'home_chat_fab_hidden';
 
+  /// Public name of the single paid tier. Internally stored as `Expert`.
+  static const proPlanName = 'Oracle Pro';
+
   static String currentPlan = 'Free';
+
+  /// User-facing plan label (`Free`, `Oracle Pro`, or legacy `Premium`).
+  static String get displayPlanName => displayNameFor(currentPlan);
+
+  static String displayNameFor(String plan) {
+    switch (plan.trim().toLowerCase()) {
+      case 'expert':
+      case 'top tier':
+      case 'pro':
+      case 'oracle pro':
+        return proPlanName;
+      case 'premium':
+        return 'Premium (legacy)';
+      default:
+        return 'Free';
+    }
+  }
 
   static bool get hasExpertChatAccess {
     final plan = currentPlan.trim().toLowerCase();
@@ -3021,10 +3041,10 @@ void showCitadelUpgradePrompt(BuildContext context) {
     builder: (ctx) => AlertDialog(
       backgroundColor: const Color(0xFF1A1A1A),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      title: const Text('Expert Plan Required', style: TextStyle(fontWeight: FontWeight.w600)),
+      title: const Text('Oracle Pro Required', style: TextStyle(fontWeight: FontWeight.w600)),
       content: Text(
-        'Automated trading via Oracle Citadel is available on the Expert (Top Tier) plan. '
-        'Upgrade to send AI trade setups directly to the secure execution backend.',
+        'Automated trading via Oracle Citadel is included with Oracle Pro. '
+        'Unlock it to send AI trade setups directly to the secure execution backend.',
         style: TextStyle(height: 1.45, color: Colors.grey[400]),
       ),
       actions: [
@@ -3680,10 +3700,10 @@ void _showPremiumCoinUpgradePrompt(BuildContext context, String coin) {
     builder: (ctx) => AlertDialog(
       backgroundColor: const Color(0xFF1A1A1A),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      title: const Text('Premium Plan Required', style: TextStyle(fontWeight: FontWeight.w600)),
+      title: const Text('Oracle Pro Required', style: TextStyle(fontWeight: FontWeight.w600)),
       content: Text(
         'Your Free plan includes BTC, ETH, and SOL only.\n\n'
-        '$normalized is outside the Free tier. Upgrade to Premium (${GooglePlayBillingService.fallbackPremiumPrice}/mo) for Top 150 coin coverage.',
+        '$normalized is outside the Free tier. Unlock Oracle Pro (${GooglePlayBillingService.fallbackProPrice}/mo) to analyze any symbol.',
         style: TextStyle(height: 1.45, color: Colors.grey[400]),
       ),
       actions: [
@@ -3697,8 +3717,8 @@ void _showPremiumCoinUpgradePrompt(BuildContext context, String coin) {
             Navigator.push(ctx, _premiumPageRoute((_) => const SubscriptionPlanScreen()));
           },
           child: const Text(
-            'View Premium',
-            style: TextStyle(color: Color(0xFF00BFFF), fontWeight: FontWeight.w600),
+            'View Oracle Pro',
+            style: TextStyle(color: Color(0xFFFFB74D), fontWeight: FontWeight.w600),
           ),
         ),
       ],
@@ -3713,10 +3733,10 @@ void _showExpertCoinUpgradePrompt(BuildContext context, String coin) {
     builder: (ctx) => AlertDialog(
       backgroundColor: const Color(0xFF1A1A1A),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      title: const Text('Expert Plan Required', style: TextStyle(fontWeight: FontWeight.w600)),
+      title: const Text('Oracle Pro Required', style: TextStyle(fontWeight: FontWeight.w600)),
       content: Text(
-        '$normalized is not in the Top 150 coin list included with Premium.\n\n'
-        'Upgrade to Expert (${GooglePlayBillingService.fallbackExpertPrice}/mo) to analyze any symbol — including new and emerging coins like HYPE.',
+        '$normalized is not included with your current plan.\n\n'
+        'Unlock Oracle Pro (${GooglePlayBillingService.fallbackProPrice}/mo) to analyze any symbol — including new and emerging coins like HYPE.',
         style: TextStyle(height: 1.45, color: Colors.grey[400]),
       ),
       actions: [
@@ -3730,7 +3750,7 @@ void _showExpertCoinUpgradePrompt(BuildContext context, String coin) {
             Navigator.push(ctx, _premiumPageRoute((_) => const SubscriptionPlanScreen()));
           },
           child: const Text(
-            'Upgrade to Expert',
+            'Unlock Oracle Pro',
             style: TextStyle(color: Color(0xFFFFB74D), fontWeight: FontWeight.w600),
           ),
         ),
@@ -4035,7 +4055,7 @@ void _showWatchlistLimitPrompt(BuildContext context) {
       title: const Text('Watchlist Limit Reached', style: TextStyle(fontWeight: FontWeight.w600)),
       content: Text(
         'Free plan includes up to ${SubscriptionPlanStore.freeWatchlistMax} watchlist coins. '
-        'Upgrade to Premium for full Top 150 coverage.',
+        'Unlock Oracle Pro for an unlimited watchlist across every symbol.',
         style: TextStyle(height: 1.45, color: Colors.grey[400]),
       ),
       actions: [
@@ -4095,10 +4115,10 @@ void showTradeSetupTimeframeUpgradePrompt(BuildContext context) {
     builder: (ctx) => AlertDialog(
       backgroundColor: const Color(0xFF1A1A1A),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      title: const Text('Premium Plan Required', style: TextStyle(fontWeight: FontWeight.w600)),
+      title: const Text('Oracle Pro Required', style: TextStyle(fontWeight: FontWeight.w600)),
       content: Text(
         'Free plan trade setups are limited to the Daily (1D) timeframe on BTC, ETH, and SOL.\n\n'
-        'Upgrade to Premium for all timeframes and Top 150 coins, or Expert for unlimited access.',
+        'Unlock Oracle Pro for every timeframe, every symbol, and unlimited setups.',
         style: TextStyle(height: 1.45, color: Colors.grey[400]),
       ),
       actions: [
@@ -4131,7 +4151,7 @@ void showTradeSetupLimitPrompt(BuildContext context) {
       content: Text(
         'Free plan includes ${SubscriptionPlanStore.freeTradeSetupsPerDay} Daily trade setups '
         'on BTC, ETH, and SOL every 24 hours.\n\n'
-        'Upgrade to Premium or Expert for unlimited setups and more timeframes.',
+        'Unlock Oracle Pro for unlimited setups on every timeframe.',
         style: TextStyle(height: 1.45, color: Colors.grey[400]),
       ),
       actions: [
@@ -4161,15 +4181,12 @@ void _showChatUpgradePrompt(BuildContext context, {required String minimumTier})
     builder: (ctx) => AlertDialog(
       backgroundColor: const Color(0xFF1A1A1A),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      title: Text(
-        premiumGate ? 'Premium Plan Required' : 'Expert Plan Required',
-        style: const TextStyle(fontWeight: FontWeight.w600),
-      ),
+      title: const Text('Oracle Pro Required', style: TextStyle(fontWeight: FontWeight.w600)),
       content: Text(
         premiumGate
-            ? 'Oracle AI Chat is available on Premium (limited) and Expert (unlimited) plans. '
-                'Upgrade to unlock real-time AI assistance for your analyses and trade setups.'
-            : 'Unlimited Oracle AI Chat is available on the Expert (Top Tier) plan.',
+            ? 'Oracle AI Chat is included with Oracle Pro. '
+                'Unlock real-time AI assistance for your analyses and trade setups.'
+            : 'Unlimited Oracle AI Chat is included with Oracle Pro.',
         style: TextStyle(height: 1.45, color: Colors.grey[400]),
       ),
       actions: [
@@ -4200,8 +4217,8 @@ void _showChatDailyLimitPrompt(BuildContext context) {
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       title: const Text('Daily Chat Limit Reached', style: TextStyle(fontWeight: FontWeight.w600)),
       content: Text(
-        'Premium includes ${SubscriptionPlanStore.premiumChatMessagesPerDay} AI chat messages per day. '
-        'Upgrade to Expert for unlimited Oracle Trader AI Chat.',
+        'Your plan includes ${SubscriptionPlanStore.premiumChatMessagesPerDay} AI chat messages per day. '
+        'Oracle Pro includes unlimited Oracle Trader AI Chat.',
         style: TextStyle(height: 1.45, color: Colors.grey[400]),
       ),
       actions: [
@@ -5589,14 +5606,14 @@ class _CitadelUpgradeView extends StatelessWidget {
                     shadowColor: const Color(0xFF00BFFF).withValues(alpha: 0.45),
                   ),
                   child: const Text(
-                    '🔓 Upgrade to Expert',
+                    '🔓 Unlock Oracle Pro',
                     style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, letterSpacing: -0.2),
                   ),
                 ),
               ),
               const SizedBox(height: 20),
               Text(
-                'Premium users get full AI analysis & Trade Setups. Citadel is Expert only.',
+                'Oracle Citadel is non-custodial — you connect your own exchange API keys. Included with Oracle Pro.',
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 12, height: 1.45, color: Colors.grey[600]),
               ),
@@ -5675,8 +5692,8 @@ class _OracleVisionTabScreenState extends State<_OracleVisionTabScreen> {
       headline: 'Oracle Vision',
       subtitle: 'Live High-Conviction Opportunities',
       detail: 'Real-time liquidation heatmaps, pulse signals, and confluence-driven setups.',
-      buttonLabel: '🔓 Upgrade to Premium',
-      footnote: 'Free users get Daily Analysis on BTC, ETH, and SOL. Oracle Vision is Premium+.',
+      buttonLabel: '🔓 Unlock Oracle Pro',
+      footnote: 'Free users get Daily Analysis on BTC, ETH, and SOL. Oracle Vision is included with Oracle Pro.',
       onUpgrade: _openSubscription,
     );
   }
@@ -5749,8 +5766,8 @@ class _OracleDeskTabScreenState extends State<_OracleDeskTabScreen> {
       headline: 'Oracle Desk',
       subtitle: 'Advanced Performance + Personal Command Center',
       detail: 'Watchlist bias, trade performance, Oracle Pulse, and your personal trading hub.',
-      buttonLabel: '🔓 Upgrade to Expert',
-      footnote: 'Premium users get Oracle Vision and unlimited trade setups. Oracle Desk is Expert only.',
+      buttonLabel: '🔓 Unlock Oracle Pro',
+      footnote: 'Your performance analytics and personal command center. Included with Oracle Pro.',
       onUpgrade: _openSubscription,
     );
   }
@@ -9120,7 +9137,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     ]);
     if (mounted) {
       setState(() {
-        _planLabel = '${SubscriptionPlanStore.currentPlan} Plan';
+        _planLabel = '${SubscriptionPlanStore.displayPlanName} Plan';
         _isExpert = SubscriptionPlanStore.isExpert;
         _displayName = UserProfileStore.displayName;
       });
@@ -9329,7 +9346,10 @@ class _AccountScreenState extends State<AccountScreen> {
           const _SectionHeader(title: 'Profile Details'),
           _AccountField(label: 'Display Name', value: UserProfileStore.displayName),
           _AccountField(label: 'Email', value: UserProfileStore.email),
-          _AccountField(label: 'Plan Tier', value: UserProfileStore.tier),
+          _AccountField(
+            label: 'Plan Tier',
+            value: SubscriptionPlanStore.displayNameFor(UserProfileStore.tier),
+          ),
           _AccountField(label: 'Member Since', value: UserProfileStore.memberSince),
           _AccountField(label: 'Timezone', value: UserProfileStore.timezone),
           const SizedBox(height: _AppSpacing.section),
@@ -9480,7 +9500,10 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
         });
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Welcome to ${event.plan}! Your subscription is active.'),
+            content: Text(
+              'Welcome to ${SubscriptionPlanStore.displayNameFor(event.plan ?? 'Expert')}! '
+              'Your subscription is active.',
+            ),
             backgroundColor: const Color(0xFF43A047),
             behavior: SnackBarBehavior.floating,
           ),
@@ -9526,7 +9549,7 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
   }
 
   Future<void> _purchasePlan(String plan) async {
-    if (plan == _currentPlan || _purchasingProductId != null || _isRestoring) return;
+    if (_isPro || _purchasingProductId != null || _isRestoring) return;
 
     if (!GooglePlayBillingService.isAndroid) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -9593,8 +9616,13 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
     });
   }
 
+  bool get _isPro => SubscriptionPlanStore.isPremiumOrHigher;
+
   @override
   Widget build(BuildContext context) {
+    const proColor = Color(0xFFFFB74D);
+    final planLabel = SubscriptionPlanStore.displayNameFor(_currentPlan);
+
     return _ProfileDetailScaffold(
       title: 'Subscription',
       body: ListView(
@@ -9610,13 +9638,13 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
                   begin: Alignment.topLeft,
                   end: Alignment.bottomRight,
                   colors: [
-                    const Color(0xFF00BFFF).withValues(alpha: 0.2),
+                    proColor.withValues(alpha: 0.18),
                     const Color(0xFF1A1A1A),
                     const Color(0xFF0F0F0F),
                   ],
                 ),
                 borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: const Color(0xFF00BFFF).withValues(alpha: 0.28)),
+                border: Border.all(color: proColor.withValues(alpha: 0.28)),
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -9626,23 +9654,27 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
                       Container(
                         padding: const EdgeInsets.all(10),
                         decoration: BoxDecoration(
-                          color: const Color(0xFF00BFFF).withValues(alpha: 0.15),
+                          color: proColor.withValues(alpha: 0.15),
                           borderRadius: BorderRadius.circular(12),
                         ),
-                        child: const Icon(Icons.workspace_premium, color: Color(0xFF00BFFF), size: 26),
+                        child: const Icon(Icons.auto_awesome, color: proColor, size: 26),
                       ),
                       const SizedBox(width: 14),
                       Expanded(
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            const Text(
-                              'Upgrade Your Edge',
-                              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700, letterSpacing: -0.3),
+                            Text(
+                              _isPro ? 'You have the full Oracle' : 'One plan. The full Oracle.',
+                              style: const TextStyle(
+                                fontSize: 20,
+                                fontWeight: FontWeight.w700,
+                                letterSpacing: -0.3,
+                              ),
                             ),
                             const SizedBox(height: 4),
                             Text(
-                              'Current plan: $_currentPlan',
+                              'Current plan: $planLabel',
                               style: TextStyle(fontSize: 13, color: Colors.grey[500]),
                             ),
                           ],
@@ -9652,84 +9684,64 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
                   ),
                   const SizedBox(height: 14),
                   Text(
-                    'Unlock deeper analysis, unlimited setups, Oracle Trader AI Chat, and advanced trading tools.',
+                    _isPro
+                        ? 'Every symbol, every timeframe, unlimited setups and AI chat, '
+                            'Oracle Vision, Citadel execution, and Oracle Desk — all active.'
+                        : 'Everything On Chain Oracle AI does, unlocked with a single subscription. '
+                            'No tiers to compare — just the complete toolkit.',
                     style: TextStyle(fontSize: 14, height: 1.5, color: Colors.grey[400]),
                   ),
                 ],
               ),
             ),
           ),
-          const SizedBox(height: _AppSpacing.item),
-          Text(
-            'AI-generated analysis is for educational purposes only — not financial advice. '
-            'Subscriptions renew monthly via Google Play. Oracle Citadel is non-custodial; '
-            'you connect your own exchange API keys and are responsible for all trades.',
-            style: TextStyle(fontSize: 12, height: 1.45, color: Colors.grey[600]),
-          ),
           const SizedBox(height: _AppSpacing.section),
-          const _SectionHeader(title: 'Choose Your Plan'),
+          _PricingTierCard(
+            name: SubscriptionPlanStore.proPlanName,
+            tagline: 'Full access to every Oracle tool',
+            price: GooglePlayBillingService.proDisplayPrice,
+            period: '/month',
+            icon: Icons.auto_awesome,
+            accentColor: proColor,
+            features: const [
+              'Any symbol — Top 150 and beyond, including new listings',
+              'All timeframes, unlimited AI trade setups',
+              'Unlimited Oracle Trader AI Chat',
+              'Oracle Vision — live high-conviction opportunities',
+              'Oracle Citadel — automated execution on your own exchange keys',
+              'Oracle Desk — performance analytics and command center',
+              'Advanced alerts: RSI, MACD, Volume, VWAP Cross, News',
+            ],
+            isCurrent: _isPro,
+            badge: 'FULL ACCESS',
+            showUpgradeButton: true,
+            upgradeButtonLabel: 'Unlock Oracle Pro',
+            isPurchasing: _purchasingProductId == GooglePlayBillingService.proProductId,
+            onUpgrade: () => _purchasePlan('Expert'),
+          ),
           _PricingTierCard(
             name: 'Free',
-            tagline: 'Get started with core markets',
+            tagline: 'Core markets to get started',
             price: '\$0',
             period: '/month',
             icon: Icons.lock_open_outlined,
             accentColor: Colors.grey,
             features: const [
-              'Daily Analysis (BTC, ETH, SOL only)',
-              'Basic Watchlist (max 5 coins)',
-              'Limited Trade Setups (3 per day)',
+              'Daily analysis on BTC, ETH, and SOL',
+              'Watchlist up to ${SubscriptionPlanStore.freeWatchlistMax} coins',
+              '${SubscriptionPlanStore.freeTradeSetupsPerDay} Daily trade setups every 24 hours',
+              'Basic price alerts',
             ],
-            isCurrent: _currentPlan == 'Free',
+            isCurrent: !_isPro,
             badge: null,
             showUpgradeButton: false,
             onUpgrade: () {},
           ),
-          _PricingTierCard(
-            name: 'Premium',
-            tagline: 'Full market coverage for active traders',
-            price: GooglePlayBillingService.displayPriceForProductId(
-              GooglePlayBillingService.premiumProductId,
-            ),
-            period: '/month',
-            icon: Icons.diamond_outlined,
-            accentColor: const Color(0xFF00BFFF),
-            features: const [
-              'Full coin coverage (Top 150)',
-              'Unlimited Trade Setups',
-              'AI Chat (limited)',
-              'All timeframes',
-              'Oracle Vision (Live High-Conviction Opportunities)',
-            ],
-            isCurrent: _currentPlan == 'Premium',
-            badge: null,
-            showUpgradeButton: true,
-            upgradeButtonLabel: 'Go Premium',
-            isPurchasing: _purchasingProductId == GooglePlayBillingService.premiumProductId,
-            onUpgrade: () => _purchasePlan('Premium'),
-          ),
-          _PricingTierCard(
-            name: 'Expert',
-            tagline: 'Top Tier — maximum Oracle power',
-            price: GooglePlayBillingService.displayPriceForProductId(
-              GooglePlayBillingService.expertProductId,
-            ),
-            period: '/month',
-            icon: Icons.auto_awesome,
-            accentColor: const Color(0xFFFFB74D),
-            features: const [
-              'Everything in Premium',
-              'Full Oracle Citadel (Automated Live Execution)',
-              'Unlimited Oracle Trader AI Chat',
-              'Oracle Vision (Live High-Conviction Opportunities)',
-              'Oracle Desk (Advanced Performance + Personal Command Center)',
-            ],
-            isCurrent: _currentPlan == 'Expert',
-            badge: 'MOST POPULAR',
-            showUpgradeButton: true,
-            upgradeButtonLabel: 'Go Expert',
-            isPurchasing: _purchasingProductId == GooglePlayBillingService.expertProductId,
-            onUpgrade: () => _purchasePlan('Expert'),
+          Text(
+            'AI-generated analysis is for educational purposes only — not financial advice. '
+            'Oracle Citadel is non-custodial: you connect your own exchange API keys and are '
+            'responsible for all trades.',
+            style: TextStyle(fontSize: 12, height: 1.45, color: Colors.grey[600]),
           ),
           const SizedBox(height: 8),
           Center(
@@ -10117,7 +10129,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _SettingsSwitchTile(
             icon: Icons.auto_awesome_outlined,
             title: 'Desk Pulse',
-            subtitle: 'Bias flips (Premium+)',
+            subtitle: 'Bias flips (Oracle Pro)',
             value: !OracleAlertStore.mutePulse && !OracleAlertStore.muteAll,
             onChanged: (v) async {
               OracleAlertStore.mutePulse = !v;
@@ -10545,9 +10557,8 @@ class PrivacySecurityScreen extends StatelessWidget {
           ),
           _PrivacySection(
             title: 'Subscriptions',
-            body: 'Premium and Expert plans are billed through Google Play '
-                '(${GooglePlayBillingService.fallbackPremiumPrice}/mo and '
-                '${GooglePlayBillingService.fallbackExpertPrice}/mo; local Play price may vary). '
+            body: 'Oracle Pro is billed monthly through Google Play '
+                '(${GooglePlayBillingService.fallbackProPrice}/mo; local Play price may vary). '
                 'Manage or cancel subscriptions in your Google Play account settings.',
           ),
           _PrivacySection(
@@ -10624,7 +10635,7 @@ class HelpSupportScreen extends StatelessWidget {
     ),
     (
       'Can I upgrade my plan?',
-      'Go to Profile → Subscription Plan to compare Free, Premium, and Expert tiers.',
+      'Go to Profile → Subscription to unlock Oracle Pro — one plan with full access to every tool.',
     ),
   ];
 
@@ -12277,9 +12288,9 @@ class _LegacyAlertsScreenUnusedState extends State<_LegacyAlertsScreenUnused> wi
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF1A1A1A),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text('Premium Plan Required', style: TextStyle(fontWeight: FontWeight.w600)),
+        title: const Text('Oracle Pro Required', style: TextStyle(fontWeight: FontWeight.w600)),
         content: Text(
-          'Advanced custom alerts (RSI, MACD, Volume, VWAP Cross, News) are available on Premium and Expert plans. '
+          'Advanced custom alerts (RSI, MACD, Volume, VWAP Cross, News) are included with Oracle Pro. '
           'Free plan includes basic Price alerts only.',
           style: TextStyle(height: 1.45, color: Colors.grey[400]),
         ),

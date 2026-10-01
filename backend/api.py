@@ -6894,6 +6894,27 @@ async def health() -> dict[str, Any]:
         return {"status": "ok", "version": "2.5.0", "degraded": True}
 
 
+# ─── Store-review access ─────────────────────────────────────────────────────
+# Google Play / App Store reviewers must reach every paid screen without billing.
+# REVIEWER_ACCESS_EMAILS = comma-separated emails (Railway env). Rotate after review.
+
+
+def _reviewer_access_emails() -> set[str]:
+    raw = os.getenv("REVIEWER_ACCESS_EMAILS") or ""
+    return {e.strip().lower() for e in raw.split(",") if e.strip()}
+
+
+@app.get("/reviewer_access")
+@app.get("/reviewer_access/")
+async def reviewer_access(email: str = "") -> dict[str, Any]:
+    """Returns whether this sign-in email is an allow-listed store reviewer (Oracle Pro access)."""
+    normalized = (email or "").strip().lower()
+    granted = bool(normalized) and normalized in _reviewer_access_emails()
+    if granted:
+        logger.info("reviewer_access_granted email_hash=%s", hashlib.sha256(normalized.encode()).hexdigest()[:12])
+    return {"granted": granted, "plan": "Expert" if granted else None}
+
+
 @app.post("/alerts/sync")
 async def sync_alert_watch(request: Request) -> dict[str, Any]:
     """Register open setup / price levels so the free Binance watcher can FCM when the app is closed."""
@@ -8016,6 +8037,31 @@ async def _execute_bitunix_citadel_trade(
         position_mode,
     )
 
+    def _size_error_response(order_type_label: str, size_meta: dict[str, Any]) -> JSONResponse:
+        msg = str(size_meta.get("error") or "Bitunix order size could not be computed.")
+        logger.warning(
+            "execute_trade_bitunix_size_rejected request_id=%s coin=%s order_type=%s meta=%s",
+            req_id,
+            trade.coin,
+            order_type_label,
+            {k: v for k, v in size_meta.items() if k != "error"},
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "status": "failed",
+                "order_type": order_type_label,
+                "trade_id": trade_id,
+                "detail": msg,
+                "user_message": msg,
+                "bitunix_code": "size_below_min",
+                "size_meta": size_meta,
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
     if not is_market:
         limit_entry = float(trade.entry_price)
         order_size, size_meta = await asyncio.to_thread(
@@ -8026,8 +8072,11 @@ async def _execute_bitunix_citadel_trade(
             leverage=effective_leverage,
             api_key=exchange_api_key,
             api_secret=exchange_secret,
+            coin=trade.coin,
             request_id=req_id,
         )
+        if size_meta.get("error"):
+            return _size_error_response("limit", size_meta)
         entry_result = await asyncio.to_thread(
             bux.place_order,
             api_key=exchange_api_key,
@@ -8201,8 +8250,11 @@ async def _execute_bitunix_citadel_trade(
         leverage=effective_leverage,
         api_key=exchange_api_key,
         api_secret=exchange_secret,
+        coin=trade.coin,
         request_id=req_id,
     )
+    if size_meta.get("error"):
+        return _size_error_response("market", size_meta)
 
     market_result = await asyncio.to_thread(
         bux.place_order,

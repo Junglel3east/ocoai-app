@@ -19,7 +19,7 @@ class OracleAcademyScreen extends StatelessWidget {
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 28),
         children: [
           Text(
-            'Core fundamentals in the Oracle voice. Free can read every lesson. Ask Oracle is Premium+ and remembers this lesson’s thread.',
+            'Core fundamentals in the Oracle voice. Free can read every lesson. Ask Oracle is included with Oracle Pro and remembers this lesson’s thread.',
             style: TextStyle(fontSize: 13.5, height: 1.45, color: Colors.grey[400]),
           ),
           const SizedBox(height: 6),

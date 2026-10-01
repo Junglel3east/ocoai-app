@@ -10,8 +10,11 @@ import json
 import logging
 import os
 import secrets
+import threading
 import time
 import urllib.parse
+from dataclasses import dataclass
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from typing import Any, Optional
 
 import requests
@@ -31,9 +34,10 @@ logger = logging.getLogger(__name__)
 BITUNIX_LIVE_API_BASE_URL = "https://fapi.bitunix.com"
 BITUNIX_DEFAULT_LEVERAGE = 5
 BITUNIX_MARGIN_COIN = "USDT"
-BITUNIX_DEFAULT_QTY = "0.001"
-BITUNIX_MIN_QTY = 0.001
-BITUNIX_QTY_STEP = 0.001
+# NOTE: qty / price precision and minimum size are PER CONTRACT — see fetch_symbol_rules().
+
+BITUNIX_TRADING_PAIRS_PATH = "/api/v1/futures/market/trading_pairs"
+BITUNIX_SYMBOL_RULES_TTL_SEC = 60 * 60
 
 BITUNIX_ACCOUNT_PATH = "/api/v1/futures/account"
 BITUNIX_CHANGE_LEVERAGE_PATH = "/api/v1/futures/account/change_leverage"
@@ -85,6 +89,164 @@ def bitunix_symbol(coin: str) -> str:
     if c.endswith("USDT"):
         return c
     return f"{c}USDT"
+
+
+# ─── Per-symbol trading rules (qty / price precision, min size) ──────────────
+#
+# Bitunix returns a generic "System error" when qty or price precision does not
+# match the contract (e.g. sending "0.153" SOL when SOL allows 2 decimals, or
+# "0.001" DOGE when the minimum is 53). Every contract has its own basePrecision /
+# quotePrecision / minTradeVolume — never assume BTC's rules for other coins.
+
+
+@dataclass(frozen=True)
+class SymbolRules:
+    symbol: str
+    qty_decimals: int
+    price_decimals: int
+    min_qty: float
+    max_market_qty: Optional[float]
+    max_leverage: Optional[int]
+    api_supported: bool
+    source: str  # "live" | "default"
+
+
+_DEFAULT_RULES_QTY_DECIMALS = 3
+_DEFAULT_RULES_MIN_QTY = 0.001
+_DEFAULT_RULES_PRICE_DECIMALS = 2
+
+_SYMBOL_RULES_CACHE: dict[str, tuple[float, SymbolRules]] = {}
+_SYMBOL_RULES_LOCK = threading.Lock()
+
+
+def _default_rules(symbol: str) -> SymbolRules:
+    return SymbolRules(
+        symbol=symbol,
+        qty_decimals=_DEFAULT_RULES_QTY_DECIMALS,
+        price_decimals=_DEFAULT_RULES_PRICE_DECIMALS,
+        min_qty=_DEFAULT_RULES_MIN_QTY,
+        max_market_qty=None,
+        max_leverage=None,
+        api_supported=True,
+        source="default",
+    )
+
+
+def _parse_rules_row(row: dict[str, Any]) -> Optional[SymbolRules]:
+    symbol = str(row.get("symbol") or "").upper()
+    if not symbol:
+        return None
+    try:
+        qty_decimals = int(row.get("basePrecision") if row.get("basePrecision") is not None else _DEFAULT_RULES_QTY_DECIMALS)
+        price_decimals = int(row.get("quotePrecision") if row.get("quotePrecision") is not None else _DEFAULT_RULES_PRICE_DECIMALS)
+        min_qty = float(row.get("minTradeVolume") or _DEFAULT_RULES_MIN_QTY)
+    except (TypeError, ValueError):
+        return None
+    max_market_qty: Optional[float] = None
+    try:
+        if row.get("maxMarketOrderVolume") is not None:
+            max_market_qty = float(row.get("maxMarketOrderVolume"))
+    except (TypeError, ValueError):
+        max_market_qty = None
+    max_leverage: Optional[int] = None
+    try:
+        if row.get("maxLeverage") is not None:
+            max_leverage = int(row.get("maxLeverage"))
+    except (TypeError, ValueError):
+        max_leverage = None
+    api_supported = row.get("isApiSupported")
+    return SymbolRules(
+        symbol=symbol,
+        qty_decimals=max(0, qty_decimals),
+        price_decimals=max(0, price_decimals),
+        min_qty=max(0.0, min_qty),
+        max_market_qty=max_market_qty,
+        max_leverage=max_leverage,
+        api_supported=True if api_supported is None else bool(api_supported),
+        source="live",
+    )
+
+
+def fetch_symbol_rules(coin: str, *, request_id: str = "?", force: bool = False) -> SymbolRules:
+    """Public (unsigned) contract rules for one symbol — cached for an hour."""
+    symbol = bitunix_symbol(coin)
+    now = time.time()
+    if not force:
+        with _SYMBOL_RULES_LOCK:
+            cached = _SYMBOL_RULES_CACHE.get(symbol)
+        if cached and now - cached[0] < BITUNIX_SYMBOL_RULES_TTL_SEC:
+            return cached[1]
+
+    url = f"{BITUNIX_LIVE_API_BASE_URL}{BITUNIX_TRADING_PAIRS_PATH}?{urllib.parse.urlencode({'symbols': symbol})}"
+    rules: Optional[SymbolRules] = None
+    try:
+        response = _BITUNIX_HTTP.get(url, timeout=15)
+        parsed = response.json() if response.text else {}
+        rows = parsed.get("data") if isinstance(parsed, dict) else None
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict) and str(row.get("symbol") or "").upper() == symbol:
+                    rules = _parse_rules_row(row)
+                    break
+        if rules is None:
+            logger.warning(
+                "bitunix_symbol_rules_missing request_id=%s symbol=%s status=%s code=%s",
+                request_id,
+                symbol,
+                response.status_code,
+                parsed.get("code") if isinstance(parsed, dict) else None,
+            )
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning("bitunix_symbol_rules_failed request_id=%s symbol=%s err=%s", request_id, symbol, exc)
+
+    if rules is None:
+        rules = _default_rules(symbol)
+    else:
+        with _SYMBOL_RULES_LOCK:
+            _SYMBOL_RULES_CACHE[symbol] = (now, rules)
+    logger.info(
+        "bitunix_symbol_rules request_id=%s symbol=%s qty_decimals=%s price_decimals=%s min_qty=%s source=%s",
+        request_id,
+        symbol,
+        rules.qty_decimals,
+        rules.price_decimals,
+        rules.min_qty,
+        rules.source,
+    )
+    return rules
+
+
+def _quantize_down(value: float, decimals: int) -> Decimal:
+    try:
+        d = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        d = Decimal(0)
+    exp = Decimal(1).scaleb(-decimals) if decimals > 0 else Decimal(1)
+    return d.quantize(exp, rounding=ROUND_DOWN)
+
+
+def _decimal_str(d: Decimal) -> str:
+    text = format(d, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def format_qty_for(rules: SymbolRules, qty: float) -> str:
+    """Round DOWN to the contract's qty precision — never above what was budgeted."""
+    return _decimal_str(_quantize_down(qty, rules.qty_decimals))
+
+
+def format_price_for(rules: SymbolRules, price: float) -> str:
+    return _decimal_str(_quantize_down(price, rules.price_decimals))
+
+
+def qty_is_valid(rules: SymbolRules, qty_str: str) -> bool:
+    try:
+        q = float(qty_str)
+    except (TypeError, ValueError):
+        return False
+    return q >= rules.min_qty and q > 0
 
 
 def _canonical_json(body: dict[str, Any]) -> str:
@@ -270,8 +432,24 @@ def user_friendly_error(code: Any, msg: Optional[str]) -> str:
         )
     if "permission" in text.lower() or code_s == "10003":
         return "Bitunix API key lacks Trade permission. Enable Trading API on your key."
+    if code_s == "20008" or "insufficient amount" in lower:
+        return "Bitunix: Order size is below this contract's minimum. Raise position size % or add USDT."
+    if code_s == "20001" or "market not exists" in lower:
+        return "Bitunix: This contract is not available for API trading. Try a different symbol."
+    if code_s == "20005" or "invalid leverage" in lower:
+        return "Bitunix: Leverage is outside this contract's allowed range. Lower leverage in Citadel Setup."
+    if code_s == "10002" or "parameter error" in lower:
+        return "Bitunix rejected the order parameters (code 10002). Retry — if it repeats, contact support."
+    if code_s == "10008":
+        return f"Bitunix: {text}" if text else "Bitunix rejected a parameter value (code 10008)."
+    if "system error" in lower or code_s == "500":
+        return (
+            "Bitunix returned a system error (code "
+            f"{code_s or '500'}). Usually a quantity/price precision mismatch or exchange-side hiccup — "
+            "Citadel has re-checked contract rules; try again in a moment."
+        )
     if text:
-        return f"Bitunix: {text}"
+        return f"Bitunix: {text}" + (f" (code {code_s})" if code_s and code_s not in text else "")
     return "Bitunix API request failed. Check keys and try again."
 
 
@@ -366,12 +544,6 @@ def fetch_available_usdt(
     return None
 
 
-def _format_qty(qty: float) -> str:
-    steps = max(1, int(qty / BITUNIX_QTY_STEP))
-    val = steps * BITUNIX_QTY_STEP
-    return f"{val:.3f}".rstrip("0").rstrip(".") or BITUNIX_DEFAULT_QTY
-
-
 def calculate_order_size(
     *,
     entry_price: float,
@@ -380,13 +552,18 @@ def calculate_order_size(
     leverage: float,
     api_key: str,
     api_secret: str,
+    coin: str = "BTC",
+    rules: Optional[SymbolRules] = None,
     request_id: str = "?",
 ) -> tuple[str, dict[str, Any]]:
     """
-    Position-size % of account → margin budget → notional (× leverage) → base qty.
-    Matches BloFin Citadel sizing: risk_percent is % of available USDT used as margin,
-    not % of account lost if stop hits.
+    Position-size % of account → margin budget → notional (× leverage) → base qty,
+    rounded DOWN to the contract's qty precision and checked against its minimum.
+    Matches BloFin Citadel sizing: risk_percent is % of available USDT used as margin.
+
+    On failure `meta["error"]` carries a user-facing message and the returned qty is "0".
     """
+    rules = rules or fetch_symbol_rules(coin, request_id=request_id)
     available = fetch_available_usdt(api_key=api_key, api_secret=api_secret, request_id=request_id)
     risk_pct = max(0.1, min(float(risk_percent), 100.0))
     lev = max(1.0, float(leverage))
@@ -401,12 +578,31 @@ def calculate_order_size(
         "entry_price": entry,
         "sl_distance": stop_dist,
         "available_usdt": available,
+        "symbol": rules.symbol,
+        "qty_decimals": rules.qty_decimals,
+        "min_qty": rules.min_qty,
+        "rules_source": rules.source,
     }
 
+    if not rules.api_supported:
+        meta["error"] = f"Bitunix does not allow API trading on {rules.symbol} right now."
+        return "0", meta
+
+    if rules.max_leverage and lev > rules.max_leverage:
+        meta["leverage_capped_to"] = rules.max_leverage
+        lev = float(rules.max_leverage)
+
     if not available or available <= 0:
+        # Balance probe failed — fall back to the contract minimum, not a BTC-sized guess.
+        qty_str = format_qty_for(rules, rules.min_qty)
         meta["fallback"] = "balance_unavailable"
-        logger.warning("bitunix_size_fallback_balance request_id=%s qty=%s", request_id, BITUNIX_DEFAULT_QTY)
-        return BITUNIX_DEFAULT_QTY, meta
+        logger.warning(
+            "bitunix_size_fallback_balance request_id=%s symbol=%s qty=%s",
+            request_id,
+            rules.symbol,
+            qty_str,
+        )
+        return qty_str, meta
 
     # Position size slider = % of available USDT deployed as margin (same as BloFin).
     margin_budget = available * (risk_pct / 100.0)
@@ -427,40 +623,88 @@ def calculate_order_size(
             qty = min(qty, max_by_sl)
             meta["loss_per_unit"] = loss_per_unit
 
-    qty = max(BITUNIX_MIN_QTY, qty)
-    required_margin = (qty * entry) / lev if lev > 0 else None
+    if rules.max_market_qty and qty > rules.max_market_qty:
+        qty = rules.max_market_qty
+        meta["capped_to_max_market_qty"] = rules.max_market_qty
+
+    qty_str = format_qty_for(rules, qty)
+    qty_rounded = float(qty_str) if qty_str else 0.0
+
+    if qty_rounded < rules.min_qty:
+        # Budget is below the exchange minimum. Bump to the minimum only if the
+        # account can actually margin it — otherwise fail with a clear message.
+        min_required_margin = (rules.min_qty * entry) / lev
+        if min_required_margin <= available * 0.98:
+            qty_str = format_qty_for(rules, rules.min_qty)
+            qty_rounded = float(qty_str)
+            meta["bumped_to_min_qty"] = True
+        else:
+            base = rules.symbol.replace("USDT", "")
+            meta["error"] = (
+                f"Bitunix minimum for {base} is {format_qty_for(rules, rules.min_qty)} {base} "
+                f"(~{rules.min_qty * entry:,.2f} USDT notional). Your {risk_pct:g}% budget at {lev:g}x "
+                f"needs about {min_required_margin:,.2f} USDT margin but {available:,.2f} USDT is available. "
+                "Raise position size %, raise leverage, or add USDT."
+            )
+            logger.warning(
+                "bitunix_size_below_min request_id=%s symbol=%s qty=%s min=%s available=%.4f",
+                request_id,
+                rules.symbol,
+                qty_str,
+                rules.min_qty,
+                available,
+            )
+            return "0", meta
+
+    required_margin = (qty_rounded * entry) / lev if lev > 0 else None
     meta.update(
         {
             "source": "balance",
             "margin_budget_usdt": margin_budget,
-            "notional_target_usdt": qty * entry,
-            "qty": qty,
+            "notional_target_usdt": qty_rounded * entry,
+            "qty": qty_rounded,
             "required_margin_usdt": required_margin,
         }
     )
     logger.info(
-        "bitunix_size_ok request_id=%s available=%.4f margin_budget=%.4f lev=%sx qty=%s required_margin=%s",
+        "bitunix_size_ok request_id=%s symbol=%s available=%.4f margin_budget=%.4f lev=%sx qty=%s "
+        "required_margin=%s",
         request_id,
+        rules.symbol,
         available,
         margin_budget,
         lev,
-        _format_qty(qty),
+        qty_str,
         f"{required_margin:.4f}" if required_margin is not None else "?",
     )
-    return _format_qty(qty), meta
+    return qty_str, meta
 
 
-def dual_tp_sizes(total_qty: str) -> tuple[str, str]:
+def dual_tp_sizes(total_qty: str, rules: Optional[SymbolRules] = None) -> tuple[str, Optional[str]]:
+    """
+    40% / 60% split honoring the contract's precision and minimum.
+    Returns (tp1_qty, tp2_qty); tp2 is None when the position is too small to split
+    (caller should place a single TP for the full size).
+    """
+    rules = rules or _default_rules("BTCUSDT")
     try:
         total = float(total_qty)
     except (TypeError, ValueError):
-        total = BITUNIX_MIN_QTY
-    if total < BITUNIX_MIN_QTY * 2:
-        half = max(BITUNIX_MIN_QTY, total / 2.0)
-        return _format_qty(half), _format_qty(max(BITUNIX_MIN_QTY, total - half))
-    tp1 = total * 0.4
-    tp2 = max(BITUNIX_MIN_QTY, total - tp1)
-    return _format_qty(tp1), _format_qty(tp2)
+        total = 0.0
+    if total <= 0:
+        return format_qty_for(rules, rules.min_qty), None
+    total_str = format_qty_for(rules, total)
+    total = float(total_str)
+    if total < rules.min_qty * 2:
+        return total_str, None
+    tp1 = float(format_qty_for(rules, total * 0.4))
+    if tp1 < rules.min_qty:
+        tp1 = rules.min_qty
+    tp2 = total - tp1
+    tp2_str = format_qty_for(rules, tp2)
+    if float(tp2_str) < rules.min_qty:
+        return total_str, None
+    return format_qty_for(rules, tp1), tp2_str
 
 
 def set_leverage(
@@ -472,10 +716,12 @@ def set_leverage(
     request_id: str = "?",
 ) -> dict[str, Any]:
     symbol = bitunix_symbol(coin)
+    rules = fetch_symbol_rules(coin, request_id=request_id)
+    max_lev = rules.max_leverage or 125
     body = {
         "symbol": symbol,
         "marginCoin": BITUNIX_MARGIN_COIN,
-        "leverage": int(max(1, min(leverage, 125))),
+        "leverage": int(max(1, min(leverage, max_lev))),
     }
     http_status, _raw, parsed = _private_request(
         base_url=BITUNIX_LIVE_API_BASE_URL,
@@ -528,6 +774,7 @@ def place_order(
     request_id: str = "?",
 ) -> dict[str, Any]:
     symbol = bitunix_symbol(coin)
+    rules = fetch_symbol_rules(coin, request_id=request_id)
     mode = (position_mode or "HEDGE").upper()
     if trade_side:
         side = "BUY" if direction.lower() == "long" and trade_side == "OPEN" else (
@@ -539,9 +786,26 @@ def place_order(
     else:
         side, ts = _open_side(direction)
 
+    try:
+        qty_str = format_qty_for(rules, float(qty))
+    except (TypeError, ValueError):
+        qty_str = str(qty)
+    if not qty_is_valid(rules, qty_str):
+        base = symbol.replace("USDT", "")
+        return {
+            "ok": False,
+            "http_status": 0,
+            "code": "qty_below_min",
+            "msg": (
+                f"Bitunix minimum order for {base} is {format_qty_for(rules, rules.min_qty)} {base}; "
+                f"Citadel computed {qty_str}. Raise position size % or add USDT."
+            ),
+            "order_id": None,
+        }
+
     body: dict[str, Any] = {
         "symbol": symbol,
-        "qty": str(qty),
+        "qty": qty_str,
         "side": side,
         "orderType": "MARKET" if order_type.lower() == "market" else "LIMIT",
     }
@@ -552,10 +816,10 @@ def place_order(
     if client_id:
         body["clientId"] = client_id[:32]
     if body["orderType"] == "LIMIT" and price is not None:
-        body["price"] = str(price)
+        body["price"] = format_price_for(rules, float(price))
         body["effect"] = "GTC"
     if sl is not None and not reduce_only:
-        body["slPrice"] = str(sl)
+        body["slPrice"] = format_price_for(rules, float(sl))
         body["slStopType"] = "MARK_PRICE"
         body["slOrderType"] = "MARKET"
 
@@ -737,18 +1001,23 @@ def place_tpsl_order(
     log_tag: str = "bitunix_tpsl",
 ) -> dict[str, Any]:
     """Native Bitunix TP/SL order (shows in exchange TP/SL UI like BloFin order-tpsl)."""
+    rules = fetch_symbol_rules(coin, request_id=request_id)
+    try:
+        qty_str = format_qty_for(rules, float(qty))
+    except (TypeError, ValueError):
+        qty_str = str(qty)
     body: dict[str, Any] = {
         "symbol": bitunix_symbol(coin),
         "positionId": str(position_id),
     }
     if tp_price is not None:
-        body["tpPrice"] = str(tp_price)
-        body["tpQty"] = str(qty)
+        body["tpPrice"] = format_price_for(rules, float(tp_price))
+        body["tpQty"] = qty_str
         body["tpStopType"] = "MARK_PRICE"
         body["tpOrderType"] = "MARKET"
     if sl_price is not None:
-        body["slPrice"] = str(sl_price)
-        body["slQty"] = str(qty)
+        body["slPrice"] = format_price_for(rules, float(sl_price))
+        body["slQty"] = qty_str
         body["slStopType"] = "MARK_PRICE"
         body["slOrderType"] = "MARKET"
     if "tpPrice" not in body and "slPrice" not in body:
@@ -828,7 +1097,9 @@ def attach_dual_tpsl_after_fill(
             "warnings": ["Could not resolve Bitunix position for TP/SL attachment."],
         }
 
-    tp1_size, tp2_size = dual_tp_sizes(position_size_str)
+    rules = fetch_symbol_rules(coin, request_id=request_id)
+    tp1_size, tp2_size = dual_tp_sizes(position_size_str, rules)
+    single_tp = tp2_size is None
     sl_tpsl_id: Optional[str] = None
     tp1_tpsl_id: Optional[str] = None
     tp2_tpsl_id: Optional[str] = None
@@ -883,32 +1154,40 @@ def attach_dual_tpsl_after_fill(
             tp1,
         )
     else:
-        warnings.append(f"TP1 (40%) not placed: {tp1_result.get('msg') or 'unknown'}")
+        label = "TP (full size)" if single_tp else "TP1 (40%)"
+        warnings.append(f"{label} not placed: {tp1_result.get('msg') or 'unknown'}")
 
-    tp2_result = place_tpsl_order(
-        api_key=api_key,
-        api_secret=api_secret,
-        coin=coin,
-        position_id=position_id,
-        qty=tp2_size,
-        tp_price=tp2,
-        request_id=request_id,
-        log_tag="bitunix_tpsl_tp2",
-    )
-    tp2_tpsl_id = tp2_result.get("tpsl_id")
-    if tp2_result.get("ok"):
-        logger.info(
-            "bitunix_tp2_tpsl_ok request_id=%s tpsl_id=%s size=%s trigger=%s",
-            request_id,
-            tp2_tpsl_id,
-            tp2_size,
-            tp2,
+    if single_tp:
+        base = rules.symbol.replace("USDT", "")
+        warnings.append(
+            f"Position ({position_size_str} {base}) is too small to split 40/60 on Bitunix "
+            f"(min {format_qty_for(rules, rules.min_qty)} {base}) — single TP set at TP1."
         )
     else:
-        warnings.append(f"TP2 (60%) not placed: {tp2_result.get('msg') or 'unknown'}")
+        tp2_result = place_tpsl_order(
+            api_key=api_key,
+            api_secret=api_secret,
+            coin=coin,
+            position_id=position_id,
+            qty=tp2_size or "0",
+            tp_price=tp2,
+            request_id=request_id,
+            log_tag="bitunix_tpsl_tp2",
+        )
+        tp2_tpsl_id = tp2_result.get("tpsl_id")
+        if tp2_result.get("ok"):
+            logger.info(
+                "bitunix_tp2_tpsl_ok request_id=%s tpsl_id=%s size=%s trigger=%s",
+                request_id,
+                tp2_tpsl_id,
+                tp2_size,
+                tp2,
+            )
+        else:
+            warnings.append(f"TP2 (60%) not placed: {tp2_result.get('msg') or 'unknown'}")
 
     return {
-        "ok": not warnings,
+        "ok": not any(w for w in warnings if "not placed" in w),
         "position_id": position_id,
         "sl_tpsl_id": sl_tpsl_id,
         "tp1_tpsl_id": tp1_tpsl_id,
@@ -964,12 +1243,17 @@ def place_tp_close_order(
 ) -> dict[str, Any]:
     side, trade_side = _close_side(direction)
     mode = (position_mode or "HEDGE").upper()
+    rules = fetch_symbol_rules(coin, request_id=request_id)
+    try:
+        qty_str = format_qty_for(rules, float(qty))
+    except (TypeError, ValueError):
+        qty_str = str(qty)
     body: dict[str, Any] = {
         "symbol": bitunix_symbol(coin),
-        "qty": str(qty),
+        "qty": qty_str,
         "side": side,
         "orderType": "LIMIT",
-        "price": str(tp_price),
+        "price": format_price_for(rules, float(tp_price)),
         "effect": "GTC",
         "reduceOnly": True,
     }

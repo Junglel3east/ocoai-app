@@ -1,7 +1,7 @@
 <en-US>
-What's new in 1.0.6 (build 15):
-• Production release — closed testing cleared
-• Subscription plan prices now match Google Play ($39.99 / $79.99; live Play catalog when available)
-• Sign-in after Sign Out fixed; Sign Out confirmation
-• Bankroll min $100, report Markdown, alert validation, live About version
+What's new in 1.0.7 (build 16):
+• One plan: Oracle Pro ($49.99/mo) unlocks every tool — any symbol, all timeframes, unlimited setups and AI chat, Oracle Vision, Citadel, Oracle Desk
+• Redesigned Subscription page
+• Citadel: fixed Bitunix "System error" — order size and price now follow each contract's live precision and minimum
+• Clearer Citadel error messages when a position is below the exchange minimum
 </en-US>
