@@ -23,6 +23,9 @@ from requests_oauthlib import OAuth1
 logger = logging.getLogger("ocoai.x_daily_poster")
 
 _TWEET_MAX = 280
+_X_URL_WEIGHT = 23
+_PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=com.onchainoracleai.app"
+_APP_LINK_LABEL = "📲 Get the app: "
 _X_API_TWEETS_URL = "https://api.twitter.com/2/tweets"
 
 _BIAS_RE = re.compile(
@@ -221,7 +224,10 @@ def format_thread_header(day: str, coins: list[str], handle: str, *, updated: bo
         f"Thread 👇 · {handle}\n"
         f"#OnChainOracle #Crypto #Trading"
     )
-    return _truncate(text, _TWEET_MAX)
+    # X counts any URL as 23 chars and an emoji as 2, so the link line costs less than len().
+    link_line = f"{_APP_LINK_LABEL}{_PLAY_STORE_URL}"
+    link_cost = len(_APP_LINK_LABEL) + 1 + _X_URL_WEIGHT
+    return _truncate(text, _TWEET_MAX - 1 - link_cost) + "\n" + link_line
 
 
 def _load_state(path: Path) -> dict[str, Any]:
@@ -263,7 +269,8 @@ class XDailyPoster:
         )
 
     def post_tweet(self, text: str, *, reply_to_tweet_id: Optional[str] = None) -> dict[str, Any]:
-        payload: dict[str, Any] = {"text": text[:_TWEET_MAX]}
+        # Formatters enforce X's weighted 280 limit; a raw slice here would cut URLs.
+        payload: dict[str, Any] = {"text": text}
         if reply_to_tweet_id:
             payload["reply"] = {"in_reply_to_tweet_id": reply_to_tweet_id}
 
