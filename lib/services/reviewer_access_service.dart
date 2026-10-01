@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -9,7 +10,8 @@ import 'user_profile_store.dart';
 /// Store-review access — Google Play / App Store reviewers must reach every
 /// paid screen without billing info. The backend keeps the allow-list
 /// (`REVIEWER_ACCESS_EMAILS` on Railway); a matching sign-in email is granted
-/// Oracle Pro on this device. Rotate the list after each review.
+/// Oracle Pro on this device. Only a salted SHA-256 of the email leaves the
+/// device — keep in sync with `_reviewer_email_hash` in backend/api.py.
 abstract final class ReviewerAccessService {
   static const _backendBaseUrl = String.fromEnvironment(
     'BACKEND_BASE_URL',
@@ -26,8 +28,9 @@ abstract final class ReviewerAccessService {
     final normalized = email.trim().toLowerCase();
     if (normalized.isEmpty) return false;
     try {
+      final digest = sha256.convert(utf8.encode('oco_reviewer:$normalized')).toString();
       final uri = Uri.parse('$_backendBaseUrl/reviewer_access')
-          .replace(queryParameters: {'email': normalized});
+          .replace(queryParameters: {'h': digest});
       final response = await http.get(uri).timeout(const Duration(seconds: 6));
       if (response.statusCode != 200) return false;
       final decoded = jsonDecode(response.body);

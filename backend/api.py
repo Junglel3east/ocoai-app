@@ -6899,19 +6899,26 @@ async def health() -> dict[str, Any]:
 # REVIEWER_ACCESS_EMAILS = comma-separated emails (Railway env). Rotate after review.
 
 
-def _reviewer_access_emails() -> set[str]:
+# The app sends only sha256("oco_reviewer:" + lowercased email) — never the raw address.
+
+
+def _reviewer_email_hash(email: str) -> str:
+    return hashlib.sha256(f"oco_reviewer:{email.strip().lower()}".encode()).hexdigest()
+
+
+def _reviewer_access_hashes() -> set[str]:
     raw = os.getenv("REVIEWER_ACCESS_EMAILS") or ""
-    return {e.strip().lower() for e in raw.split(",") if e.strip()}
+    return {_reviewer_email_hash(e) for e in raw.split(",") if e.strip()}
 
 
 @app.get("/reviewer_access")
 @app.get("/reviewer_access/")
-async def reviewer_access(email: str = "") -> dict[str, Any]:
-    """Returns whether this sign-in email is an allow-listed store reviewer (Oracle Pro access)."""
-    normalized = (email or "").strip().lower()
-    granted = bool(normalized) and normalized in _reviewer_access_emails()
+async def reviewer_access(h: str = "") -> dict[str, Any]:
+    """Returns whether this sign-in email hash is an allow-listed store reviewer (Oracle Pro access)."""
+    digest = (h or "").strip().lower()
+    granted = len(digest) == 64 and digest in _reviewer_access_hashes()
     if granted:
-        logger.info("reviewer_access_granted email_hash=%s", hashlib.sha256(normalized.encode()).hexdigest()[:12])
+        logger.info("reviewer_access_granted hash_prefix=%s", digest[:12])
     return {"granted": granted, "plan": "Expert" if granted else None}
 
 
