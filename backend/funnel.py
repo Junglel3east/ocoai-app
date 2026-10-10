@@ -70,7 +70,7 @@ class FunnelStore:
             self._recent[install_id] = hits
             return True
 
-    def append(self, event: dict[str, Any], *, user_id: Optional[str], now: Optional[float] = None) -> None:
+    def append(self, event: dict[str, Any], *, user_id: Optional[str] = None, now: Optional[float] = None) -> None:
         row = {**event, "ts": now if now is not None else time.time()}
         if user_id:
             row["user_id"] = user_id
@@ -92,6 +92,51 @@ class FunnelStore:
                 if isinstance(row, dict) and float(row.get("ts") or 0) >= since:
                     rows.append(row)
         return rows
+
+
+def clean_crash(raw: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(raw, dict) or not raw.get("error"):
+        return None
+
+    def text(key: str, limit: int) -> str:
+        return str(raw.get(key) or "")[:limit]
+
+    return {
+        "error": text("error", 500),
+        "type": text("type", 100),
+        "stack": text("stack", 4000),
+        "fatal": bool(raw.get("fatal")),
+        "context": text("context", 200),
+        "app_version": text("app_version", 40),
+        "os": text("os", 80),
+    }
+
+
+def _crash_signature(row: dict[str, Any]) -> str:
+    frames = [ln.strip() for ln in str(row.get("stack") or "").splitlines() if ln.strip()]
+    app_frame = next((f for f in frames if "package:on_chain_oracle_ai" in f), frames[0] if frames else "")
+    return f"{row.get('type')}|{app_frame}"
+
+
+def summarize_crashes(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Group crashes by error type + first app stack frame, most frequent first."""
+    groups: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        sig = _crash_signature(row)
+        g = groups.setdefault(
+            sig,
+            {"signature": sig, "count": 0, "fatal": False, "first_seen": row.get("ts"), "versions": set(),
+             "sample_error": row.get("error"), "sample_stack": row.get("stack")},
+        )
+        g["count"] += 1
+        g["fatal"] = g["fatal"] or bool(row.get("fatal"))
+        g["last_seen"] = row.get("ts")
+        if row.get("app_version"):
+            g["versions"].add(row["app_version"])
+    ordered = sorted(groups.values(), key=lambda g: g["count"], reverse=True)
+    for g in ordered:
+        g["versions"] = sorted(g["versions"])
+    return {"total": len(rows), "groups": ordered}
 
 
 def _rate(numerator: int, denominator: int) -> Optional[float]:

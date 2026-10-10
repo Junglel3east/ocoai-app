@@ -142,6 +142,7 @@ _BILLING_STORE = play_billing.EntitlementStore(_CITADEL_DATA_DIR / "billing_enti
 _TRACK_RECORD_STORE = trk.TrackRecordStore(_CITADEL_DATA_DIR / "track_record.json")
 _PAPER_TRADES_STORE = trk.TrackRecordStore(_CITADEL_DATA_DIR / "paper_trades.json")
 _FUNNEL_STORE = funnel.FunnelStore(_CITADEL_DATA_DIR / "funnel_events.jsonl")
+_CRASH_STORE = funnel.FunnelStore(_CITADEL_DATA_DIR / "app_crashes.jsonl")
 # Owner-only funnel summary: GET /analytics/funnel with header X-Admin-Token.
 ANALYTICS_ADMIN_TOKEN = (os.getenv("ANALYTICS_ADMIN_TOKEN") or "").strip()
 TRACK_RECORD_EVAL_INTERVAL_SEC = int(os.getenv("TRACK_RECORD_EVAL_INTERVAL_SEC", "1800"))
@@ -7139,16 +7140,47 @@ async def analytics_event(http_request: Request) -> JSONResponse:
     return JSONResponse(status_code=200, content={"success": True})
 
 
-@app.get("/analytics/funnel")
-async def analytics_funnel(http_request: Request, days: int = 30) -> JSONResponse:
+def _analytics_admin_error(http_request: Request) -> Optional[JSONResponse]:
     if not ANALYTICS_ADMIN_TOKEN:
         return JSONResponse(status_code=503, content={"success": False, "detail": "ANALYTICS_ADMIN_TOKEN not set."})
     supplied = (http_request.headers.get("X-Admin-Token") or "").strip()
     if not hmac.compare_digest(supplied, ANALYTICS_ADMIN_TOKEN):
         return JSONResponse(status_code=401, content={"success": False, "detail": "Unauthorized."})
+    return None
+
+
+@app.get("/analytics/funnel")
+async def analytics_funnel(http_request: Request, days: int = 30) -> JSONResponse:
+    if (err := _analytics_admin_error(http_request)) is not None:
+        return err
     days = max(1, min(days, 365))
     rows = await asyncio.to_thread(_FUNNEL_STORE.read_since, time.time() - days * 86400)
     return JSONResponse(status_code=200, content={"success": True, "days": days, **funnel.summarize(rows)})
+
+
+@app.post("/analytics/crash")
+async def analytics_crash(http_request: Request) -> JSONResponse:
+    """Uncaught app error report. Rate-limited per client IP."""
+    try:
+        raw = await http_request.json()
+    except Exception:
+        raw = None
+    crash = funnel.clean_crash(raw)
+    client = http_request.client.host if http_request.client else "unknown"
+    if crash is not None and _CRASH_STORE.allow(f"ip:{client}"):
+        await asyncio.to_thread(_CRASH_STORE.append, crash)
+        logger.warning("app_crash type=%s fatal=%s version=%s err=%s",
+                       crash["type"], crash["fatal"], crash["app_version"], crash["error"][:160])
+    return JSONResponse(status_code=200, content={"success": True})
+
+
+@app.get("/analytics/crashes")
+async def analytics_crashes(http_request: Request, days: int = 7) -> JSONResponse:
+    if (err := _analytics_admin_error(http_request)) is not None:
+        return err
+    days = max(1, min(days, 90))
+    rows = await asyncio.to_thread(_CRASH_STORE.read_since, time.time() - days * 86400)
+    return JSONResponse(status_code=200, content={"success": True, "days": days, **funnel.summarize_crashes(rows)})
 
 
 @app.post("/alerts/sync")

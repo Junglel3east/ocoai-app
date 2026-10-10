@@ -257,6 +257,19 @@ def test_funnel_summary_counts_unique_installs() -> None:
         assert not store.allow("dd44dd44", now=1000.0), "rate limited after 30/min"
 
 
+def test_crash_grouping() -> None:
+    import funnel
+
+    stack = "#0 Foo.bar (package:on_chain_oracle_ai/main.dart:10)\n#1 dart:async"
+    rows = [dict(funnel.clean_crash({"error": "boom", "type": "StateError", "stack": stack,
+                                     "app_version": v}), ts=i) for i, v in enumerate(["1.0.8", "1.0.8", "1.0.9"])]
+    rows.append(dict(funnel.clean_crash({"error": "x", "type": "RangeError", "stack": "#0 other"}), ts=9))
+    s = funnel.summarize_crashes(rows)
+    assert s["total"] == 4 and s["groups"][0]["count"] == 3
+    assert s["groups"][0]["versions"] == ["1.0.8", "1.0.9"]
+    assert funnel.clean_crash({"type": "x"}) is None
+
+
 if __name__ == "__main__":
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_") and callable(fn)]
     failed = 0

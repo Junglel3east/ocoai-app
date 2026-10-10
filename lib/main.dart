@@ -39,6 +39,7 @@ import 'services/app_api_key_service.dart';
 import 'services/auth_service.dart';
 import 'services/google_play_billing_service.dart';
 import 'services/entitlement_service.dart';
+import 'services/crash_reporter.dart';
 import 'services/funnel_analytics.dart';
 import 'services/social_links.dart';
 import 'services/x_share_service.dart';
@@ -5111,6 +5112,7 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  CrashReporter.install(appVersion: AppVersionInfo.aboutLine);
   // Hive — Recent Analyses / trade setup history survives app restarts.
   await AnalysisHistoryStore.init();
   await DailyAnalysisStore.init();
