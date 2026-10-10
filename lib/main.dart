@@ -38,6 +38,7 @@ import 'services/oracle_vision_service.dart';
 import 'services/app_api_key_service.dart';
 import 'services/auth_service.dart';
 import 'services/google_play_billing_service.dart';
+import 'services/entitlement_service.dart';
 import 'services/social_links.dart';
 import 'services/x_share_service.dart';
 import 'widgets/push_to_x_button.dart';
@@ -57,6 +58,8 @@ part 'screens/trade_performance_screen.dart';
 part 'screens/citadel_trade_levels.dart';
 part 'screens/citadel_setup_dialog.dart';
 part 'screens/citadel_live_positions.dart';
+part 'screens/citadel_safety.dart';
+part 'screens/track_record_screen.dart';
 part 'screens/oracle_desk_screen.dart';
 part 'screens/first_run_setup_screen.dart';
 part 'screens/oracle_academy_screen.dart';
@@ -778,8 +781,8 @@ const String kReportDisclaimer =
 
 /// Keep in sync with `pubspec.yaml` version (`name+build`).
 abstract final class AppVersionInfo {
-  static const versionName = '1.0.7';
-  static const buildNumber = '18';
+  static const versionName = '1.0.8';
+  static const buildNumber = '19';
   static const label = 'v$versionName';
   static const aboutLine = 'Version $versionName (Build $buildNumber)';
 }
@@ -1115,8 +1118,13 @@ abstract final class OracleCitadelStore {
   static const _leverageKey = 'citadel_leverage';
   static const _demoModeKey = 'citadel_use_demo_mode';
   static const _selectedExchangeKey = 'citadel_selected_exchange';
+  static const _paperModeKey = 'citadel_paper_mode';
 
   static String userId = 'demo_user';
+  /// Paper mode routes "Send to Oracle Citadel" to graded paper trades instead of the exchange.
+  static bool paperMode = false;
+  /// Server-side kill switch; refreshed from `/exchange_keys/status`.
+  static bool serverPaused = false;
   static String apiKey = '';
   static double defaultRiskPercent = 1.0;
   static double defaultLeverage = 5.0;
@@ -1145,6 +1153,13 @@ abstract final class OracleCitadelStore {
     selectedExchange = prefs.getString(_selectedExchangeKey) ?? 'blofin';
     if (selectedExchange != 'bitunix') selectedExchange = 'blofin';
     useDemoMode = _demoModeForExchange(selectedExchange);
+    paperMode = prefs.getBool(_paperModeKey) ?? false;
+  }
+
+  static Future<void> savePaperMode(bool enabled) async {
+    paperMode = enabled;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_paperModeKey, enabled);
   }
 
   /// Mode is dictated by the exchange: BloFin = demo-only, Bitunix = live-only.
@@ -1558,6 +1573,7 @@ abstract final class OracleCitadelService {
         if (body['use_demo_mode'] is bool) {
           await OracleCitadelStore.saveDemoMode(body['use_demo_mode'] as bool);
         }
+        OracleCitadelStore.serverPaused = body['paused'] == true;
         await OracleCitadelStore.markExchangeLinked(true);
         return const CitadelServerLinkStatus(linked: true);
       }
@@ -1748,6 +1764,33 @@ Future<void> _sendMarketOrder(
   }
   final rootContext = Navigator.of(messengerContext, rootNavigator: true).context;
 
+  if (OracleCitadelStore.paperMode) {
+    await _sendPaperOrder(
+      messengerContext,
+      orderType: 'market',
+      coin: coin,
+      direction: direction,
+      plannedEntry: plannedEntry,
+      stopLoss: stopLoss,
+      tp1: tp1,
+      tp2: tp2,
+    );
+    return;
+  }
+  final confirmed = await _previewAndConfirmCitadelOrder(
+    messengerContext,
+    orderType: 'market',
+    coin: coin,
+    direction: direction,
+    entryPrice: plannedEntry,
+    stopLoss: stopLoss,
+    tp1: tp1,
+    tp2: tp2,
+    riskPercent: riskPercent,
+    leverage: leverage,
+  );
+  if (!confirmed || !messengerContext.mounted) return;
+
   ScaffoldMessenger.of(messengerContext).showSnackBar(
     SnackBar(
       content: Text('Executing MARKET ${direction.toUpperCase()} on $coin…'),
@@ -1790,6 +1833,7 @@ Future<void> _sendMarketOrder(
       );
     }
 
+    if (!rootContext.mounted) return;
     _showCitadelPostExecutionReviewDialog(
       rootContext,
       reportText: reportText,
@@ -1800,10 +1844,10 @@ Future<void> _sendMarketOrder(
       direction: direction,
     );
   } on OracleCitadelException catch (e) {
-    if (!messengerContext.mounted) return;
     if (e.errorCode == 'credentials_missing' || e.errorCode == 'credentials_mismatch') {
       await OracleCitadelStore.clearExchangeLinked();
     }
+    if (!messengerContext.mounted) return;
     ScaffoldMessenger.of(messengerContext).showSnackBar(
       SnackBar(
         content: Text(e.userMessage),
@@ -1853,6 +1897,33 @@ Future<void> _sendLimitOrder(
   }
   final rootContext = Navigator.of(messengerContext, rootNavigator: true).context;
 
+  if (OracleCitadelStore.paperMode) {
+    await _sendPaperOrder(
+      messengerContext,
+      orderType: 'limit',
+      coin: coin,
+      direction: direction,
+      plannedEntry: plannedEntry,
+      stopLoss: stopLoss,
+      tp1: tp1,
+      tp2: tp2,
+    );
+    return;
+  }
+  final confirmed = await _previewAndConfirmCitadelOrder(
+    messengerContext,
+    orderType: 'limit',
+    coin: coin,
+    direction: direction,
+    entryPrice: plannedEntry,
+    stopLoss: stopLoss,
+    tp1: tp1,
+    tp2: tp2,
+    riskPercent: riskPercent,
+    leverage: leverage,
+  );
+  if (!confirmed || !messengerContext.mounted) return;
+
   ScaffoldMessenger.of(messengerContext).showSnackBar(
     SnackBar(
       content: Text(
@@ -1898,6 +1969,7 @@ Future<void> _sendLimitOrder(
       );
     }
 
+    if (!rootContext.mounted) return;
     _showCitadelLimitPostPlacementDialog(
       rootContext,
       reportText: reportText,
@@ -1908,10 +1980,10 @@ Future<void> _sendLimitOrder(
       direction: direction,
     );
   } on OracleCitadelException catch (e) {
-    if (!messengerContext.mounted) return;
     if (e.errorCode == 'credentials_missing' || e.errorCode == 'credentials_mismatch') {
       await OracleCitadelStore.clearExchangeLinked();
     }
+    if (!messengerContext.mounted) return;
     ScaffoldMessenger.of(messengerContext).showSnackBar(
       SnackBar(
         content: Text(e.userMessage),
@@ -2014,8 +2086,13 @@ Future<void> _showCitadelExecuteChoiceDialog(
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            'Market or Limit · ${OracleCitadelStore.exchangeDisplayLabel}',
-                            style: const TextStyle(fontSize: 13, color: Colors.grey),
+                            OracleCitadelStore.paperMode
+                                ? 'Paper trade · no real order'
+                                : 'Market or Limit · ${OracleCitadelStore.exchangeDisplayLabel}',
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: OracleCitadelStore.paperMode ? const Color(0xFFB39DDB) : Colors.grey,
+                            ),
                           ),
                         ],
                       ),
@@ -3175,7 +3252,9 @@ class _SendToCitadelButtonState extends State<SendToCitadelButton> {
       if (!OracleCitadelStore.isConfigured) return;
     }
 
-    var linkStatus = await OracleCitadelService.checkServerLinked();
+    var linkStatus = OracleCitadelStore.paperMode
+        ? const CitadelServerLinkStatus(linked: true)
+        : await OracleCitadelService.checkServerLinked();
     if (!linkStatus.linked) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).clearSnackBars();
@@ -5027,6 +5106,13 @@ void main() async {
     debugPrint('[main] Google Play Billing init skipped: $e');
   }
   await SubscriptionPlanStore.load();
+  // After Play's silent restore has reported owned purchases, adopt the server's entitlement.
+  unawaited(
+    Future<void>.delayed(const Duration(seconds: 6), () async {
+      await EntitlementService.sync();
+      await SubscriptionPlanStore.load();
+    }),
+  );
   if (kDebugMode) pingBackendHealth();
   runApp(const OnChainOracleAI());
 }
@@ -5438,6 +5524,8 @@ class _CitadelExpertViewState extends State<_CitadelExpertView> {
                 ),
               ],
               if (!_loading) ...[
+                const SizedBox(height: 18),
+                CitadelPaperTradesPanel(isActive: widget.isActive),
                 const SizedBox(height: 18),
                 _CitadelLeverageRiskPanel(
                   leverage: _leverage,
@@ -9208,6 +9296,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     title: 'Subscription Plan',
                     subtitle: 'View or upgrade your plan',
                     onTap: () => _open(context, const SubscriptionPlanScreen()),
+                  ),
+                  _ProfileMenuTile(
+                    icon: Icons.insights_outlined,
+                    title: 'Track Record',
+                    subtitle: 'Every daily setup, graded on real candles',
+                    onTap: () => _open(context, const TrackRecordScreen()),
                   ),
                   const SizedBox(height: _AppSpacing.item),
                   const _SectionHeader(title: 'Community'),

@@ -221,6 +221,8 @@ class _CitadelLivePositionsPanelState extends State<CitadelLivePositionsPanel> {
           onRefresh: () => _refresh(),
         ),
         const SizedBox(height: 12),
+        _CitadelSafetyBar(onAfterCloseAll: () => _refresh()),
+        const SizedBox(height: 12),
         if (_loading && _positions.isEmpty)
           const Padding(
             padding: EdgeInsets.symmetric(vertical: 20),

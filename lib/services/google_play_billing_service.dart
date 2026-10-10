@@ -7,6 +7,7 @@ import 'package:in_app_purchase/in_app_purchase.dart';
 import 'package:in_app_purchase_android/in_app_purchase_android.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'entitlement_service.dart';
 import 'user_profile_store.dart';
 
 /// Google Play Billing — one Oracle Pro monthly subscription (Android only).
@@ -202,6 +203,12 @@ abstract final class GooglePlayBillingService {
         case PurchaseStatus.purchased:
         case PurchaseStatus.restored:
           restoredAny = purchase.status == PurchaseStatus.restored;
+          unawaited(
+            EntitlementService.verifyPurchase(
+              productId: purchase.productID,
+              purchaseToken: purchase.verificationData.serverVerificationData,
+            ),
+          );
           final plan = await _applyPurchase(purchase);
           if (plan != null) {
             _emit(BillingPurchaseEvent.success(plan));

@@ -1,7 +1,8 @@
 <en-US>
-What's new in 1.0.7 (build 18):
-• One plan: Oracle Pro ($49.99/mo) unlocks every tool — any symbol, all timeframes, unlimited setups and AI chat, Oracle Vision, Citadel, Oracle Desk
-• Redesigned Subscription page
-• Citadel: fixed Bitunix "System error" — order size and price now follow each contract's live precision and minimum
-• Clearer Citadel error messages when a position is below the exchange minimum
+What's new in 1.0.8 (build 19):
+• Track Record: every daily setup graded on real market candles, wins and losses, free for everyone (Profile → Track Record)
+• Citadel order preview: see size, margin, leverage, liquidation estimate and dollar risk before any live order
+• Paper trading: practice Citadel with no money at risk, graded on real candles
+• Pause Citadel and emergency Close All controls
+• Subscriptions are now verified securely with Google Play
 </en-US>
