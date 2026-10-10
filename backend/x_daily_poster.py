@@ -96,6 +96,8 @@ class XDailyPosterConfig:
         )
         data_dir = Path(os.getenv("CITADEL_DATA_DIR", str(Path(__file__).resolve().parent / "data")))
         self.state_file = data_dir / "x_daily_posts.json"
+        self.weekly_state_file = data_dir / "x_weekly_recaps.json"
+        self.weekly_recap_enabled = _env_bool("X_WEEKLY_RECAP_ENABLED", True)
 
     def oauth_ready(self) -> bool:
         return bool(self.api_key and self.api_secret and self.access_token and self.access_token_secret)
@@ -228,6 +230,88 @@ def format_thread_header(day: str, coins: list[str], handle: str, *, updated: bo
     link_line = f"{_APP_LINK_LABEL}{_PLAY_STORE_URL}"
     link_cost = len(_APP_LINK_LABEL) + 1 + _X_URL_WEIGHT
     return _truncate(text, _TWEET_MAX - 1 - link_cost) + "\n" + link_line
+
+
+def _fmt_r(value: Optional[float]) -> str:
+    v = float(value or 0)
+    return f"{'+' if v >= 0 else '−'}{abs(v):.1f}R"
+
+
+def _fmt_pct(value: Optional[float]) -> str:
+    return "—" if value is None else f"{round(value * 100)}%"
+
+
+def format_week_label(start: datetime, end: datetime) -> str:
+    """'Oct 4–10' within a month, 'Sep 28–Oct 4' across months."""
+    if start.month == end.month:
+        return f"{start:%b} {start.day}–{end.day}"
+    return f"{start:%b} {start.day}–{end:%b} {end.day}"
+
+
+def format_weekly_recap(stats: dict[str, Any], week_label: str) -> Optional[str]:
+    """Weekly track-record post (≤280 weighted chars). None when nothing closed this week."""
+    week = stats.get("week") or {}
+    closed = int(week.get("closed") or 0)
+    if closed == 0:
+        return None
+    lines = [
+        f"📊 Oracle Weekly Recap · {week_label}",
+        "",
+        f"{closed} setup{'s' if closed != 1 else ''} closed: {week.get('wins', 0)}W / "
+        f"{week.get('losses', 0)}L ({_fmt_pct(week.get('win_rate'))})",
+        f"TP1 hit {_fmt_pct(week.get('tp1_hit_rate'))} · Net {_fmt_r(week.get('total_r'))}",
+    ]
+    best = stats.get("best")
+    if isinstance(best, dict) and best.get("coin"):
+        # X allows one cashtag per post, so coins are written without $.
+        lines.append(f"Best: {best['coin']} {_fmt_r(best.get('r_multiple'))}")
+    all_time = stats.get("all_time") or {}
+    if int(all_time.get("closed") or 0) > closed:
+        lines.append(
+            f"All-time: {all_time['closed']} closed · {_fmt_pct(all_time.get('win_rate'))} wins · "
+            f"{_fmt_r(all_time.get('total_r'))}"
+        )
+    lines.extend(["", "Graded on real candles. Wins and losses, no edits. NFA", "#OnChainOracle #Crypto"])
+    link_line = f"{_APP_LINK_LABEL}{_PLAY_STORE_URL}"
+    # Emojis weigh 2 on X; reserve a few chars beyond the link's fixed weight.
+    link_cost = len(_APP_LINK_LABEL) + 1 + _X_URL_WEIGHT + 4
+    return _truncate("\n".join(lines), _TWEET_MAX - 1 - link_cost) + "\n" + link_line
+
+
+def already_posted_weekly(config: "XDailyPosterConfig", week_key: str) -> bool:
+    """True once the week was posted or deliberately skipped (nothing closed)."""
+    return isinstance(_load_state(config.weekly_state_file).get(week_key), dict)
+
+
+def post_weekly_recap(
+    week_key: str,
+    text: Optional[str],
+    *,
+    config: Optional["XDailyPosterConfig"] = None,
+) -> dict[str, Any]:
+    """Post the weekly recap once per week_key (synchronous; run in a thread)."""
+    cfg = config or XDailyPosterConfig()
+    if not cfg.enabled or not cfg.weekly_recap_enabled:
+        return {"skipped": True, "reason": "disabled"}
+    if not cfg.oauth_ready():
+        return {"skipped": True, "reason": f"missing_oauth_credentials: {', '.join(cfg.missing_fields())}"}
+    if already_posted_weekly(cfg, week_key):
+        return {"skipped": True, "reason": "already_posted", "week": week_key}
+    if not text:
+        state = _load_state(cfg.weekly_state_file)
+        state[week_key] = {"posted_at": None, "skipped": "no_closed_setups"}
+        _save_state(cfg.weekly_state_file, state)
+        return {"skipped": True, "reason": "no_closed_setups", "week": week_key}
+    try:
+        data = XDailyPoster(cfg).post_tweet(text)
+    except Exception as exc:
+        logger.exception("x_weekly_recap_failed week=%s err=%s", week_key, exc)
+        return {"success": False, "week": week_key, "error": str(exc)}
+    state = _load_state(cfg.weekly_state_file)
+    state[week_key] = {"posted_at": datetime.now(timezone.utc).isoformat(), "tweet_id": str(data["id"])}
+    _save_state(cfg.weekly_state_file, state)
+    logger.info("x_weekly_recap_posted week=%s tweet_id=%s", week_key, data["id"])
+    return {"success": True, "week": week_key, "tweet_id": str(data["id"])}
 
 
 def _load_state(path: Path) -> dict[str, Any]:

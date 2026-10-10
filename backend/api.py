@@ -42,7 +42,7 @@ import hmac
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import re
 import threading
@@ -71,8 +71,12 @@ from discord_daily_poster import (
 from x_daily_poster import (
     XDailyPosterConfig,
     already_posted_today,
+    already_posted_weekly,
+    format_week_label,
+    format_weekly_recap,
     post_daily_analyses_to_x,
     post_today_from_store,
+    post_weekly_recap,
 )
 
 # ---------------------------------------------------------------------------
@@ -6541,6 +6545,40 @@ async def _x_daily_post_scheduler_loop() -> None:
         await asyncio.sleep(30)
 
 
+# Weekly track-record recap — Sunday evening, America/Chicago.
+X_WEEKLY_RECAP_HOUR = int(os.getenv("X_WEEKLY_RECAP_HOUR", "19"))
+X_WEEKLY_RECAP_MINUTE = int(os.getenv("X_WEEKLY_RECAP_MINUTE", "0"))
+_X_WEEKLY_MAX_ATTEMPTS = 3
+
+
+def _weekly_recap_text(now_local: datetime) -> tuple[str, Optional[str], dict[str, Any]]:
+    stats = trk.weekly_recap_stats(_TRACK_RECORD_STORE, now=now_local.timestamp())
+    label = format_week_label(now_local - timedelta(days=6), now_local)
+    return now_local.strftime("%Y-%m-%d"), format_weekly_recap(stats, label), stats
+
+
+async def _x_weekly_recap_loop() -> None:
+    """Posts once each Sunday from X_WEEKLY_RECAP_HOUR until 23:00 Chicago (catches up after a redeploy)."""
+    attempts: dict[str, int] = {}
+    while True:
+        try:
+            now = datetime.now(ZoneInfo(DAILY_ANALYSIS_TZ))
+            due = now.weekday() == 6 and (now.hour, now.minute) >= (X_WEEKLY_RECAP_HOUR, X_WEEKLY_RECAP_MINUTE)
+            if due and now.hour < 23:
+                week_key, text, _stats = await asyncio.to_thread(_weekly_recap_text, now)
+                if attempts.get(week_key, 0) < _X_WEEKLY_MAX_ATTEMPTS and not await asyncio.to_thread(
+                    already_posted_weekly, _X_DAILY_CONFIG, week_key
+                ):
+                    attempts[week_key] = attempts.get(week_key, 0) + 1
+                    result = await asyncio.to_thread(post_weekly_recap, week_key, text, config=_X_DAILY_CONFIG)
+                    logger.info("x_weekly_recap week=%s result=%s", week_key, result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("x_weekly_recap_loop err=%s", exc)
+        await asyncio.sleep(60)
+
+
 # ---------------------------------------------------------------------------
 # Discord — daily BTC/ETH embeds via Incoming Webhook (channel: #🔮-oracle-vision)
 # ---------------------------------------------------------------------------
@@ -6729,6 +6767,14 @@ async def lifespan(app: FastAPI):
 
     _alert_watch_task = asyncio.create_task(alert_watch.watcher_loop())
     track_record_task = asyncio.create_task(_track_record_loop())
+    weekly_recap_task = asyncio.create_task(_x_weekly_recap_loop())
+    logger.info(
+        "startup | x_weekly_recap enabled=%s sunday %02d:%02d %s",
+        X_DAILY_POST_ENABLED and _X_DAILY_CONFIG.weekly_recap_enabled,
+        X_WEEKLY_RECAP_HOUR,
+        X_WEEKLY_RECAP_MINUTE,
+        DAILY_ANALYSIS_TZ,
+    )
     logger.info(
         "startup | billing_verification configured=%s rtdn_token=%s",
         play_billing.is_configured(),
@@ -6738,6 +6784,7 @@ async def lifespan(app: FastAPI):
     yield
 
     track_record_task.cancel()
+    weekly_recap_task.cancel()
 
     if _daily_scheduler_task is not None:
         _daily_scheduler_task.cancel()
@@ -7057,6 +7104,21 @@ async def get_track_record() -> dict[str, Any]:
     """Every published daily setup, graded on 1h candles. Free / public."""
     payload = await asyncio.to_thread(trk.public_payload, _TRACK_RECORD_STORE)
     return {"success": True, **payload}
+
+
+@app.get("/track_record/weekly_recap_preview")
+async def weekly_recap_preview() -> dict[str, Any]:
+    """What Sunday's X recap would say right now (read-only)."""
+    now = datetime.now(ZoneInfo(DAILY_ANALYSIS_TZ))
+    week_key, text, stats = await asyncio.to_thread(_weekly_recap_text, now)
+    return {
+        "success": True,
+        "week": week_key,
+        "text": text,
+        "would_skip": text is None,
+        "schedule": f"Sundays {X_WEEKLY_RECAP_HOUR:02d}:{X_WEEKLY_RECAP_MINUTE:02d} {DAILY_ANALYSIS_TZ}",
+        "stats": stats,
+    }
 
 
 @app.post("/alerts/sync")

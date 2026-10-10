@@ -299,6 +299,29 @@ def user_payload(store: TrackRecordStore, user_id: str, *, recent: int = 50) -> 
     }
 
 
+def weekly_recap_stats(store: TrackRecordStore, *, now: Optional[float] = None) -> dict[str, Any]:
+    """Setups that closed in the last 7 days, plus the all-time record, for the weekly X recap."""
+    now = now if now is not None else time.time()
+    week_start = now - 7 * 86400
+    setups = store.all()
+    closed_this_week = [
+        s for s in setups if s.get("status") == "closed" and float(s.get("closed_at") or 0) >= week_start
+    ]
+    best = max(closed_this_week, key=lambda s: float(s.get("r_multiple") or 0), default=None)
+    return {
+        "week_start": week_start,
+        "week_end": now,
+        "week": summarize(closed_this_week),
+        "open": sum(1 for s in setups if s.get("status") == "open"),
+        "best": (
+            {"coin": best["coin"], "r_multiple": best.get("r_multiple"), "outcome": best.get("outcome")}
+            if best is not None and float(best.get("r_multiple") or 0) > 0
+            else None
+        ),
+        "all_time": summarize(setups),
+    }
+
+
 def public_payload(store: TrackRecordStore, *, recent: int = 30) -> dict[str, Any]:
     setups = store.all()
     setups.sort(key=lambda s: s.get("created_at", 0), reverse=True)

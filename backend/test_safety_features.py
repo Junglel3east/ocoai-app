@@ -177,6 +177,55 @@ def test_dual_tp_split() -> None:
     assert float(tp1) + float(tp2) == 1.0 and tp2 is not None
 
 
+# ─── Weekly X recap ──────────────────────────────────────────────────────────
+
+
+def _x_weight(text: str) -> int:
+    """X counts URLs as 23 and characters outside basic ranges (emoji) as 2."""
+    import re
+
+    without_urls = re.sub(r"https?://\S+", "", text)
+    urls = len(re.findall(r"https?://\S+", text))
+    return urls * 23 + sum(2 if ord(ch) > 0x2FFF else 1 for ch in without_urls)
+
+
+def test_weekly_recap_skips_empty_week() -> None:
+    import x_daily_poster as xp
+
+    assert xp.format_weekly_recap({"week": {"closed": 0}}, "Oct 4–10") is None
+
+
+def test_weekly_recap_fits_x_limit() -> None:
+    import x_daily_poster as xp
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = trk.TrackRecordStore(Path(tmp) / "t.json")
+        now = 100 * 86400.0
+        closed = [
+            dict(_long_setup(), id=f"s{i}", coin=c, status="closed", outcome=o, r_multiple=r,
+                 tp1_hit=o != "stopped", closed_at=now - 86400)
+            for i, (c, o, r) in enumerate([("BTC", "tp2", 3.2), ("ETH", "stopped", -1.0), ("SOL", "tp1_then_stop", 0.2)])
+        ]
+        old = dict(_long_setup(), id="old", status="closed", outcome="tp2", r_multiple=2.0, closed_at=now - 30 * 86400)
+        store.replace_many(closed + [old])
+        stats = trk.weekly_recap_stats(store, now=now)
+        assert stats["week"]["closed"] == 3 and stats["all_time"]["closed"] == 4
+        assert stats["best"]["coin"] == "BTC"
+        text = xp.format_weekly_recap(stats, "Sep 28–Oct 4")
+        assert text and "2W / 1L" in text and "+2.4R" in text and "All-time: 4 closed" in text
+        assert _x_weight(text) <= 280, _x_weight(text)
+        assert text.count("$") == 0, "no cashtags"
+
+
+def test_week_label() -> None:
+    from datetime import datetime
+
+    import x_daily_poster as xp
+
+    assert xp.format_week_label(datetime(2026, 10, 5), datetime(2026, 10, 11)) == "Oct 5–11"
+    assert xp.format_week_label(datetime(2026, 9, 28), datetime(2026, 10, 4)) == "Sep 28–Oct 4"
+
+
 if __name__ == "__main__":
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_") and callable(fn)]
     failed = 0
