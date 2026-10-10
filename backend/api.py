@@ -94,6 +94,8 @@ if _root_env.is_file():
 import coingecko_service as cg
 import bitunix_service as bux
 import alert_watcher as alert_watch
+import play_billing
+import track_record as trk
 
 # Required on Railway: Variables → GROK_API_KEY
 GROK_API_KEY = (os.getenv("GROK_API_KEY") or "").strip()
@@ -131,6 +133,9 @@ CITADEL_ENCRYPTION_KEY = (os.getenv("CITADEL_ENCRYPTION_KEY") or "").strip()
 _CITADEL_DATA_DIR = Path(os.getenv("CITADEL_DATA_DIR", str(_BACKEND_DIR / "data")))
 _CITADEL_KEYS_FILE = _CITADEL_DATA_DIR / "exchange_keys.json"
 _APP_API_KEYS_FILE = _CITADEL_DATA_DIR / "app_api_keys.json"
+_BILLING_STORE = play_billing.EntitlementStore(_CITADEL_DATA_DIR / "billing_entitlements.json")
+_TRACK_RECORD_STORE = trk.TrackRecordStore(_CITADEL_DATA_DIR / "track_record.json")
+TRACK_RECORD_EVAL_INTERVAL_SEC = int(os.getenv("TRACK_RECORD_EVAL_INTERVAL_SEC", "1800"))
 
 # Home "Daily Analysis" — auto-generated BTC/ETH/SOL/XRP batch (7:30 AM America/Chicago).
 DAILY_ANALYSIS_ENABLED = os.getenv("DAILY_ANALYSIS_ENABLED", "true").strip().lower() in {
@@ -2200,6 +2205,9 @@ def save_exchange_keys_record(
     }
     if encrypted_passphrase:
         row["exchange_passphrase_encrypted"] = encrypted_passphrase
+    if prior.get("citadel_paused"):
+        row["citadel_paused"] = True
+        row["citadel_paused_at"] = prior.get("citadel_paused_at")
     store[user_id] = row
     _save_citadel_key_store(store)
     register_app_api_key(user_id, app_api_key)
@@ -6341,6 +6349,7 @@ async def _run_daily_analysis_batch(*, reason: str = "scheduled") -> None:
         _persist_daily_analysis_batch(day, entries)
         _last_daily_run_day = day
         logger.info("daily_analysis_batch_saved day=%s count=%s", day, len(entries))
+        _record_track_record_entries(day, entries)
         _schedule_x_daily_post_after_batch(
             day, entries, force=reason.startswith("repair")
         )
@@ -6380,6 +6389,37 @@ async def _maybe_catchup_daily_analyses() -> None:
         return
     reason = "repair_trade_levels" if has_full_set and not levels_ok else "startup_catchup"
     await _run_daily_analysis_batch(reason=reason)
+
+
+def _record_track_record_entries(day: str, entries: list[dict[str, Any]]) -> None:
+    try:
+        added = trk.record_daily_entries(_TRACK_RECORD_STORE, day, entries, parse_trade_levels)
+        logger.info("track_record_recorded day=%s added=%s", day, added)
+    except Exception as exc:
+        logger.exception("track_record_record_failed day=%s err=%s", day, exc)
+
+
+def _track_record_fetch_hourly(coin: str, limit: int) -> Optional[list[list[float]]]:
+    return fetch_binance_klines(binance_usdt_symbol(coin), "1h", limit)
+
+
+async def _track_record_loop() -> None:
+    store = _load_daily_analysis_store()
+    day, entries = store.get("day"), store.get("analyses")
+    if isinstance(day, str) and isinstance(entries, list):
+        _record_track_record_entries(day, entries)
+    while True:
+        try:
+            changed = await asyncio.to_thread(
+                trk.evaluate_open_setups, _TRACK_RECORD_STORE, _track_record_fetch_hourly
+            )
+            if changed:
+                logger.info("track_record_evaluated changed=%s", changed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("track_record_eval_failed err=%s", exc)
+        await asyncio.sleep(TRACK_RECORD_EVAL_INTERVAL_SEC)
 
 
 async def _daily_analysis_scheduler_loop() -> None:
@@ -6688,8 +6728,16 @@ async def lifespan(app: FastAPI):
         logger.info("startup | discord_daily_post disabled (DISCORD_DAILY_ENABLED=false)")
 
     _alert_watch_task = asyncio.create_task(alert_watch.watcher_loop())
+    track_record_task = asyncio.create_task(_track_record_loop())
+    logger.info(
+        "startup | billing_verification configured=%s rtdn_token=%s",
+        play_billing.is_configured(),
+        bool(play_billing.RTDN_TOKEN),
+    )
 
     yield
+
+    track_record_task.cancel()
 
     if _daily_scheduler_task is not None:
         _daily_scheduler_task.cancel()
@@ -6920,6 +6968,95 @@ async def reviewer_access(h: str = "") -> dict[str, Any]:
     if granted:
         logger.info("reviewer_access_granted hash_prefix=%s", digest[:12])
     return {"granted": granted, "plan": "Expert" if granted else None}
+
+
+# ─── Subscriptions (Google Play) — server-side entitlement ───────────────────
+
+
+def _billing_user_id(http_request: Request) -> Optional[str]:
+    key = (http_request.headers.get("X-API-Key") or http_request.headers.get("x-api-key") or "").strip()
+    return resolve_user_id_from_app_key(key) if key else None
+
+
+def _billing_unauthorized() -> JSONResponse:
+    return JSONResponse(
+        status_code=401,
+        content={"success": False, "detail": "Registered X-API-Key required."},
+    )
+
+
+@app.post("/billing/verify")
+@app.post("/billing/verify/")
+async def billing_verify(http_request: Request) -> JSONResponse:
+    """App reports a Play purchase token; the server confirms it with Google and stores the entitlement."""
+    user_id = _billing_user_id(http_request)
+    if not user_id:
+        return _billing_unauthorized()
+    try:
+        body = await http_request.json()
+    except Exception:
+        body = {}
+    token = str((body or {}).get("purchase_token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="purchase_token is required.")
+    if not play_billing.is_configured():
+        return JSONResponse(status_code=200, content={"success": True, "configured": False})
+    try:
+        view = await asyncio.to_thread(play_billing.verify_and_store, _BILLING_STORE, user_id, token)
+    except play_billing.BillingError as exc:
+        logger.warning("billing_verify_failed user_id=%s invalid=%s err=%s", user_id, exc.invalid_token, exc)
+        if exc.invalid_token:
+            return JSONResponse(
+                status_code=200,
+                content={"success": True, "configured": True, "active": False, "plan": None, "invalid_token": True},
+            )
+        return JSONResponse(status_code=502, content={"success": False, "configured": True, "detail": str(exc)})
+    return JSONResponse(status_code=200, content={"success": True, "configured": True, **view})
+
+
+@app.get("/billing/entitlement")
+@app.get("/billing/entitlement/")
+async def billing_entitlement(http_request: Request) -> JSONResponse:
+    """Server's answer to "is this user Oracle Pro?" — re-checked with Google when stale."""
+    user_id = _billing_user_id(http_request)
+    if not user_id:
+        return _billing_unauthorized()
+    if not play_billing.is_configured():
+        return JSONResponse(status_code=200, content={"success": True, "configured": False})
+    view = await asyncio.to_thread(play_billing.current_entitlement, _BILLING_STORE, user_id)
+    return JSONResponse(status_code=200, content={"success": True, "configured": True, **view})
+
+
+@app.post("/billing/rtdn")
+@app.post("/billing/rtdn/")
+async def billing_rtdn(http_request: Request, token: str = "") -> JSONResponse:
+    """Google Play Real-Time Developer Notifications (Pub/Sub push subscription)."""
+    if not play_billing.RTDN_TOKEN or not hmac.compare_digest(token, play_billing.RTDN_TOKEN):
+        return JSONResponse(status_code=401, content={"detail": "Invalid RTDN token."})
+    try:
+        envelope = await http_request.json()
+    except Exception:
+        return JSONResponse(status_code=200, content={"handled": False, "reason": "bad_json"})
+    try:
+        result = await asyncio.to_thread(play_billing.handle_rtdn, _BILLING_STORE, envelope)
+    except play_billing.BillingError as exc:
+        if exc.invalid_token:
+            return JSONResponse(status_code=200, content={"handled": False, "reason": "invalid_token"})
+        # Non-2xx makes Pub/Sub retry with backoff.
+        logger.warning("billing_rtdn_retry err=%s", exc)
+        return JSONResponse(status_code=503, content={"handled": False, "retry": True})
+    return JSONResponse(status_code=200, content=result)
+
+
+# ─── Public track record ─────────────────────────────────────────────────────
+
+
+@app.get("/track_record")
+@app.get("/track_record/")
+async def get_track_record() -> dict[str, Any]:
+    """Every published daily setup, graded on 1h candles. Free / public."""
+    payload = await asyncio.to_thread(trk.public_payload, _TRACK_RECORD_STORE)
+    return {"success": True, **payload}
 
 
 @app.post("/alerts/sync")
@@ -7914,6 +8051,7 @@ async def _handle_exchange_keys_status(http_request: Request) -> JSONResponse:
             "use_demo_mode": bool(record.get("use_demo_mode")),
             "api_base_url": record.get("api_base_url"),
             "updated_at": record.get("updated_at"),
+            "paused": bool(record.get("citadel_paused")),
             "request_id": req_id,
         },
         headers={"X-Request-ID": req_id},
@@ -8524,6 +8662,20 @@ async def _handle_execute_trade(http_request: Request) -> JSONResponse:
                 "detail": "X-API-Key does not match saved Citadel credentials.",
                 "user_message": "App API Key mismatch. Re-save credentials in Oracle Citadel Setup.",
                 "error_code": "credentials_missing",
+                "request_id": req_id,
+            },
+            headers={"X-Request-ID": req_id},
+        )
+
+    if record.get("citadel_paused"):
+        logger.info("execute_trade_blocked_paused request_id=%s user_id=%s", req_id, user_id)
+        return JSONResponse(
+            status_code=423,
+            content={
+                "success": False,
+                "detail": "Oracle Citadel is paused.",
+                "user_message": "Oracle Citadel is paused. Resume it in Citadel to place trades.",
+                "error_code": "citadel_paused",
                 "request_id": req_id,
             },
             headers={"X-Request-ID": req_id},
@@ -9675,6 +9827,304 @@ async def _handle_citadel_tpsl_details(http_request: Request) -> JSONResponse:
         },
         headers={"X-Request-ID": session["req_id"]},
     )
+
+
+# ─── Citadel safety: order preview, pause, close-all ─────────────────────────
+
+# Rough maintenance-margin rate for the isolated liquidation estimate shown in previews.
+_PREVIEW_MAINT_MARGIN_RATE = 0.005
+
+
+def _estimate_liquidation_price(direction: str, entry: float, leverage: float) -> Optional[float]:
+    if leverage <= 1:
+        return None
+    if direction == "long":
+        return entry * (1 - 1 / leverage + _PREVIEW_MAINT_MARGIN_RATE)
+    return entry * (1 + 1 / leverage - _PREVIEW_MAINT_MARGIN_RATE)
+
+
+def _citadel_error(status: int, message: str, req_id: str, **extra: Any) -> JSONResponse:
+    return JSONResponse(
+        status_code=status,
+        content={"success": False, "detail": message, "user_message": message, "request_id": req_id, **extra},
+        headers={"X-Request-ID": req_id},
+    )
+
+
+def _set_citadel_paused(user_id: str, paused: bool) -> None:
+    store = _load_citadel_key_store()
+    record = store.get(user_id)
+    if not isinstance(record, dict):
+        raise KeyError(user_id)
+    record = dict(record)
+    record["citadel_paused"] = bool(paused)
+    record["citadel_paused_at"] = datetime.now(timezone.utc).isoformat() if paused else None
+    store[user_id] = record
+    _save_citadel_key_store(store)
+
+
+async def _handle_citadel_preview(http_request: Request) -> JSONResponse:
+    """Same payload as /execute_trade — computes exact size, margin and risk without placing anything."""
+    req_id = getattr(http_request.state, "request_id", "?")
+    try:
+        raw = await http_request.json()
+    except Exception:
+        raw = None
+    if not isinstance(raw, dict):
+        return _citadel_error(400, "Invalid trade request.", req_id)
+    try:
+        trade = _parse_execute_trade_request(raw)
+    except ValidationError:
+        return _citadel_error(422, "Check coin, direction, entry, SL, TP1, TP2, and position size %.", req_id)
+
+    session, err = _citadel_resolve_exchange_session(http_request, trade.user_id)
+    if err is not None:
+        return err
+    assert session is not None
+
+    geometry_err = _validate_citadel_trade_geometry(
+        direction=trade.direction,
+        entry=trade.entry_price,
+        sl=trade.stop_loss,
+        tp1=trade.tp1,
+        tp2=trade.tp2,
+    )
+    if geometry_err:
+        return _citadel_error(400, geometry_err, req_id)
+
+    effective_risk, _requested = _resolve_effective_risk_percent(trade.risk_percent)
+    leverage = float(_normalize_citadel_leverage(trade.leverage))
+    entry = float(trade.entry_price)
+    warnings: list[str] = []
+
+    if session["exchange"] == "bitunix":
+        rules = await asyncio.to_thread(bux.fetch_symbol_rules, trade.coin, request_id=req_id)
+        qty_str, meta = await asyncio.to_thread(
+            bux.calculate_order_size,
+            entry_price=entry,
+            stop_loss=trade.stop_loss,
+            risk_percent=effective_risk,
+            leverage=leverage,
+            api_key=session["api_key"],
+            api_secret=session["api_secret"],
+            coin=trade.coin,
+            rules=rules,
+            request_id=req_id,
+        )
+        if meta.get("error"):
+            return _citadel_error(400, str(meta["error"]), req_id, size_meta=meta)
+        qty = float(qty_str)
+        leverage = float(meta.get("leverage_capped_to") or leverage)
+        _tp1_qty, tp2_qty = bux.dual_tp_sizes(qty_str, rules)
+        if tp2_qty is None:
+            warnings.append("Position is too small to split 40/60 — a single take-profit will be set at TP1.")
+        if meta.get("bumped_to_min_qty"):
+            warnings.append("Size was raised to the exchange minimum for this contract.")
+        size_label = f"{qty_str} {trade.coin.upper()}"
+    else:
+        size_str, meta = await asyncio.to_thread(
+            _blofin_calculate_order_size,
+            coin=trade.coin,
+            entry_price=entry,
+            stop_loss=trade.stop_loss,
+            risk_percent=effective_risk,
+            leverage=leverage,
+            base_url=session["api_base_url"],
+            api_key=session["api_key"],
+            api_secret=session["api_secret"],
+            passphrase=session["passphrase"],
+            request_id=req_id,
+        )
+        contracts = float(size_str or 0)
+        qty = contracts * float(meta.get("contract_value") or 0)
+        size_label = f"{size_str} contracts (≈{qty:g} {trade.coin.upper()})"
+
+    if meta.get("fallback") == "balance_unavailable":
+        warnings.append("Could not read your exchange balance — size shown is the exchange minimum.")
+
+    available = meta.get("available_usdt")
+    notional = qty * entry
+    margin = notional / leverage if leverage > 0 else notional
+    sl_distance = abs(entry - float(trade.stop_loss))
+    risk_usd = qty * sl_distance
+    reward_tp1 = qty * 0.4 * abs(float(trade.tp1) - entry)
+    reward_tp2 = qty * 0.6 * abs(float(trade.tp2) - entry)
+    liq = _estimate_liquidation_price(trade.direction, entry, leverage)
+    if liq is not None:
+        sl_beyond_liq = (trade.direction == "long" and trade.stop_loss <= liq) or (
+            trade.direction == "short" and trade.stop_loss >= liq
+        )
+        if sl_beyond_liq:
+            warnings.append("Stop loss sits beyond the estimated liquidation price — lower leverage.")
+    if isinstance(available, (int, float)) and available > 0 and risk_usd / available > 0.05:
+        warnings.append(f"A stop-out would lose {risk_usd / available:.0%} of your available balance.")
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": True,
+            "exchange": session["exchange"],
+            "coin": trade.coin.upper(),
+            "direction": trade.direction,
+            "order_type": "market" if _is_market_trade_request(trade, raw) else "limit",
+            "entry_price": entry,
+            "stop_loss": trade.stop_loss,
+            "tp1": trade.tp1,
+            "tp2": trade.tp2,
+            "size_label": size_label,
+            "quantity": qty,
+            "notional_usdt": round(notional, 2),
+            "margin_usdt": round(margin, 2),
+            "leverage": leverage,
+            "position_size_percent": effective_risk,
+            "available_usdt": round(available, 2) if isinstance(available, (int, float)) else None,
+            "risk_usdt": round(risk_usd, 2),
+            "reward_tp1_usdt": round(reward_tp1, 2),
+            "reward_full_usdt": round(reward_tp1 + reward_tp2, 2),
+            "est_liquidation_price": liq,
+            "paused": bool(session["record"].get("citadel_paused")),
+            "warnings": warnings,
+            "request_id": req_id,
+        },
+        headers={"X-Request-ID": req_id},
+    )
+
+
+async def _handle_citadel_pause(http_request: Request) -> JSONResponse:
+    req_id = getattr(http_request.state, "request_id", "?")
+    try:
+        raw = await http_request.json()
+    except Exception:
+        raw = {}
+    raw = raw if isinstance(raw, dict) else {}
+    user_id = str(raw.get("user_id") or "").strip()
+    session, err = _citadel_resolve_exchange_session(http_request, user_id)
+    if err is not None:
+        return err
+    paused = bool(raw.get("paused", True))
+    _set_citadel_paused(user_id, paused)
+    logger.info("citadel_pause request_id=%s user_id=%s paused=%s", req_id, user_id, paused)
+    return JSONResponse(
+        status_code=200,
+        content={"success": True, "paused": paused, "request_id": req_id},
+        headers={"X-Request-ID": req_id},
+    )
+
+
+async def _handle_citadel_close_all(http_request: Request) -> JSONResponse:
+    """Emergency stop: pause Citadel, cancel resting orders (Bitunix), market-close every position."""
+    req_id = getattr(http_request.state, "request_id", "?")
+    try:
+        raw = await http_request.json()
+    except Exception:
+        raw = {}
+    raw = raw if isinstance(raw, dict) else {}
+    user_id = str(raw.get("user_id") or "").strip()
+    session, err = _citadel_resolve_exchange_session(http_request, user_id)
+    if err is not None:
+        return err
+    assert session is not None
+    _set_citadel_paused(user_id, True)
+
+    closed: list[str] = []
+    failed: list[dict[str, Any]] = []
+    orders_cancelled: Optional[bool] = None
+
+    if session["exchange"] == "bitunix":
+        cancel = await asyncio.to_thread(
+            bux.cancel_all_orders,
+            api_key=session["api_key"],
+            api_secret=session["api_secret"],
+            request_id=req_id,
+        )
+        orders_cancelled = bool(cancel.get("ok"))
+        positions = await asyncio.to_thread(
+            bux.fetch_positions,
+            api_key=session["api_key"],
+            api_secret=session["api_secret"],
+            request_id=req_id,
+        )
+        for pos in positions:
+            result = await asyncio.to_thread(
+                bux.flash_close_position,
+                api_key=session["api_key"],
+                api_secret=session["api_secret"],
+                position_id=pos["positionId"],
+                request_id=req_id,
+            )
+            if result.get("ok"):
+                closed.append(pos["coin"])
+            else:
+                failed.append({"coin": pos["coin"], "message": bux.user_friendly_error(result.get("code"), result.get("msg"))})
+    else:
+        positions = await asyncio.to_thread(
+            _blofin_fetch_positions,
+            base_url=session["api_base_url"],
+            api_key=session["api_key"],
+            api_secret=session["api_secret"],
+            passphrase=session["passphrase"],
+            inst_id=None,
+            request_id=req_id,
+        )
+        for pos in positions:
+            result = await asyncio.to_thread(
+                _blofin_close_position,
+                base_url=session["api_base_url"],
+                api_key=session["api_key"],
+                api_secret=session["api_secret"],
+                passphrase=session["passphrase"],
+                inst_id=pos["instId"],
+                margin_mode=pos.get("marginMode") or BLOFIN_MARGIN_MODE,
+                position_side=pos.get("positionSide") or "net",
+                request_id=req_id,
+            )
+            if result.get("ok"):
+                closed.append(pos["coin"])
+            else:
+                failed.append({"coin": pos["coin"], "message": _blofin_user_friendly_error(result.get("code"), result.get("msg"))})
+
+    logger.warning(
+        "citadel_close_all request_id=%s user_id=%s exchange=%s closed=%s failed=%s orders_cancelled=%s",
+        req_id,
+        user_id,
+        session["exchange"],
+        closed,
+        failed,
+        orders_cancelled,
+    )
+    return JSONResponse(
+        status_code=200 if not failed else 207,
+        content={
+            "success": not failed,
+            "paused": True,
+            "closed": closed,
+            "failed": failed,
+            "orders_cancelled": orders_cancelled,
+            "request_id": req_id,
+        },
+        headers={"X-Request-ID": req_id},
+    )
+
+
+@app.post("/citadel/preview_trade")
+@app.post("/citadel/preview_trade/")
+@app.post("/api/citadel/preview_trade")
+async def citadel_preview_trade(http_request: Request) -> JSONResponse:
+    return await _handle_citadel_preview(http_request)
+
+
+@app.post("/citadel/pause")
+@app.post("/citadel/pause/")
+@app.post("/api/citadel/pause")
+async def citadel_pause(http_request: Request) -> JSONResponse:
+    return await _handle_citadel_pause(http_request)
+
+
+@app.post("/citadel/close_all")
+@app.post("/citadel/close_all/")
+@app.post("/api/citadel/close_all")
+async def citadel_close_all(http_request: Request) -> JSONResponse:
+    return await _handle_citadel_close_all(http_request)
 
 
 @app.post("/citadel/bitunix_probe")

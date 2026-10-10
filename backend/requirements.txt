@@ -10,6 +10,7 @@ requests-oauthlib==2.0.0
 oauthlib==3.3.1
 python-dotenv==1.2.2
 pydantic==2.13.4
+google-auth==2.61.0
 
 # Transitive (pinned for reproducible deploys)
 starlette==1.1.0

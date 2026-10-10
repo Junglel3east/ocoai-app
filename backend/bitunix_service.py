@@ -45,6 +45,7 @@ BITUNIX_PLACE_ORDER_PATH = "/api/v1/futures/trade/place_order"
 BITUNIX_ORDER_DETAIL_PATH = "/api/v1/futures/trade/get_order_detail"
 BITUNIX_POSITIONS_PATH = "/api/v1/futures/position/get_pending_positions"
 BITUNIX_FLASH_CLOSE_PATH = "/api/v1/futures/trade/flash_close_position"
+BITUNIX_CANCEL_ALL_ORDERS_PATH = "/api/v1/futures/trade/cancel_all_orders"
 BITUNIX_PLACE_TPSL_PATH = "/api/v1/futures/tpsl/place_order"
 BITUNIX_TPSL_PENDING_PATH = "/api/v1/futures/tpsl/get_pending_orders"
 
@@ -1354,6 +1355,34 @@ def fetch_positions(
             }
         )
     return out
+
+
+def cancel_all_orders(
+    *,
+    api_key: str,
+    api_secret: str,
+    symbol: Optional[str] = None,
+    request_id: str = "?",
+) -> dict[str, Any]:
+    """Cancel every resting (unfilled) order, optionally for one symbol."""
+    body: dict[str, Any] = {"symbol": symbol} if symbol else {}
+    http_status, _raw, parsed = _private_request(
+        base_url=BITUNIX_LIVE_API_BASE_URL,
+        api_key=api_key,
+        api_secret=api_secret,
+        method="POST",
+        path=BITUNIX_CANCEL_ALL_ORDERS_PATH,
+        body=body,
+        request_id=request_id,
+        log_tag="bitunix_cancel_all_orders",
+    )
+    ok = http_status == 200 and isinstance(parsed, dict) and str(parsed.get("code")) == "0"
+    return {
+        "ok": ok,
+        "http_status": http_status,
+        "code": parsed.get("code") if isinstance(parsed, dict) else None,
+        "msg": parsed.get("msg") if isinstance(parsed, dict) else None,
+    }
 
 
 def flash_close_position(
