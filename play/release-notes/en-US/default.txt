@@ -1,8 +1,8 @@
 <en-US>
-What's new in 1.0.8 (build 19):
-• Track Record: every daily setup graded on real market candles, wins and losses, free for everyone (Profile → Track Record)
-• Citadel order preview: see size, margin, leverage, liquidation estimate and dollar risk before any live order
-• Paper trading: practice Citadel with no money at risk, graded on real candles
-• Pause Citadel and emergency Close All controls
-• Subscriptions are now verified securely with Google Play
+What's new in 1.0.9 (build 20):
+• Try Oracle Pro free: Free users get a one-time 30-minute preview of any symbol and any timeframe
+• Free trial support for Oracle Pro when available on your account
+• See real results before you subscribe: Track Record link on the Subscription page
+• Stability: automatic error reporting so we can fix crashes faster
+• Under-the-hood updates and performance improvements
 </en-US>

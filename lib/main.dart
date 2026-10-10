@@ -122,8 +122,8 @@ const String kReportDisclaimer =
 
 /// Keep in sync with `pubspec.yaml` version (`name+build`).
 abstract final class AppVersionInfo {
-  static const versionName = '1.0.8';
-  static const buildNumber = '19';
+  static const versionName = '1.0.9';
+  static const buildNumber = '20';
   static const label = 'v$versionName';
   static const aboutLine = 'Version $versionName (Build $buildNumber)';
 }
