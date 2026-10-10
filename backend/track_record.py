@@ -285,6 +285,20 @@ def evaluate_open_setups(
     return len(updated)
 
 
+def user_payload(store: TrackRecordStore, user_id: str, *, recent: int = 50) -> dict[str, Any]:
+    """One user's paper trades, graded with the same rules as the public record."""
+    setups = [s for s in store.all() if s.get("user_id") == user_id]
+    setups.sort(key=lambda s: s.get("created_at", 0), reverse=True)
+    fields = (
+        "id", "coin", "direction", "order_type", "entry", "tp1", "tp2", "sl",
+        "status", "outcome", "r_multiple", "tp1_hit", "created_at", "filled_at", "closed_at",
+    )
+    return {
+        "summary": summarize(setups),
+        "trades": [{k: s.get(k) for k in fields} for s in setups[:recent]],
+    }
+
+
 def public_payload(store: TrackRecordStore, *, recent: int = 30) -> dict[str, Any]:
     setups = store.all()
     setups.sort(key=lambda s: s.get("created_at", 0), reverse=True)

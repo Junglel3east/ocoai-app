@@ -135,6 +135,7 @@ _CITADEL_KEYS_FILE = _CITADEL_DATA_DIR / "exchange_keys.json"
 _APP_API_KEYS_FILE = _CITADEL_DATA_DIR / "app_api_keys.json"
 _BILLING_STORE = play_billing.EntitlementStore(_CITADEL_DATA_DIR / "billing_entitlements.json")
 _TRACK_RECORD_STORE = trk.TrackRecordStore(_CITADEL_DATA_DIR / "track_record.json")
+_PAPER_TRADES_STORE = trk.TrackRecordStore(_CITADEL_DATA_DIR / "paper_trades.json")
 TRACK_RECORD_EVAL_INTERVAL_SEC = int(os.getenv("TRACK_RECORD_EVAL_INTERVAL_SEC", "1800"))
 
 # Home "Daily Analysis" — auto-generated BTC/ETH/SOL/XRP batch (7:30 AM America/Chicago).
@@ -6410,11 +6411,10 @@ async def _track_record_loop() -> None:
         _record_track_record_entries(day, entries)
     while True:
         try:
-            changed = await asyncio.to_thread(
-                trk.evaluate_open_setups, _TRACK_RECORD_STORE, _track_record_fetch_hourly
-            )
-            if changed:
-                logger.info("track_record_evaluated changed=%s", changed)
+            for store in (_TRACK_RECORD_STORE, _PAPER_TRADES_STORE):
+                changed = await asyncio.to_thread(trk.evaluate_open_setups, store, _track_record_fetch_hourly)
+                if changed:
+                    logger.info("track_record_evaluated file=%s changed=%s", store.path.name, changed)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -9894,8 +9894,23 @@ async def _handle_citadel_preview(http_request: Request) -> JSONResponse:
 
     effective_risk, _requested = _resolve_effective_risk_percent(trade.risk_percent)
     leverage = float(_normalize_citadel_leverage(trade.leverage))
+    is_market = _is_market_trade_request(trade, raw)
     entry = float(trade.entry_price)
     warnings: list[str] = []
+    if is_market:
+        # The app sends a placeholder entry for MARKET; size at the live price instead.
+        try:
+            live = await asyncio.to_thread(fetch_live_price_for_analysis, trade.coin.upper())
+            entry = float(live["price"])
+        except Exception as exc:
+            logger.warning("citadel_preview_live_price_failed request_id=%s err=%s", req_id, exc)
+            warnings.append("Live price unavailable — preview uses the setup entry price.")
+        past_stop = entry <= trade.stop_loss if trade.direction == "long" else entry >= trade.stop_loss
+        if past_stop:
+            return _citadel_error(400, "Price has already moved past your stop loss — this setup is invalidated.", req_id)
+        past_tp1 = entry >= trade.tp1 if trade.direction == "long" else entry <= trade.tp1
+        if past_tp1:
+            warnings.append("Price is already beyond TP1 — most of this move has happened.")
 
     if session["exchange"] == "bitunix":
         rules = await asyncio.to_thread(bux.fetch_symbol_rules, trade.coin, request_id=req_id)
@@ -9966,7 +9981,7 @@ async def _handle_citadel_preview(http_request: Request) -> JSONResponse:
             "exchange": session["exchange"],
             "coin": trade.coin.upper(),
             "direction": trade.direction,
-            "order_type": "market" if _is_market_trade_request(trade, raw) else "limit",
+            "order_type": "market" if is_market else "limit",
             "entry_price": entry,
             "stop_loss": trade.stop_loss,
             "tp1": trade.tp1,
@@ -10104,6 +10119,79 @@ async def _handle_citadel_close_all(http_request: Request) -> JSONResponse:
         },
         headers={"X-Request-ID": req_id},
     )
+
+
+async def _handle_paper_trade(http_request: Request) -> JSONResponse:
+    """Record a paper trade — graded on real candles, no exchange keys needed."""
+    req_id = getattr(http_request.state, "request_id", "?")
+    user_id = _billing_user_id(http_request)
+    if not user_id:
+        return _citadel_error(401, "Sign in again to use paper trading.", req_id)
+    try:
+        raw = await http_request.json()
+    except Exception:
+        raw = None
+    if not isinstance(raw, dict):
+        return _citadel_error(400, "Invalid paper trade.", req_id)
+    raw = {**raw, "user_id": user_id}
+    try:
+        trade = _parse_execute_trade_request(raw)
+    except ValidationError:
+        return _citadel_error(422, "Check coin, direction, entry, SL, TP1, and TP2.", req_id)
+    is_market = _is_market_trade_request(trade, raw)
+    entry = float(trade.entry_price)
+    if is_market:
+        try:
+            live = await asyncio.to_thread(fetch_live_price_for_analysis, trade.coin.upper())
+            entry = float(live["price"])
+        except Exception:
+            return _citadel_error(502, "Live price unavailable — try again in a moment.", req_id)
+
+    now = time.time()
+    setup = trk.build_setup(
+        setup_id=f"paper_{uuid.uuid4().hex[:12]}",
+        coin=trade.coin,
+        day=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        entry=entry,
+        tp1=float(trade.tp1),
+        tp2=float(trade.tp2),
+        sl=float(trade.stop_loss),
+        created_at=now,
+        source="paper",
+    )
+    if setup is None:
+        return _citadel_error(
+            400,
+            "These levels don't form a valid trade at the current price (stop or targets on the wrong side).",
+            req_id,
+        )
+    setup["user_id"] = user_id
+    setup["order_type"] = "market" if is_market else "limit"
+    if is_market:
+        setup.update({"status": "open", "filled_at": now})
+    _PAPER_TRADES_STORE.upsert_new(setup)
+    logger.info("paper_trade_recorded request_id=%s user_id=%s coin=%s type=%s", req_id, user_id, setup["coin"], setup["order_type"])
+    return JSONResponse(
+        status_code=200,
+        content={"success": True, "trade": setup, "request_id": req_id},
+        headers={"X-Request-ID": req_id},
+    )
+
+
+@app.post("/citadel/paper_trade")
+@app.post("/citadel/paper_trade/")
+async def citadel_paper_trade(http_request: Request) -> JSONResponse:
+    return await _handle_paper_trade(http_request)
+
+
+@app.get("/citadel/paper_trades")
+@app.get("/citadel/paper_trades/")
+async def citadel_paper_trades(http_request: Request) -> JSONResponse:
+    user_id = _billing_user_id(http_request)
+    if not user_id:
+        return JSONResponse(status_code=401, content={"success": False, "detail": "Registered X-API-Key required."})
+    payload = await asyncio.to_thread(trk.user_payload, _PAPER_TRADES_STORE, user_id)
+    return JSONResponse(status_code=200, content={"success": True, **payload})
 
 
 @app.post("/citadel/preview_trade")
