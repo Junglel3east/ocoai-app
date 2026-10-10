@@ -226,6 +226,37 @@ def test_week_label() -> None:
     assert xp.format_week_label(datetime(2026, 9, 28), datetime(2026, 10, 4)) == "Sep 28–Oct 4"
 
 
+# ─── Paywall funnel ──────────────────────────────────────────────────────────
+
+
+def test_funnel_rejects_bad_events() -> None:
+    import funnel
+
+    assert funnel.clean_event({"event": "hack", "install_id": "abcd1234"}) is None
+    assert funnel.clean_event({"event": "paywall_view", "install_id": "not-hex!"}) is None
+    ok = funnel.clean_event({"event": "paywall_view", "install_id": "ABCD1234",
+                             "props": {"source": "x" * 500, "trial_days": 7, "nested": {"a": 1}}})
+    assert ok and ok["install_id"] == "abcd1234" and len(ok["props"]["source"]) == 64
+
+
+def test_funnel_summary_counts_unique_installs() -> None:
+    import funnel
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = funnel.FunnelStore(Path(tmp) / "f.jsonl")
+        for install, events in {"aa11aa11": ["paywall_view", "paywall_view", "purchase_start", "purchase_success"],
+                                "bb22bb22": ["paywall_view", "purchase_start", "purchase_cancel"],
+                                "cc33cc33": ["paywall_view"]}.items():
+            for e in events:
+                store.append({"event": e, "install_id": install, "props": {"source": "profile"}}, user_id=None)
+        s = funnel.summarize(store.read_since(0))
+        assert s["overall"]["paywall_views"] == 3 and s["overall"]["purchase_starts"] == 2
+        assert s["overall"]["purchases"] == 1 and s["overall"]["view_to_purchase"] == round(1 / 3, 4)
+        assert s["by_source"]["profile"]["start_to_purchase"] == 0.5
+        assert all(store.allow("dd44dd44", now=1000.0) for _ in range(30))
+        assert not store.allow("dd44dd44", now=1000.0), "rate limited after 30/min"
+
+
 if __name__ == "__main__":
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_") and callable(fn)]
     failed = 0

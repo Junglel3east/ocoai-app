@@ -98,6 +98,7 @@ if _root_env.is_file():
 import coingecko_service as cg
 import bitunix_service as bux
 import alert_watcher as alert_watch
+import funnel
 import play_billing
 import track_record as trk
 
@@ -140,6 +141,9 @@ _APP_API_KEYS_FILE = _CITADEL_DATA_DIR / "app_api_keys.json"
 _BILLING_STORE = play_billing.EntitlementStore(_CITADEL_DATA_DIR / "billing_entitlements.json")
 _TRACK_RECORD_STORE = trk.TrackRecordStore(_CITADEL_DATA_DIR / "track_record.json")
 _PAPER_TRADES_STORE = trk.TrackRecordStore(_CITADEL_DATA_DIR / "paper_trades.json")
+_FUNNEL_STORE = funnel.FunnelStore(_CITADEL_DATA_DIR / "funnel_events.jsonl")
+# Owner-only funnel summary: GET /analytics/funnel with header X-Admin-Token.
+ANALYTICS_ADMIN_TOKEN = (os.getenv("ANALYTICS_ADMIN_TOKEN") or "").strip()
 TRACK_RECORD_EVAL_INTERVAL_SEC = int(os.getenv("TRACK_RECORD_EVAL_INTERVAL_SEC", "1800"))
 
 # Home "Daily Analysis" — auto-generated BTC/ETH/SOL/XRP batch (7:30 AM America/Chicago).
@@ -7119,6 +7123,32 @@ async def weekly_recap_preview() -> dict[str, Any]:
         "schedule": f"Sundays {X_WEEKLY_RECAP_HOUR:02d}:{X_WEEKLY_RECAP_MINUTE:02d} {DAILY_ANALYSIS_TZ}",
         "stats": stats,
     }
+
+
+@app.post("/analytics/event")
+async def analytics_event(http_request: Request) -> JSONResponse:
+    """Paywall funnel event from the app. Always 204-style success so the app never retries."""
+    try:
+        raw = await http_request.json()
+    except Exception:
+        raw = None
+    event = funnel.clean_event(raw)
+    if event is not None and _FUNNEL_STORE.allow(event["install_id"]):
+        user_id = _billing_user_id(http_request)
+        await asyncio.to_thread(_FUNNEL_STORE.append, event, user_id=user_id)
+    return JSONResponse(status_code=200, content={"success": True})
+
+
+@app.get("/analytics/funnel")
+async def analytics_funnel(http_request: Request, days: int = 30) -> JSONResponse:
+    if not ANALYTICS_ADMIN_TOKEN:
+        return JSONResponse(status_code=503, content={"success": False, "detail": "ANALYTICS_ADMIN_TOKEN not set."})
+    supplied = (http_request.headers.get("X-Admin-Token") or "").strip()
+    if not hmac.compare_digest(supplied, ANALYTICS_ADMIN_TOKEN):
+        return JSONResponse(status_code=401, content={"success": False, "detail": "Unauthorized."})
+    days = max(1, min(days, 365))
+    rows = await asyncio.to_thread(_FUNNEL_STORE.read_since, time.time() - days * 86400)
+    return JSONResponse(status_code=200, content={"success": True, "days": days, **funnel.summarize(rows)})
 
 
 @app.post("/alerts/sync")

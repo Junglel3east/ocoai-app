@@ -228,7 +228,7 @@ class _OracleVisionScreenState extends State<OracleVisionScreen> with TickerProv
       return;
     }
     if (!mounted) return;
-    final resolved = await resolveCoinForCurrentPlan(context, coin);
+    final resolved = await resolveCoinForCurrentPlan(context, coin, offerPreview: true);
     if (resolved == null || !mounted) return;
     Navigator.push(
       context,

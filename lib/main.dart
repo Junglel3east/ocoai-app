@@ -39,6 +39,7 @@ import 'services/app_api_key_service.dart';
 import 'services/auth_service.dart';
 import 'services/google_play_billing_service.dart';
 import 'services/entitlement_service.dart';
+import 'services/funnel_analytics.dart';
 import 'services/social_links.dart';
 import 'services/x_share_service.dart';
 import 'widgets/push_to_x_button.dart';
@@ -60,6 +61,7 @@ part 'screens/citadel_setup_dialog.dart';
 part 'screens/citadel_live_positions.dart';
 part 'screens/citadel_safety.dart';
 part 'screens/track_record_screen.dart';
+part 'screens/pro_preview.dart';
 part 'screens/oracle_desk_screen.dart';
 part 'screens/first_run_setup_screen.dart';
 part 'screens/oracle_academy_screen.dart';
@@ -1034,6 +1036,7 @@ abstract final class SubscriptionPlanStore {
   }
 
   static bool isFreeAllowedTradeSetupTimeframe(String timeframe) {
+    if (ProPreviewStore.isActive) return true;
     final tf = timeframe.trim().toLowerCase();
     return tf == '1d' || tf == 'daily' || tf == 'd1';
   }
@@ -1048,7 +1051,7 @@ abstract final class SubscriptionPlanStore {
   }
 
   static bool canGenerateTradeSetup(List<Map<String, dynamic>> trades) {
-    if (!isFree) return true;
+    if (!isFree || ProPreviewStore.isActive) return true;
     return countTradeSetupsInWindow(trades) < freeTradeSetupsPerDay;
   }
 
@@ -1089,6 +1092,7 @@ abstract final class SubscriptionPlanStore {
   static Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
     currentPlan = prefs.getString(_planKey) ?? 'Free';
+    await ProPreviewStore.load();
   }
 
   static Future<void> setPlan(String plan) async {
@@ -3694,7 +3698,7 @@ abstract final class CoinAccessPolicy {
       return CoinAccessResult.denied(CoinAccessDenial.invalidSymbol);
     }
 
-    if (SubscriptionPlanStore.isExpert) {
+    if (SubscriptionPlanStore.isExpert || ProPreviewStore.isActive) {
       return CoinAccessResult.allowed(coin);
     }
 
@@ -3748,12 +3752,21 @@ Future<String?> resolveCoinForCurrentPlan(
   BuildContext context,
   String raw, {
   bool showDialogs = true,
+  bool offerPreview = false,
 }) async {
   await SubscriptionPlanStore.load();
   final result = CoinAccessPolicy.evaluate(raw);
   if (result.allowed) return result.coin;
 
   if (!showDialogs || !context.mounted) return null;
+
+  if (offerPreview &&
+      result.coin != null &&
+      result.denial != CoinAccessDenial.invalidSymbol &&
+      await offerProPreview(context, feature: result.coin!)) {
+    return result.coin;
+  }
+  if (!context.mounted) return null;
 
   switch (result.denial) {
     case CoinAccessDenial.invalidSymbol:
@@ -4168,6 +4181,8 @@ Future<bool> ensureFreeTradeSetupAllowed(
   if (!SubscriptionPlanStore.isFree) return true;
 
   if (!SubscriptionPlanStore.isFreeAllowedTradeSetupTimeframe(timeframe)) {
+    if (!context.mounted) return false;
+    if (await offerProPreview(context, feature: 'The ${timeframe.toUpperCase()} timeframe')) return true;
     if (context.mounted) showTradeSetupTimeframeUpgradePrompt(context);
     return false;
   }
@@ -4175,7 +4190,7 @@ Future<bool> ensureFreeTradeSetupAllowed(
   final coinResult = CoinAccessPolicy.evaluate(coin);
   if (!coinResult.allowed) {
     if (context.mounted) {
-      await resolveCoinForCurrentPlan(context, coin);
+      return await resolveCoinForCurrentPlan(context, coin, offerPreview: true) != null;
     }
     return false;
   }
@@ -9295,7 +9310,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     icon: Icons.workspace_premium_outlined,
                     title: 'Subscription Plan',
                     subtitle: 'View or upgrade your plan',
-                    onTap: () => _open(context, const SubscriptionPlanScreen()),
+                    onTap: () => _open(context, const SubscriptionPlanScreen(source: 'profile')),
                   ),
                   _ProfileMenuTile(
                     icon: Icons.insights_outlined,
@@ -9538,7 +9553,10 @@ class _AccountField extends StatelessWidget {
 }
 
 class SubscriptionPlanScreen extends StatefulWidget {
-  const SubscriptionPlanScreen({super.key});
+  /// Where the user came from, for paywall funnel stats.
+  final String source;
+
+  const SubscriptionPlanScreen({super.key, this.source = 'upgrade_prompt'});
 
   @override
   State<SubscriptionPlanScreen> createState() => _SubscriptionPlanScreenState();
@@ -9559,7 +9577,15 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
 
   Future<void> _refreshStorePrices() async {
     await GooglePlayBillingService.queryProducts();
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    setState(() {});
+    await SubscriptionPlanStore.load();
+    if (!SubscriptionPlanStore.isPremiumOrHigher) {
+      FunnelAnalytics.log('paywall_view', {
+        'source': widget.source,
+        'trial_days': GooglePlayBillingService.proTrialDays,
+      });
+    }
   }
 
   @override
@@ -9583,6 +9609,9 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
         setState(() => _purchasingProductId = event.productId);
         break;
       case BillingPurchaseEventType.success:
+        if (_purchasingProductId != null) {
+          FunnelAnalytics.log('purchase_success', {'source': widget.source});
+        }
         setState(() {
           _purchasingProductId = null;
           _isRestoring = false;
@@ -9604,6 +9633,9 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
         );
         break;
       case BillingPurchaseEventType.error:
+        if (_purchasingProductId != null) {
+          FunnelAnalytics.log('purchase_error', {'source': widget.source});
+        }
         setState(() {
           _purchasingProductId = null;
           _isRestoring = false;
@@ -9617,6 +9649,9 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
         );
         break;
       case BillingPurchaseEventType.canceled:
+        if (_purchasingProductId != null) {
+          FunnelAnalytics.log('purchase_cancel', {'source': widget.source});
+        }
         setState(() {
           _purchasingProductId = null;
           _isRestoring = false;
@@ -9669,6 +9704,10 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
     if (productId == null) return;
 
     setState(() => _purchasingProductId = productId);
+    FunnelAnalytics.log('purchase_start', {
+      'source': widget.source,
+      'trial_days': GooglePlayBillingService.proTrialDays,
+    });
     final started = await GooglePlayBillingService.purchase(productId);
     if (!mounted) return;
     if (!started) {
@@ -9716,6 +9755,8 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
   Widget build(BuildContext context) {
     const proColor = Color(0xFFFFB74D);
     final planLabel = SubscriptionPlanStore.displayNameFor(_currentPlan);
+    final trialDays = _isPro ? null : GooglePlayBillingService.proTrialDays;
+    final price = GooglePlayBillingService.proDisplayPrice;
 
     return _ProfileDetailScaffold(
       title: 'Subscription',
@@ -9793,7 +9834,7 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
           _PricingTierCard(
             name: SubscriptionPlanStore.proPlanName,
             tagline: 'Full access to every Oracle tool',
-            price: GooglePlayBillingService.proDisplayPrice,
+            price: price,
             period: '/month',
             icon: Icons.auto_awesome,
             accentColor: proColor,
@@ -9807,11 +9848,35 @@ class _SubscriptionPlanScreenState extends State<SubscriptionPlanScreen> {
               'Advanced alerts: RSI, MACD, Volume, VWAP Cross, News',
             ],
             isCurrent: _isPro,
-            badge: 'FULL ACCESS',
+            badge: trialDays != null ? '$trialDays-DAY FREE TRIAL' : 'FULL ACCESS',
             showUpgradeButton: true,
-            upgradeButtonLabel: 'Unlock Oracle Pro',
+            upgradeButtonLabel: trialDays != null ? 'Start $trialDays-day free trial' : 'Unlock Oracle Pro',
             isPurchasing: _purchasingProductId == GooglePlayBillingService.proProductId,
             onUpgrade: () => _purchasePlan('Expert'),
+          ),
+          if (trialDays != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 16),
+              child: Text(
+                'Free for $trialDays days, then $price/month. Cancel anytime in Google Play '
+                'before the trial ends and you won\'t be charged.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12.5, height: 1.45, color: Colors.grey[400]),
+              ),
+            ),
+          Padding(
+            padding: const EdgeInsets.only(bottom: 16),
+            child: OutlinedButton.icon(
+              onPressed: () => Navigator.push(context, _premiumPageRoute((_) => const TrackRecordScreen())),
+              icon: const Icon(Icons.insights_outlined, size: 18),
+              label: const Text('See every setup\'s real results'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: const Color(0xFF00BFFF),
+                side: BorderSide(color: const Color(0xFF00BFFF).withValues(alpha: 0.4)),
+                minimumSize: const Size.fromHeight(44),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+            ),
           ),
           _PricingTierCard(
             name: 'Free',

@@ -45,7 +45,7 @@ class _QuickAnalyzeScreenState extends State<QuickAnalyzeScreen> {
   }
 
   Future<void> analyze() async {
-    final coin = await resolveCoinForCurrentPlan(context, _controller.text);
+    final coin = await resolveCoinForCurrentPlan(context, _controller.text, offerPreview: true);
     if (coin == null || !mounted) return;
     Navigator.push(
       context,

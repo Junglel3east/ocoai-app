@@ -131,7 +131,7 @@ class _TradeSetupScreenState extends State<TradeSetupScreen> {
       return;
     }
     if (!mounted) return;
-    final coin = await resolveCoinForCurrentPlan(context, raw);
+    final coin = await resolveCoinForCurrentPlan(context, raw, offerPreview: true);
     if (coin == null || !mounted) return;
     Navigator.push(
       context,

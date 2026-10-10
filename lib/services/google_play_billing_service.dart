@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:in_app_purchase/in_app_purchase.dart';
+import 'package:in_app_purchase_android/billing_client_wrappers.dart';
 import 'package:in_app_purchase_android/in_app_purchase_android.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -35,7 +36,10 @@ abstract final class GooglePlayBillingService {
   );
 
   static StreamSubscription<List<PurchaseDetails>>? _purchaseSub;
+  /// Base-plan row per product (its price is the recurring price).
   static final Map<String, ProductDetails> _products = {};
+  /// Free-trial offer rows. Play only returns offers this account is eligible for.
+  static final Map<String, GooglePlayProductDetails> _trialOffers = {};
 
   static bool _initialized = false;
   static bool _storeAvailable = false;
@@ -56,6 +60,41 @@ abstract final class GooglePlayBillingService {
     final live = _products[proProductId]?.price.trim();
     if (live != null && live.isNotEmpty) return live;
     return fallbackProPrice;
+  }
+
+  /// Length of the Oracle Pro free trial this account can still claim, else null.
+  static int? get proTrialDays {
+    final trial = _trialOffers[proProductId];
+    final offer = trial == null ? null : _offerOf(trial);
+    if (offer == null) return null;
+    final phase = offer.pricingPhases.first;
+    final days = _periodDays(phase.billingPeriod);
+    if (days == null) return null;
+    return days * (phase.billingCycleCount < 1 ? 1 : phase.billingCycleCount);
+  }
+
+  static SubscriptionOfferDetailsWrapper? _offerOf(ProductDetails product) {
+    if (product is! GooglePlayProductDetails) return null;
+    final index = product.subscriptionIndex;
+    final offers = product.productDetails.subscriptionOfferDetails;
+    if (index == null || offers == null || index >= offers.length) return null;
+    return offers[index];
+  }
+
+  static bool _isFreeTrial(SubscriptionOfferDetailsWrapper offer) =>
+      offer.pricingPhases.isNotEmpty && offer.pricingPhases.first.priceAmountMicros == 0;
+
+  /// ISO-8601 period (P7D, P1W, P1M) → days.
+  static int? _periodDays(String period) {
+    final match = RegExp(r'^P(\d+)([DWMY])$').firstMatch(period.trim());
+    if (match == null) return null;
+    final n = int.parse(match.group(1)!);
+    return switch (match.group(2)) {
+      'D' => n,
+      'W' => n * 7,
+      'M' => n * 30,
+      _ => n * 365,
+    };
   }
 
   static String? planForProductId(String? productId) {
@@ -137,10 +176,19 @@ abstract final class GooglePlayBillingService {
     }
 
     _products.clear();
+    _trialOffers.clear();
+    // Google Play returns one row per eligible offer: the base plan plus any trial / promo offers.
     for (final product in response.productDetails) {
-      // Google Play may return multiple offer rows per subscription id — keep the first.
-      _products.putIfAbsent(product.id, () => product);
+      final offer = _offerOf(product);
+      if (offer != null && product is GooglePlayProductDetails && _isFreeTrial(offer)) {
+        _trialOffers.putIfAbsent(product.id, () => product);
+      } else if (offer != null && offer.offerId == null) {
+        _products[product.id] = product;
+      } else {
+        _products.putIfAbsent(product.id, () => product);
+      }
     }
+    debugPrint('[GooglePlayBilling] products=${_products.keys} trials=${_trialOffers.keys}');
   }
 
   static Future<bool> purchase(String productId) async {
@@ -151,7 +199,7 @@ abstract final class GooglePlayBillingService {
       await queryProducts();
     }
 
-    final product = _products[productId];
+    final product = _trialOffers[productId] ?? _products[productId];
     if (product == null) {
       _emit(BillingPurchaseEvent.error('Subscription not found in Google Play.'));
       return false;
